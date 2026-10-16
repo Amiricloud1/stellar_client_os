@@ -76,3 +76,12 @@ graph TD
 
 -   **Payment Stream Contract:** Manages the lifecycle of payment streams, including creation, withdrawal, pausing, and cancellation.
 -   **Distributor Contract:** Handles the distribution of tokens to multiple recipients, with support for both equal and weighted distributions.
+
+## Security, Observability & Operational Resilience
+
+The platform adheres to enterprise security, observability, and operational data continuity standards:
+
+- **Distributed Tracing & Correlation:** Propagates W3C traceparent and request correlation across API endpoints, Stellar RPC/Horizon calls, and webhook notifications while redacting wallet secrets, mnemonics, and personal identifiers. See [Observability & Tracing](./observability-tracing.md).
+- **Service Level Objectives (SLOs):** Defines 99.9% / 99.5% availability and latency targets across critical flows (reads, submission, webhooks, sync) with multi-window burn-rate alerting. See [SLO & Alert Thresholds](./slo-and-alert-thresholds.md) and [SLO Runbook](./runbooks/slo-burn-rate.md).
+- **Incident Response & Key Compromise:** Structured operational runbooks for emergency containment, on-chain multi-sig signer demotion, zero-downtime dual-secret rotation, and tabletop exercises. See [Incident Response Runbook](./runbooks/incident-response.md) and [Key Compromise Runbook](./runbooks/key-compromise.md).
+- **Backup & Isolated Restore Continuity:** Cryptographic AES-256-GCM operational data snapshots, grandfather-father-son retention, and isolated restore drills enforcing RPO <= 15m and RTO <= 30m. See [Backup & Restore Policy](./backup-and-restore-policy.md) and [Restore Drill Runbook](./runbooks/backup-restore-drill.md).
