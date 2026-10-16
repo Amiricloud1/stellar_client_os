@@ -1,26 +1,34 @@
 "use client";
 
 /**
- * SyncQueueDrawer — Action drawer listing pending sync items (issue #528)
+ * SyncQueueDrawer — Action drawer listing pending sync items and conflicts (Issues #528, #73)
  *
  * Slides up from the bottom on mobile / in from the right on desktop,
- * showing all items in the sync queue with their status and a per-item
- * retry action. Uses the existing Sheet component from the design system.
+ * showing all items in the sync queue with their status and actions:
+ *   - Retry transient failures or forced sync
+ *   - Discard unneeded or duplicate items
+ *   - Conflict-resolution actions for stale/conflict items (Keep local, Accept server, Edit & merge)
+ *   - Payload editing so user input is never lost
  *
  * Accessibility:
  *   - Drawer is a dialog (role="dialog") with a labelled title
  *   - Each status badge uses aria-label for screen readers
  *   - Empty state has a descriptive paragraph
- *   - All action buttons have accessible labels
+ *   - All action buttons have accessible labels and meet WCAG 2.2 AA target size (>=24x24px)
  */
 
-import React from "react";
+import React, { useState } from "react";
 import {
   AlertCircle,
+  AlertTriangle,
+  Check,
   CheckCircle2,
   Clock,
+  Edit2,
+  GitMerge,
   Loader2,
   RefreshCw,
+  Server,
   Trash2,
   UploadCloud,
 } from "lucide-react";
@@ -34,7 +42,7 @@ import {
   SheetFooter,
 } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
-import type { SyncQueueItem, SyncQueueState } from "@/hooks/use-sync-queue";
+import type { ConflictResolution, SyncQueueItem, SyncQueueState } from "@/hooks/use-sync-queue";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -52,7 +60,13 @@ export interface SyncQueueDrawerProps {
     | "remove"
     | "clearSynced"
     | "clearAll"
-  >;
+  > & {
+    conflictItems?: SyncQueueItem[];
+    conflictCount?: number;
+    discard?: (id: string) => void;
+    resolveConflict?: (id: string, resolution: ConflictResolution) => Promise<void>;
+    updatePayload?: (id: string, newPayload: unknown, newLabel?: string) => void;
+  };
 }
 
 // ── Status badge ──────────────────────────────────────────────────────────────
@@ -75,6 +89,12 @@ function StatusBadge({ status }: { status: SyncQueueItem["status"] }) {
       icon: CheckCircle2,
       label: "Synced",
       className: "bg-emerald-900/50 text-emerald-300 border-emerald-700/50",
+      spin: false,
+    },
+    conflict: {
+      icon: AlertTriangle,
+      label: "Conflict",
+      className: "bg-orange-900/60 text-orange-200 border-orange-600/60",
       spin: false,
     },
     failed: {
@@ -107,96 +127,330 @@ function QueueItemRow({
   item,
   onRetry,
   onRemove,
+  onDiscard,
+  onResolveConflict,
+  onUpdatePayload,
   isOnline,
 }: {
   item: SyncQueueItem;
-  onRetry: (id: string) => void;
+  onRetry: (id: string, options?: { force?: boolean }) => void;
   onRemove: (id: string) => void;
+  onDiscard?: (id: string) => void;
+  onResolveConflict?: (id: string, resolution: ConflictResolution) => Promise<void>;
+  onUpdatePayload?: (id: string, newPayload: unknown, newLabel?: string) => void;
   isOnline: boolean;
 }) {
+  const [isEditing, setIsEditing] = useState(false);
+  const [editedPayloadText, setEditedPayloadText] = useState(() =>
+    item.payload ? JSON.stringify(item.payload, null, 2) : ""
+  );
+  const [editedLabel, setEditedLabel] = useState(item.label);
+
+  const isConflict = item.status === "conflict" || item.failureType === "conflict" || item.failureType === "stale";
+  const isDuplicate = item.failureType === "duplicate";
+  const isPermanent = item.failureType === "permanent";
+
+  const handleSaveEdit = () => {
+    let parsed: unknown = editedPayloadText;
+    try {
+      parsed = JSON.parse(editedPayloadText);
+    } catch {
+      // Keep as string if not valid JSON
+    }
+    onUpdatePayload?.(item.id, parsed, editedLabel.trim() || item.label);
+    setIsEditing(false);
+  };
+
+  const handleMergeResolve = async () => {
+    let parsed: unknown = editedPayloadText;
+    try {
+      parsed = JSON.parse(editedPayloadText);
+    } catch {
+      // Keep as string
+    }
+    await onResolveConflict?.(item.id, {
+      action: "merge",
+      mergedPayload: parsed,
+      newLabel: editedLabel.trim() || item.label,
+    });
+    setIsEditing(false);
+  };
+
   return (
     <li
       className={cn(
-        "flex items-start gap-3 rounded-lg border p-3 transition-colors",
-        "border-white/10 bg-white/5 hover:bg-white/[0.07]"
+        "flex flex-col gap-2 rounded-lg border p-3 transition-colors",
+        "border-white/10 bg-white/5 hover:bg-white/[0.07]",
+        isConflict && "border-orange-500/40 bg-orange-950/10"
       )}
     >
-      {/* Icon */}
-      <UploadCloud
-        aria-hidden="true"
-        className={cn(
-          "mt-0.5 h-5 w-5 shrink-0",
-          item.status === "synced" ? "text-emerald-400" :
-          item.status === "failed" ? "text-red-400" :
-          item.status === "syncing" ? "text-purple-400" :
-          "text-amber-400"
-        )}
-      />
+      <div className="flex items-start gap-3">
+        {/* Icon */}
+        <UploadCloud
+          aria-hidden="true"
+          className={cn(
+            "mt-0.5 h-5 w-5 shrink-0",
+            item.status === "synced"
+              ? "text-emerald-400"
+              : isConflict
+              ? "text-orange-400"
+              : item.status === "failed"
+              ? "text-red-400"
+              : item.status === "syncing"
+              ? "text-purple-400"
+              : "text-amber-400"
+          )}
+        />
 
-      {/* Content */}
-      <div className="min-w-0 flex-1">
-        <div className="flex items-start justify-between gap-2">
-          <p className="truncate text-sm font-medium text-white">{item.label}</p>
-          <StatusBadge status={item.status} />
+        {/* Content */}
+        <div className="min-w-0 flex-1">
+          <div className="flex items-start justify-between gap-2">
+            <p className="truncate text-sm font-medium text-white">{item.label}</p>
+            <StatusBadge status={item.status} />
+          </div>
+
+          {item.description && (
+            <p className="mt-0.5 truncate text-xs text-white/50">{item.description}</p>
+          )}
+
+          {/* Error / failure notice */}
+          {item.error && (
+            <div
+              className={cn(
+                "mt-1.5 rounded p-2 text-xs",
+                isConflict
+                  ? "border border-orange-500/30 bg-orange-500/10 text-orange-200"
+                  : isDuplicate
+                  ? "border border-amber-500/30 bg-amber-500/10 text-amber-200"
+                  : "border border-red-500/30 bg-red-500/10 text-red-300"
+              )}
+              role="alert"
+            >
+              <div className="flex items-center gap-1 font-semibold">
+                {isConflict ? (
+                  <>
+                    <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                    <span>Conflict: {item.failureType === "stale" ? "Stale server state" : "Data collision"}</span>
+                  </>
+                ) : isDuplicate ? (
+                  <>
+                    <AlertCircle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                    <span>Duplicate submission already confirmed</span>
+                  </>
+                ) : isPermanent ? (
+                  <>
+                    <AlertCircle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                    <span>Permanent error: manual edit required</span>
+                  </>
+                ) : (
+                  <>
+                    <AlertCircle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                    <span>Transient error</span>
+                  </>
+                )}
+              </div>
+              <p className="mt-0.5 text-xs opacity-90">{item.error}</p>
+              {item.conflictDetails?.reason && item.conflictDetails.reason !== item.error && (
+                <p className="mt-0.5 text-xs opacity-75">{item.conflictDetails.reason}</p>
+              )}
+            </div>
+          )}
+
+          <div className="mt-1.5 flex items-center gap-2">
+            <p className="text-xs text-white/40">
+              {new Date(item.enqueuedAt).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+              })}
+            </p>
+            {item.retryCount > 0 && (
+              <p className="text-xs text-white/40">
+                · {item.retryCount} retr{item.retryCount === 1 ? "y" : "ies"}
+              </p>
+            )}
+          </div>
         </div>
 
-        {item.description && (
-          <p className="mt-0.5 truncate text-xs text-white/50">{item.description}</p>
-        )}
-
-        {item.error && item.status === "failed" && (
-          <p className="mt-1 text-xs text-red-400" role="alert">
-            {item.error}
-          </p>
-        )}
-
-        <div className="mt-1.5 flex items-center gap-2">
-          <p className="text-xs text-white/40">
-            {new Date(item.enqueuedAt).toLocaleTimeString([], {
-              hour: "2-digit",
-              minute: "2-digit",
-            })}
-          </p>
-          {item.retryCount > 0 && (
-            <p className="text-xs text-white/40">
-              · {item.retryCount} retr{item.retryCount === 1 ? "y" : "ies"}
-            </p>
+        {/* Header Right Actions */}
+        <div className="flex shrink-0 items-center gap-1">
+          {item.status !== "syncing" && (
+            <button
+              type="button"
+              onClick={() => (onDiscard ? onDiscard(item.id) : onRemove(item.id))}
+              aria-label={`Discard ${item.label}`}
+              className={cn(
+                "min-h-[28px] min-w-[28px] rounded-md p-1.5 text-white/40 hover:text-red-400",
+                "hover:bg-red-400/10 focus-visible:outline-none focus-visible:ring-2",
+                "focus-visible:ring-red-400/30 transition-all duration-150"
+              )}
+            >
+              <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
+            </button>
           )}
         </div>
       </div>
 
-      {/* Actions */}
-      <div className="flex shrink-0 items-center gap-1">
-        {(item.status === "pending" || item.status === "failed") && isOnline && (
-          <button
+      {/* Conflict Resolution Toolbar (Issue #73) */}
+      {isConflict && (
+        <div className="mt-2 flex flex-wrap gap-2 border-t border-white/10 pt-2">
+          {/* Action 1: Keep local */}
+          <Button
             type="button"
-            onClick={() => onRetry(item.id)}
-            aria-label={`Retry syncing ${item.label}`}
-            className={cn(
-              "rounded-md p-1.5 text-white/50 hover:text-white",
-              "hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2",
-              "focus-visible:ring-white/30 transition-all duration-150",
-              "disabled:cursor-not-allowed disabled:opacity-40"
-            )}
+            size="sm"
+            variant="outline"
+            onClick={() => onResolveConflict?.(item.id, { action: "use_local" })}
+            className="h-7 text-xs border-orange-500/40 bg-orange-500/10 text-orange-200 hover:bg-orange-500/20"
+            aria-label={`Keep local version for ${item.label}`}
           >
-            <RefreshCw aria-hidden="true" className="h-3.5 w-3.5" />
-          </button>
-        )}
-        {item.status !== "syncing" && (
-          <button
+            <UploadCloud className="mr-1 h-3 w-3" aria-hidden="true" />
+            Keep local
+          </Button>
+
+          {/* Action 2: Accept server */}
+          <Button
             type="button"
-            onClick={() => onRemove(item.id)}
-            aria-label={`Remove ${item.label} from queue`}
-            className={cn(
-              "rounded-md p-1.5 text-white/30 hover:text-red-400",
-              "hover:bg-red-400/10 focus-visible:outline-none focus-visible:ring-2",
-              "focus-visible:ring-red-400/30 transition-all duration-150"
-            )}
+            size="sm"
+            variant="outline"
+            onClick={() => onResolveConflict?.(item.id, { action: "use_server" })}
+            className="h-7 text-xs border-white/20 bg-white/5 text-white/80 hover:bg-white/10"
+            aria-label={`Accept server version for ${item.label}`}
           >
-            <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
-          </button>
-        )}
-      </div>
+            <Server className="mr-1 h-3 w-3" aria-hidden="true" />
+            Accept server
+          </Button>
+
+          {/* Action 3: Edit input without losing data */}
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            onClick={() => setIsEditing(!isEditing)}
+            className="h-7 text-xs text-white/70 hover:bg-white/10 hover:text-white"
+            aria-label={`Edit user input for ${item.label}`}
+          >
+            <Edit2 className="mr-1 h-3 w-3" aria-hidden="true" />
+            {isEditing ? "Cancel edit" : "Edit input"}
+          </Button>
+
+          {/* Action 4: Discard */}
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            onClick={() => (onDiscard ? onDiscard(item.id) : onRemove(item.id))}
+            className="h-7 text-xs text-red-300 hover:bg-red-500/10 hover:text-red-200 ml-auto"
+            aria-label={`Discard conflicting item ${item.label}`}
+          >
+            Discard
+          </Button>
+        </div>
+      )}
+
+      {/* Non-conflict failed or duplicate actions */}
+      {!isConflict && item.status === "failed" && (
+        <div className="mt-1 flex flex-wrap gap-2 border-t border-white/10 pt-2">
+          {isOnline && (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => onRetry(item.id, { force: true })}
+              className="h-7 text-xs border-white/20 bg-white/5 text-white/90 hover:bg-white/10"
+              aria-label={isDuplicate ? `Force retry ${item.label}` : `Retry ${item.label}`}
+            >
+              <RefreshCw className="mr-1 h-3 w-3" aria-hidden="true" />
+              {isDuplicate ? "Force retry" : "Retry now"}
+            </Button>
+          )}
+
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            onClick={() => setIsEditing(!isEditing)}
+            className="h-7 text-xs text-white/70 hover:bg-white/10 hover:text-white"
+            aria-label={`Edit payload for ${item.label}`}
+          >
+            <Edit2 className="mr-1 h-3 w-3" aria-hidden="true" />
+            {isEditing ? "Cancel edit" : "Edit payload"}
+          </Button>
+
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            onClick={() => (onDiscard ? onDiscard(item.id) : onRemove(item.id))}
+            className="h-7 text-xs text-red-300 hover:bg-red-500/10 hover:text-red-200 ml-auto"
+            aria-label={`Discard failed item ${item.label}`}
+          >
+            Discard
+          </Button>
+        </div>
+      )}
+
+      {/* Inline payload editor ensuring no user input is lost */}
+      {isEditing && (
+        <div className="mt-2 rounded border border-white/15 bg-black/40 p-2.5">
+          <label className="block text-xs font-semibold text-white/80">
+            Edit Item Label
+          </label>
+          <input
+            type="text"
+            value={editedLabel}
+            onChange={(e) => setEditedLabel(e.target.value)}
+            className="mt-1 w-full rounded bg-white/10 px-2 py-1 text-xs text-white border border-white/20 focus:outline-none focus:ring-1 focus:ring-fundable-purple-2"
+          />
+
+          <label className="mt-2 block text-xs font-semibold text-white/80">
+            Payload / User Input (JSON or text)
+          </label>
+          <textarea
+            rows={3}
+            value={editedPayloadText}
+            onChange={(e) => setEditedPayloadText(e.target.value)}
+            className="mt-1 w-full rounded bg-white/10 p-2 font-mono text-xs text-white border border-white/20 focus:outline-none focus:ring-1 focus:ring-fundable-purple-2"
+            placeholder="{ ...user input }"
+          />
+
+          <div className="mt-2 flex items-center justify-end gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              onClick={() => setIsEditing(false)}
+              className="h-6 text-xs text-white/60 hover:text-white"
+            >
+              Cancel
+            </Button>
+
+            {isConflict ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="gradient"
+                onClick={handleMergeResolve}
+                className="h-6 text-xs"
+                aria-label="Save merged payload and retry sync"
+              >
+                <GitMerge className="mr-1 h-3 w-3" aria-hidden="true" />
+                Merge & Retry
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                size="sm"
+                variant="gradient"
+                onClick={handleSaveEdit}
+                className="h-6 text-xs"
+                aria-label="Save input changes"
+              >
+                <Check className="mr-1 h-3 w-3" aria-hidden="true" />
+                Save Changes
+              </Button>
+            )}
+          </div>
+        </div>
+      )}
     </li>
   );
 }
@@ -209,15 +463,22 @@ export function SyncQueueDrawer({ open, onClose, syncQueue }: SyncQueueDrawerPro
     pendingCount,
     isSyncing,
     isOnline,
+    conflictItems = [],
+    conflictCount = conflictItems.length,
     retryAll,
     retryItem,
     remove,
+    discard = remove,
+    resolveConflict,
+    updatePayload,
     clearSynced,
     clearAll,
   } = syncQueue;
 
   const hasSynced = queue.some((i) => i.status === "synced");
-  const hasRetryable = queue.some((i) => i.status === "pending" || i.status === "failed");
+  const hasRetryable = queue.some(
+    (i) => i.status === "pending" || i.status === "failed" || i.status === "conflict"
+  );
 
   return (
     <Sheet open={open} onOpenChange={(o) => !o && onClose()}>
@@ -227,9 +488,8 @@ export function SyncQueueDrawer({ open, onClose, syncQueue }: SyncQueueDrawerPro
           "max-h-[85dvh] rounded-t-2xl border-white/10",
           "bg-fundable-dark text-white",
           "flex flex-col gap-0 p-0",
-          // Desktop: slide in from right instead
           "sm:side-right sm:max-h-full sm:rounded-none sm:rounded-l-2xl",
-          "sm:w-[420px] sm:max-w-[420px]"
+          "sm:w-[460px] sm:max-w-[460px]"
         )}
         aria-label="Sync queue"
       >
@@ -244,6 +504,14 @@ export function SyncQueueDrawer({ open, onClose, syncQueue }: SyncQueueDrawerPro
                 className="ml-auto flex h-5 min-w-5 items-center justify-center rounded-full bg-fundable-purple-2 px-1.5 text-xs font-bold text-white"
               >
                 {pendingCount}
+              </span>
+            )}
+            {conflictCount > 0 && (
+              <span
+                aria-label={`${conflictCount} conflicts`}
+                className="flex h-5 items-center justify-center rounded-full bg-orange-600 px-2 text-xs font-bold text-white"
+              >
+                {conflictCount} conflict{conflictCount !== 1 ? "s" : ""}
               </span>
             )}
           </div>
@@ -266,13 +534,16 @@ export function SyncQueueDrawer({ open, onClose, syncQueue }: SyncQueueDrawerPro
               </p>
             </div>
           ) : (
-            <ul className="flex flex-col gap-2" aria-label="Pending upload items">
+            <ul className="flex flex-col gap-2.5" aria-label="Sync queue items">
               {queue.map((item) => (
                 <QueueItemRow
                   key={item.id}
                   item={item}
                   onRetry={retryItem}
                   onRemove={remove}
+                  onDiscard={discard}
+                  onResolveConflict={resolveConflict}
+                  onUpdatePayload={updatePayload}
                   isOnline={isOnline}
                 />
               ))}
@@ -288,7 +559,7 @@ export function SyncQueueDrawer({ open, onClose, syncQueue }: SyncQueueDrawerPro
                 <Button
                   variant="gradient"
                   size="sm"
-                  onClick={retryAll}
+                  onClick={() => retryAll({ includeConflicts: false })}
                   disabled={isSyncing}
                   className="flex-1"
                   aria-label="Retry all pending and failed uploads"

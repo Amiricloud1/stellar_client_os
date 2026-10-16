@@ -41,3 +41,8 @@ The main entry point of the application is the `page.tsx` file. Currently, this 
 ### Custom Components
 
 As of now, there are no custom components defined in the `src/components` directory. The structure is in place to add new components as the application develops. When adding new components from `shadcn/ui`, they will be located in the `src/components/ui` directory, following the aliasing convention.
+
+## Standards and Guidelines
+
+For in-depth guidelines on offline synchronization and conflict recovery, WCAG 2.2 AA accessibility audit patterns, performance budgets for discovery and maps, and centralized locale-aware formatting, see [Frontend Standards and Contributor Guide](./standards-and-guides.md).
+

@@ -11,6 +11,7 @@
     "test:watch": "vitest",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
+    "perf:budget": "vitest run src/lib/performance-budgets.test.ts",
     "storybook": "start-storybook -p 6006 -s public",
     "build-storybook": "build-storybook -o storybook-static"
   },
