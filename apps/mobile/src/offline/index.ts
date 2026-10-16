@@ -19,6 +19,7 @@ export * from "./types";
 export * from "./campaignCache";
 export * from "./wishlist";
 export * from "./sync";
+export * from "./telemetry";
 
 export interface OfflineServices {
   cache: CampaignCache<CampaignSummary[], CampaignDetail>;
