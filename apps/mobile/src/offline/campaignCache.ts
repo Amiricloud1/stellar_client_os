@@ -82,6 +82,27 @@ export class CampaignCache<
         .map((key) => this.storage.removeItem(key)),
     );
   }
+
+  /** Remove a single cached campaign detail (account-scoped deletion). */
+  async removeDetail(campaignId: string): Promise<void> {
+    await this.storage.removeItem(this.detailKey(campaignId));
+  }
+
+  /**
+   * Freshness check for a cached payload timestamp.
+   *
+   * The cache itself never expires entries: a cached payload is served
+   * indefinitely while the network is unreachable. Screens that need a
+   * staleness bound call this helper with the `cachedAt` returned by
+   * `CampaignRepository` and decide (e.g. show a "last updated" badge).
+   *
+   * @param cachedAt value timestamp, or `null` when nothing is cached.
+   * @param maxAgeMs maximum acceptable age in milliseconds.
+   */
+  isFresh(cachedAt: number | null, maxAgeMs: number): boolean {
+    if (cachedAt === null) return false;
+    return this.clock() - cachedAt <= maxAgeMs;
+  }
 }
 
 /** Result of a read-through load, indicating whether it came from cache. */

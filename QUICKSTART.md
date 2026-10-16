@@ -87,18 +87,17 @@ const result = await waitForTransaction(tx, rpcUrl, {
 
 ### Run All SDK Tests
 ```bash
-cd /workspaces/stellar_client_os
-pnpm test -w @fundable/sdk
+pnpm --filter @fundable/sdk test
 ```
 
 ### Run Only Transaction Tests
 ```bash
-pnpm test -w @fundable/sdk -- transactions.test.ts
+pnpm --filter @fundable/sdk test -- transactions.test.ts
 ```
 
 ### Run Tests in Watch Mode
 ```bash
-pnpm test:watch -w @fundable/sdk -- transactions.test.ts
+pnpm --filter @fundable/sdk test:watch -- transactions.test.ts
 ```
 
 ### Build to Check for TypeScript Errors

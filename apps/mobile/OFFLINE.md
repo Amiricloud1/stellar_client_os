@@ -37,6 +37,35 @@ duplicates. `bindSyncOnReconnect` subscribes to a `ConnectivityMonitor` and
 flushes the queue on an offline → online transition only; failed operations stay
 queued for the next attempt.
 
+## Sync guarantees
+
+Every guarantee below names its implementation and the test that pins it.
+All offline tests are deterministic (injectable `clock`, in-memory storage,
+mocked remotes) and never touch live funds or the network.
+
+| # | Guarantee | Implementation | Pinned by |
+| - | --------- | -------------- | --------- |
+| G1 | **Cached entities.** Only campaign list (`CampaignSummary[]`) and campaign detail (`CampaignDetail`) payloads are cached, keyed per namespace (`<namespace>.campaigns.list`, `<namespace>.campaigns.detail.<id>`). The wishlist stores ids (`<namespace>.ids`); the sync queue stores `{ type, campaignId, queuedAt }` ops. | `src/offline/campaignCache.ts` (`listKey`, `detailKey`), `src/offline/wishlist.ts` (`key`), `src/offline/sync.ts` (`key`) | `__tests__/campaignCache.test.ts` (namespace isolation), `__tests__/guarantees.test.ts` (key scoping) |
+| G2 | **Network-first freshness.** A successful fetch overwrites the cache with a new `cachedAt` timestamp and returns `fromCache: false`; a failed fetch serves the last cached payload with `fromCache: true` and its original `cachedAt`. Cached entries never expire on their own — screens apply their own staleness bound with `CampaignCache.isFresh(cachedAt, maxAgeMs)`. | `src/offline/campaignCache.ts` (`CampaignRepository.loadList/loadDetail`, `isFresh`) | `__tests__/campaignCache.test.ts` (write → offline read), `__tests__/guarantees.test.ts` (freshness boundary incl. `null` → stale) |
+| G3 | **Empty-cache behavior.** Off-line with an empty cache returns the caller-supplied `fallback` when present, otherwise re-throws the original network error so screens can render an error state. | `src/offline/campaignCache.ts` (`LoadOptions.fallback`) | `__tests__/campaignCache.test.ts` (fallback + re-throw), `__tests__/offlineFlow.test.ts` (empty-cache path) |
+| G4 | **Last-write-wins conflicts.** Enqueueing an operation for a campaign drops any earlier queued operation for that campaign, so each campaign is sent at most once per flush in final-state order. Local wishlist edits apply immediately (optimistic), independent of queue state. | `src/offline/sync.ts` (`WishlistSyncQueue.enqueue`), `src/offline/wishlist.ts` (`add`/`remove` idempotent) | `__tests__/sync.test.ts` (queue collapse), `__tests__/guarantees.test.ts` (add→remove→add collapses to one `add`) |
+| G5 | **Retries.** `WishlistSyncEngine.sync()` returns `{ attempted, synced, failed }`; successfully applied operations are removed via `markSynced`, failures stay queued and `onSyncError` fires per failure. `bindSyncOnReconnect` flushes only on an offline → online transition and swallows flush errors so they remain queued for the next reconnect. | `src/offline/sync.ts` (`sync`, `bindSyncOnReconnect`) | `__tests__/sync.test.ts` (failed ops stay queued; reconnect-only flush; redundant online signals ignored), `__tests__/guarantees.test.ts` (partial-failure retention) |
+| G6 | **Deletion / account scoping.** `CampaignCache.removeDetail(id)` deletes one detail entry; `CampaignCache.clear()` deletes every entry under the cache namespace (`<namespace>.campaigns.*`); `WishlistSyncQueue.clear()` drops all pending ops. Namespaces isolate accounts — entries written under one namespace are invisible to another. | `src/offline/campaignCache.ts` (`removeDetail`, `clear`), `src/offline/sync.ts` (`clear`) | `__tests__/campaignCache.test.ts` (clear + isolation), `__tests__/guarantees.test.ts` (per-entry delete keeps list + siblings) |
+
+### Compatibility / migration notes
+
+- Storage keys are namespaced strings of JSON (`{ data, cachedAt }` /
+  `{ ids, updatedAt }` / `{ operations }`). Corrupt JSON reads as `null`
+  (`readJSON` in `src/offline/storage.ts`), which the repository treats as
+  "nothing cached" (G3) — safe to upgrade clients without a migration.
+- Changing the default namespace (`fundable.offline.cache`,
+  `fundable.offline.wishlist`, `fundable.offline.wishlist.queue`) orphans
+  previously stored keys; keep the namespace stable per account or call
+  `clear()` on sign-out.
+- No TTL eviction and no server-driven invalidation exist yet: cached data can
+  go stale while offline. Screens must surface `cachedAt` / `isFresh` state
+  when showing cached payloads.
+
 ## Wiring it into an app
 
 ### 1. Storage
