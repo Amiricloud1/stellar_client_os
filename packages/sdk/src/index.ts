@@ -101,3 +101,6 @@ export {
   CONTRACT_ERRORS,
   type ParsedContractError,
 } from "./utils/errors.js";
+
+// Export recipes (issue #117)
+export * from "./recipes/index.js";

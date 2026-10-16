@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "network": "mainnet",
+  "networkPassphrase": "Public Global Stellar Network ; September 2015",
+  "rpcUrl": "",
+  "deployedAt": "",
+  "deployer": "",
+  "contracts": {}
+}

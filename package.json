@@ -17,7 +17,10 @@
     "lint": "pnpm --filter @fundable/web lint",
     "changeset": "changeset",
     "changeset:version": "changeset version",
-    "changeset:publish": "pnpm --filter @fundable/sdk build && changeset publish"
+    "changeset:publish": "pnpm --filter @fundable/sdk build && changeset publish",
+    "docs:openapi:generate": "npx tsx scripts/generate-openapi-docs.ts",
+    "docs:openapi:check": "npx tsx scripts/generate-openapi-docs.ts --check",
+    "validate-manifest": "npx tsx scripts/validate-manifest.ts"
   },
   "keywords": [
     "stellar",

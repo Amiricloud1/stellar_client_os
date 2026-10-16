@@ -19,17 +19,7 @@ info:
 
     Standard rate-limiting headers (`RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`)
     are returned on all responses. Exceeded limits return `429 Too Many Requests` with a `Retry-After` header.
-<<<<<<< HEAD
-=======
-    GraphQL analytics, webhook subscriptions, campaign metadata IPFS pinning,
-    creator stats, and verification SLA guarantees.
-
-    ## Rate Limits & Throttling
-    All endpoints enforce sliding-window rate limiting (60 req/min for Read APIs,
-    30 req/min for Creation APIs, 10 req/min for Execution APIs).
-    Rate limit headers (`RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`, `Retry-After`)
-    are included on all responses. For detailed policy, see `docs/campaign-api-rate-limits.md`.
->>>>>>> upstream/main
+    For detailed policy, see `docs/campaign-api-rate-limits.md`.
   license:
     name: MIT
     url: https://opensource.org/license/mit/
@@ -64,6 +54,12 @@ tags:
     description: Public geographic stream queries
   - name: Webhooks
     description: Subscription registration and event dispatch
+  - name: MobilePush
+    description: Mobile push notification subscriptions and milestone delivery
+  - name: CampaignAudit
+    description: Immutable on-chain verification audit trail for campaigns
+
+paths:
   /api/campaigns/trending:
     get:
       tags: [Campaigns]
@@ -118,11 +114,6 @@ tags:
           $ref: '#/components/responses/BadRequest'
         '500':
           $ref: '#/components/responses/InternalServerError'
-
-  /api/certificates:
-
-
-paths:
   /api/campaigns:
     get:
       tags: [Campaigns]
@@ -1057,8 +1048,6 @@ components:
           type: string
           format: uri
           example: https://fundable.network/pricing
-<<<<<<< HEAD
-=======
     CampaignStatus:
       type: string
       enum: [DRAFT, PENDING_VERIFICATION, ACTIVE, PAUSED, COMPLETED, FAILED]
@@ -1133,7 +1122,7 @@ components:
         changedBy: { type: string }
         reason: { type: string }
         treeCount: { type: integer, minimum: 0, description: 'Cumulative trees planted; crossing 1000 or 5000 emits a campaign_milestone_reached webhook' }
-        co2Sequestration: { type: string, pattern: '^\d+(\.\d+)?$', description: 'Cumulative CO2 sequestration in metric tonnes; crossing 10 emits a campaign_milestone_reached webhook' }
+        co2Sequestration: { type: string, pattern: '^\\d+(\\.\\d+)?$', description: 'Cumulative CO2 sequestration in metric tonnes; crossing 10 emits a campaign_milestone_reached webhook' }
     Pagination:
       type: object
       required: [limit, offset, count]
@@ -1141,7 +1130,6 @@ components:
         limit: { type: integer }
         offset: { type: integer }
         count: { type: integer }
->>>>>>> upstream/main
     Error:
       type: object
       required: [error]
