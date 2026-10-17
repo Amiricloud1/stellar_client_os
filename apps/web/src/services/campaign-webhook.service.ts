@@ -9,6 +9,25 @@ import type {
 } from "@/types/campaign-webhook";
 
 /**
+ * Public projection of a webhook subscription. The signing secret is
+ * deliberately excluded so it is only ever revealed once, at creation time.
+ */
+export interface CampaignWebhookSubscriptionSummary {
+  id: string;
+  accountId: string;
+  url: string;
+  events: string[];
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CampaignWebhookSubscriptionCreated
+  extends CampaignWebhookSubscriptionSummary {
+  secret: string;
+}
+
+/**
  * Publishes the campaign lifecycle events consumed by external integrations.
  * The event identifiers are intentionally supplied by the caller so replayed
  * indexer notifications are deduplicated by WebhookService.
@@ -117,6 +136,55 @@ export class CampaignWebhookService {
       ...event,
       eventId: event.completionId,
     });
+  }
+
+  /**
+   * Lists the subscriptions owned by `accountId`. Secrets are never included;
+   * subscriptions belonging to other accounts are filtered out by the
+   * underlying WebhookService, which scopes every read by account.
+   */
+  async listSubscriptions(
+    accountId: string
+  ): Promise<CampaignWebhookSubscriptionSummary[]> {
+    this.assertRequired(accountId, "accountId");
+    const subscriptions = await this.webhookService.listSubscriptions(accountId);
+    return subscriptions.map((subscription) => this.toSummary(subscription));
+  }
+
+  /**
+   * Rotates the signing secret for a subscription owned by `accountId`.
+   * The new secret is returned exactly once so the caller can persist it;
+   * subsequent reads will not expose it again.
+   */
+  async rotateSecret(
+    accountId: string,
+    id: string
+  ): Promise<CampaignWebhookSubscriptionCreated> {
+    this.assertRequired(accountId, "accountId");
+    this.assertRequired(id, "id");
+    const rotated = await this.webhookService.rotateSecret(accountId, id);
+    return { ...this.toSummary(rotated), secret: rotated.secret };
+  }
+
+  /**
+   * Revokes (deactivates) a subscription owned by `accountId`. Ownership is
+   * enforced by WebhookService, which throws for cross-account access.
+   */
+  async revokeSubscription(
+    accountId: string,
+    id: string
+  ): Promise<CampaignWebhookSubscriptionSummary> {
+    this.assertRequired(accountId, "accountId");
+    this.assertRequired(id, "id");
+    const revoked = await this.webhookService.revokeSubscription(accountId, id);
+    return this.toSummary(revoked);
+  }
+
+  private toSummary(
+    subscription: CampaignWebhookSubscriptionSummary & { secret?: string }
+  ): CampaignWebhookSubscriptionSummary {
+    const { secret: _secret, ...summary } = subscription;
+    return summary;
   }
 
   private assertRequired(value: string, field: string): void {

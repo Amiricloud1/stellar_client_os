@@ -8,8 +8,34 @@ import { PaymentStreamClient } from '../../../../packages/sdk/src/PaymentStreamC
 import { DistributorClient } from '../../../../packages/sdk/src/DistributorClient';
 import { createBatches } from '../../../../packages/sdk/src/utils/batchDistribution';
 import { Stream, StreamStatus } from '../types';
+import {
+    requirePolicy,
+    type ApiRequestContext,
+} from './api-policy';
+import {
+    validateStreamId,
+    validateAddress,
+    validateCreateStreamInput,
+    validateWithdrawInput,
+    validateDistributeInput,
+    validateDepositInput,
+    validateFailureProofInput,
+    validateStreamActionInput,
+} from './api-schemas';
+
+// NOTE: This module is the single entry point for API-side validation and
+// authorization. Every exported function validates its inputs with the shared
+// schemas in `api-schemas` before touching services/contracts, and privileged
+// operations call `requirePolicy(request, 'privileged')` from `api-policy`.
+// Do not bypass these helpers by calling the SDK clients directly from routes.
 
 type WalletSigner = (xdr: string) => Promise<string>;
+
+/**
+ * Optional request context threaded through API calls. When omitted, calls are
+ * treated as unauthenticated and privileged operations will be rejected.
+ */
+export type ApiCallContext = ApiRequestContext | undefined;
 
 function deriveHorizonUrl(): string {
     if (env.NEXT_PUBLIC_STELLAR_HORIZON_URL) return env.NEXT_PUBLIC_STELLAR_HORIZON_URL;
@@ -97,15 +123,17 @@ function createDistributorClient(publicKey: string): DistributorClient {
 }
 
 export async function fetchStream(streamId: number, signal?: AbortSignal): Promise<Stream | null> {
+    const id = validateStreamId(streamId);
     throwIfAborted(signal);
-    const stream = await stellarService.getStream(BigInt(streamId));
+    const stream = await stellarService.getStream(id);
     throwIfAborted(signal);
     return stream ? mapServiceStream(stream) : null;
 }
 
 export async function fetchUserStreams(address: string, signal?: AbortSignal): Promise<Stream[]> {
+    const account = validateAddress(address);
     throwIfAborted(signal);
-    const streams = await stellarService.getStreams(address);
+    const streams = await stellarService.getStreams(account);
     throwIfAborted(signal);
     return streams.map(mapServiceStream);
 }
@@ -118,16 +146,18 @@ export async function createStream(params: {
     startTime: number;
     endTime: number;
     signTransaction?: WalletSigner;
+    request?: ApiCallContext;
 }): Promise<string> {
-    const client = createPaymentStreamClient(params.sender);
+    const input = validateCreateStreamInput(params);
+    const client = createPaymentStreamClient(input.sender);
     const tx = await client.createStream({
-        sender: params.sender,
-        recipient: params.recipient,
-        token: params.token,
-        total_amount: params.amount,
+        sender: input.sender,
+        recipient: input.recipient,
+        token: input.token,
+        total_amount: input.amount,
         initial_amount: 0n,
-        start_time: BigInt(params.startTime),
-        end_time: BigInt(params.endTime),
+        start_time: BigInt(input.startTime),
+        end_time: BigInt(input.endTime),
     });
 
     await signAndSendTx(tx, params.signTransaction);
@@ -144,10 +174,12 @@ export async function withdraw(params: {
     amount: bigint;
     sender?: string;
     signTransaction?: WalletSigner;
+    request?: ApiCallContext;
 }): Promise<string> {
-    let sender = params.sender;
+    const input = validateWithdrawInput(params);
+    let sender = input.sender;
     if (!sender) {
-        const stream = await stellarService.getStream(BigInt(params.streamId));
+        const stream = await stellarService.getStream(input.streamId);
         sender = stream?.recipient;
     }
 
@@ -156,7 +188,7 @@ export async function withdraw(params: {
     }
 
     const client = createPaymentStreamClient(sender);
-    const tx = await client.withdraw(BigInt(params.streamId), params.amount);
+    const tx = await client.withdraw(input.streamId, input.amount);
     const hash = await signAndSendTx(tx, params.signTransaction);
     return hash;
 }
@@ -167,17 +199,20 @@ export async function distribute(params: {
     recipients: string[];
     amounts: bigint[] | bigint;
     signTransaction?: WalletSigner;
+    request?: ApiCallContext;
 }): Promise<void> {
-    const client = createDistributorClient(params.sender);
+    requirePolicy(params.request, 'privileged');
+    const input = validateDistributeInput(params);
+    const client = createDistributorClient(input.sender);
     const BATCH_SIZE = 100;
 
-    if (typeof params.amounts === 'bigint') {
-        const recipientBatches = createBatches(params.recipients, BATCH_SIZE);
+    if (typeof input.amounts === 'bigint') {
+        const recipientBatches = createBatches(input.recipients, BATCH_SIZE);
         for (const batch of recipientBatches) {
             const tx = await client.distributeEqual({
-                sender: params.sender,
-                token: params.token,
-                total_amount: params.amounts,
+                sender: input.sender,
+                token: input.token,
+                total_amount: input.amounts,
                 recipients: batch,
             });
             await signAndSendTx(tx, params.signTransaction);
@@ -185,17 +220,13 @@ export async function distribute(params: {
         return;
     }
 
-    if (params.amounts.length !== params.recipients.length) {
-        throw new Error('Recipients and amounts length mismatch');
-    }
-
-    const recipientBatches = createBatches(params.recipients, BATCH_SIZE);
-    const amountBatches = createBatches(params.amounts, BATCH_SIZE);
+    const recipientBatches = createBatches(input.recipients, BATCH_SIZE);
+    const amountBatches = createBatches(input.amounts, BATCH_SIZE);
 
     for (let i = 0; i < recipientBatches.length; i++) {
         const tx = await client.distributeWeighted({
-            sender: params.sender,
-            token: params.token,
+            sender: input.sender,
+            token: input.token,
             recipients: recipientBatches[i],
             amounts: amountBatches[i],
         });
@@ -204,35 +235,50 @@ export async function distribute(params: {
 }
 
 export async function fetchAccountInfo(address: string, signal?: AbortSignal): Promise<AccountInfo | null> {
+    const account = validateAddress(address);
     throwIfAborted(signal);
     try {
-        return await stellarService.getAccount(address, signal);
+        return await stellarService.getAccount(account, signal);
     } catch {
         return null;
     }
 }
-export async function pauseStream(params: { id: string; address: string; signTransaction: (xdr: string) => Promise<string> }) {
+export async function pauseStream(params: {
+    id: string;
+    address: string;
+    signTransaction: (xdr: string) => Promise<string>;
+    request?: ApiCallContext;
+}) {
+    requirePolicy(params.request, 'privileged');
+    const input = validateStreamActionInput(params);
     const client = new PaymentStreamClient({
         networkPassphrase: NETWORK_PASSPHRASE,
         rpcUrl: SOROBAN_RPC_URL,
         contractId: PAYMENT_STREAM_CONTRACT_ID,
-        publicKey: params.address,
+        publicKey: input.address,
     });
 
-    const tx = await client.pauseStream(BigInt(params.id));
+    const tx = await client.pauseStream(input.id);
 
     await signAndSendTx(tx, params.signTransaction);
 }
 
-export async function resumeStream(params: { id: string; address: string; signTransaction: (xdr: string) => Promise<string> }) {
+export async function resumeStream(params: {
+    id: string;
+    address: string;
+    signTransaction: (xdr: string) => Promise<string>;
+    request?: ApiCallContext;
+}) {
+    requirePolicy(params.request, 'privileged');
+    const input = validateStreamActionInput(params);
     const client = new PaymentStreamClient({
         networkPassphrase: NETWORK_PASSPHRASE,
         rpcUrl: SOROBAN_RPC_URL,
         contractId: PAYMENT_STREAM_CONTRACT_ID,
-        publicKey: params.address,
+        publicKey: input.address,
     });
 
-    const tx = await client.resumeStream(BigInt(params.id));
+    const tx = await client.resumeStream(input.id);
 
     await signAndSendTx(tx, params.signTransaction);
 }
@@ -242,9 +288,11 @@ export async function depositToStream(params: {
     amount: bigint;
     sender: string;
     signTransaction?: WalletSigner;
+    request?: ApiCallContext;
 }): Promise<string> {
-    const client = createPaymentStreamClient(params.sender);
-    const tx = await client.deposit(BigInt(params.streamId), params.amount);
+    const input = validateDepositInput(params);
+    const client = createPaymentStreamClient(input.sender);
+    const tx = await client.deposit(input.streamId, input.amount);
     const hash = await signAndSendTx(tx, params.signTransaction);
     return hash;
 }
@@ -252,19 +300,27 @@ export async function depositToStream(params: {
 export async function getWithdrawableAmount(params: {
     streamId: number;
 }): Promise<string> {
-    const amount = await stellarService.getWithdrawableAmount(BigInt(params.streamId));
+    const streamId = validateStreamId(params.streamId);
+    const amount = await stellarService.getWithdrawableAmount(streamId);
     return amount.toString();
 }
 
-export async function cancelStream(params: { id: string; address: string; signTransaction: (xdr: string) => Promise<string> }) {
+export async function cancelStream(params: {
+    id: string;
+    address: string;
+    signTransaction: (xdr: string) => Promise<string>;
+    request?: ApiCallContext;
+}) {
+    requirePolicy(params.request, 'privileged');
+    const input = validateStreamActionInput(params);
     const client = new PaymentStreamClient({
         networkPassphrase: NETWORK_PASSPHRASE,
         rpcUrl: SOROBAN_RPC_URL,
         contractId: PAYMENT_STREAM_CONTRACT_ID,
-        publicKey: params.address,
+        publicKey: input.address,
     });
 
-    const tx = await client.cancelStream(BigInt(params.id));
+    const tx = await client.cancelStream(input.id);
 
     await signAndSendTx(tx, params.signTransaction);
 }
@@ -274,9 +330,12 @@ export async function submitFailureProof(params: {
     address: string;
     evidence: string;
     signTransaction?: WalletSigner;
+    request?: ApiCallContext;
 }): Promise<string> {
-    const client = createPaymentStreamClient(params.address);
-    const tx = await client.submitFailureProof(BigInt(params.streamId), params.evidence);
+    requirePolicy(params.request, 'privileged');
+    const input = validateFailureProofInput(params);
+    const client = createPaymentStreamClient(input.address);
+    const tx = await client.submitFailureProof(input.streamId, input.evidence);
     const hash = await signAndSendTx(tx, params.signTransaction);
     return hash;
 }

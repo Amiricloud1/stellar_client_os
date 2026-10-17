@@ -5,17 +5,23 @@
  * Mount in `src/middleware.ts` (Next.js edge middleware) or call directly
  * from individual route handlers for fine-grained control.
  *
- * # Keying strategy
- * Rate-limit key = IP address extracted from:
- *   1. X-Forwarded-For header (first IP, set by proxies / Vercel)
- *   2. X-Real-IP header (nginx convention)
- *   3. "anonymous" fallback (always-allow when IP cannot be determined)
+ * # Keying strategy (issue #56 — unified policy)
+ * Rate-limit key = client IP address extracted with a trusted-proxy allowlist:
+ *   1. Determine the peer (socket) address from the request.
+ *   2. Only when the peer is listed in `TRUSTED_PROXIES` (comma-separated IPs)
+ *      do we honour `X-Forwarded-For` (first hop) or `X-Real-IP`.
+ *   3. Otherwise the peer address is used directly, so spoofed forwarding
+ *      headers from untrusted clients cannot rotate the rate-limit key.
+ *   4. "anonymous" fallback when no address can be determined.
+ *
+ * All route classes share one policy (see `@/lib/api-policy`); the route class
+ * determines the limit/window and the standard `RateLimit-*` headers.
  *
  * # Configuration (environment variables)
  * | Variable                | Default | Description                              |
  * |-------------------------|---------|------------------------------------------|
- * | RATE_LIMIT_MAX_REQUESTS | 60      | Requests per window                      |
- * | RATE_LIMIT_WINDOW_MS    | 60000   | Window duration in ms                    |
+ * | TRUSTED_PROXIES         | —       | Comma-separated proxy IPs allowed to set XFF |
+ * | RATE_LIMIT_WINDOW_MS    | 60000   | Window duration in ms (global override)  |
  * | RATE_LIMIT_KEY_PREFIX   | rl      | Redis key prefix                         |
  * | RATE_LIMIT_SKIP_IPS     | —       | Comma-separated IPs to always allow      |
  *
@@ -26,7 +32,7 @@
  *
  * export const POST = withRateLimit(async (req) => {
  *   // ...handler
- * }, { limit: 10, windowMs: 60_000, keyPrefix: "rl:stream" });
+ * }, "stream");
  * ```
  */
 
@@ -39,20 +45,44 @@ import {
   resolveCampaignApiTier,
   type RateLimitOptions,
 } from "@/lib/rate-limit";
+import {
+  checkRouteLimit,
+  getRouteClassPolicy,
+  type RouteClass,
+} from "@/lib/api-policy";
 
 // ── IP extraction ─────────────────────────────────────────────────────────────
 
-export function extractIp(req: NextRequest): string {
-  const xff = req.headers.get("x-forwarded-for");
-  if (xff) {
-    const first = xff.split(",")[0].trim();
-    if (first) return first;
-  }
-  const xri = req.headers.get("x-real-ip");
-  if (xri) return xri.trim();
-  // NextRequest.ip is available in some deployment environments
+function getTrustedProxies(): Set<string> {
+  const raw = process.env.TRUSTED_PROXIES ?? "";
+  return new Set(raw.split(",").map((s) => s.trim()).filter(Boolean));
+}
+
+function getPeerAddress(req: NextRequest): string | null {
+  // NextRequest.ip is available in some deployment environments (socket peer).
   const ip = (req as unknown as { ip?: string }).ip;
-  if (ip) return ip;
+  return ip ? ip.trim() : null;
+}
+
+export function extractIp(req: NextRequest): string {
+  const peer = getPeerAddress(req);
+  const trusted = getTrustedProxies();
+
+  // Only honour forwarding headers when the immediate peer is a trusted proxy.
+  if (peer && trusted.has(peer)) {
+    const xff = req.headers.get("x-forwarded-for");
+    if (xff) {
+      const first = xff.split(",")[0].trim();
+      if (first) return first;
+    }
+    const xri = req.headers.get("x-real-ip");
+    if (xri) {
+      const trimmed = xri.trim();
+      if (trimmed) return trimmed;
+    }
+  }
+
+  if (peer) return peer;
   return "anonymous";
 }
 
@@ -76,19 +106,20 @@ function getSkipIps(): Set<string> {
 // ── Core check ────────────────────────────────────────────────────────────────
 
 /**
- * Check whether a request should be rate-limited.
+ * Check whether a request should be rate-limited under the unified policy.
  * Returns `null` if allowed, or a `NextResponse` (429) if rejected.
+ * The route class selects the limit/window from `@/lib/api-policy`.
  */
 export async function checkRateLimit(
   req: NextRequest,
-  limiter: RateLimiter
+  routeClass: RouteClass
 ): Promise<NextResponse | null> {
   const ip = extractIp(req);
 
   // Skip-list: internal/trusted IPs bypass rate limiting
   if (getSkipIps().has(ip)) return null;
 
-  const result = await limiter.check(ip);
+  const result = await checkRouteLimit(routeClass, ip);
   const headers = buildRateLimitHeaders(result);
 
   if (!result.allowed) {
@@ -96,6 +127,7 @@ export async function checkRateLimit(
       {
         error: "Too many requests",
         code: "RATE_LIMIT_EXCEEDED",
+        routeClass,
         retryAfter: headers["Retry-After"],
       },
       {
@@ -114,19 +146,17 @@ type RouteHandler = (req: NextRequest) => Promise<NextResponse> | NextResponse;
 
 /**
  * Higher-order function that wraps a Next.js App Router route handler
- * with sliding-window rate limiting.
+ * with unified sliding-window rate limiting for the given route class.
  *
- * @param handler  — the original route handler
- * @param options  — rate-limit options (overrides env vars)
+ * @param handler    — the original route handler
+ * @param routeClass — route class from `@/lib/api-policy` (defaults to "public")
  */
 export function withRateLimit(
   handler: RouteHandler,
-  options?: Partial<RateLimitOptions>
+  routeClass: RouteClass = "public"
 ): RouteHandler {
-  const limiter = createRateLimiter(getRedisClient(), options);
-
   return async (req: NextRequest): Promise<NextResponse> => {
-    const limited = await checkRateLimit(req, limiter);
+    const limited = await checkRateLimit(req, routeClass);
     if (limited) return limited;
     return handler(req);
   };
@@ -134,14 +164,29 @@ export function withRateLimit(
 
 type CampaignRouteHandler = (req: Request, ...args: any[]) => Promise<Response> | Response;
 export function withCampaignApiRateLimit(handler: CampaignRouteHandler): CampaignRouteHandler {
-  const redis = getRedisClient();
   return async (req: Request, ...args: any[]): Promise<Response> => {
     const nextReq = req as NextRequest;
     const { identity, tier } = extractCampaignApiIdentity(req);
     if (getSkipIps().has(extractIp(nextReq))) return handler(req, ...args);
-    const result = await new RateLimiter(redis, { limit: tier.hourlyLimit, windowMs: tier.windowMs, keyPrefix: "rl:campaign-api" }).check(identity);
+    const policy = getRouteClassPolicy("campaign-api");
+    const result = await checkRouteLimit("campaign-api", identity, {
+      limit: tier.hourlyLimit,
+      windowMs: tier.windowMs,
+      keyPrefix: policy.keyPrefix,
+    });
     const headers = buildRateLimitHeaders(result);
-    if (!result.allowed) return NextResponse.json({ error: "Too many requests", code: "RATE_LIMIT_EXCEEDED", tier: tier.id, retryAfter: headers["Retry-After"] }, { status: 429, headers });
+    if (!result.allowed) {
+      return NextResponse.json(
+        {
+          error: "Too many requests",
+          code: "RATE_LIMIT_EXCEEDED",
+          routeClass: "campaign-api",
+          tier: tier.id,
+          retryAfter: headers["Retry-After"],
+        },
+        { status: 429, headers }
+      );
+    }
     return handler(req, ...args);
   };
 }
@@ -151,25 +196,27 @@ export function withCampaignApiRateLimit(handler: CampaignRouteHandler): Campaig
 let _streamLimiter: RateLimiter | null = null;
 let _submitLimiter: RateLimiter | null = null;
 
-/** 30 stream-creation requests per minute per IP */
+/** Stream-creation limiter — policy from the "stream" route class */
 export function getStreamLimiter(): RateLimiter {
   if (!_streamLimiter) {
+    const policy = getRouteClassPolicy("stream");
     _streamLimiter = new RateLimiter(getRedisClient(), {
-      limit: Number(process.env.RATE_LIMIT_STREAM_MAX ?? 30),
-      windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS ?? 60_000),
-      keyPrefix: "rl:stream",
+      limit: policy.limit,
+      windowMs: policy.windowMs,
+      keyPrefix: policy.keyPrefix,
     });
   }
   return _streamLimiter;
 }
 
-/** 10 payment-submission requests per minute per IP */
+/** Payment-submission limiter — policy from the "submit" route class */
 export function getSubmitLimiter(): RateLimiter {
   if (!_submitLimiter) {
+    const policy = getRouteClassPolicy("submit");
     _submitLimiter = new RateLimiter(getRedisClient(), {
-      limit: Number(process.env.RATE_LIMIT_SUBMIT_MAX ?? 10),
-      windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS ?? 60_000),
-      keyPrefix: "rl:submit",
+      limit: policy.limit,
+      windowMs: policy.windowMs,
+      keyPrefix: policy.keyPrefix,
     });
   }
   return _submitLimiter;

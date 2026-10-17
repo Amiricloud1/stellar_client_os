@@ -2,6 +2,31 @@ import { z } from 'zod'
 import { env } from './env'
 import { StellarService } from './stellar'
 import { validateContractId } from './stream-validation'
+import {
+  stellarAddressSchema,
+  contractIdSchema,
+  tokenAmountSchema,
+  positiveIntegerStringSchema,
+  streamIdSchema,
+  paginationQuerySchema,
+  streamStatusSchema,
+} from './api-schemas'
+
+// Re-export the shared API schemas so form and API validation share a single
+// source of truth (issue #55). Consumers should prefer importing from here.
+export {
+  stellarAddressSchema,
+  contractIdSchema,
+  tokenAmountSchema,
+  positiveIntegerStringSchema,
+  streamIdSchema,
+  paginationQuerySchema,
+  streamStatusSchema,
+}
+export type {
+  PaginationQuery,
+  StreamStatus,
+} from './api-schemas'
 
 // Stream record type for display
 export interface StreamRecord {
@@ -30,10 +55,7 @@ export interface StreamRecord {
 export const TOKEN_AMOUNT_REGEX = /^\d+(\.\d{1,7})?$/
 
 export const paymentStreamSchema = z.object({
-  recipientAddress: z
-    .string()
-    .min(1, "Recipient address is required")
-    .refine((address) => StellarService.validateStellarAddress(address), "Please enter a valid Stellar public key"),
+  recipientAddress: stellarAddressSchema,
   
   token: z
     .string()
@@ -43,28 +65,15 @@ export const paymentStreamSchema = z.object({
       "Invalid token: must be 'native' or a valid Stellar contract ID"
     ),
   
-  totalAmount: z
-    .string()
-    .min(1, "Amount is required")
-    .refine((val) => {
-      const num = parseFloat(val)
-      return !isNaN(num) && num > 0
-    }, "Amount must be a positive number")
-    .refine((val) => TOKEN_AMOUNT_REGEX.test(val), "Amount cannot exceed 7 decimal places"),
+  totalAmount: tokenAmountSchema,
   
-  duration: z
-    .string()
-    .min(1, "Duration is required")
-    .refine((val) => {
-      const num = parseInt(val)
-      return !isNaN(num) && num > 0
-    }, "Duration must be a positive number"),
+  duration: positiveIntegerStringSchema,
   
   durationUnit: z.enum(["hours", "days"]),
   
   cancelable: z.boolean(),
   transferable: z.boolean(),
-})
+}).strict()
 
 export type PaymentStreamFormData = z.infer<typeof paymentStreamSchema>
 
@@ -76,7 +85,7 @@ export type PaymentStreamFormData = z.infer<typeof paymentStreamSchema>
 export const cloneCampaignSchema = paymentStreamSchema.extend({
   sourceCampaignId: z.string().min(1, "Source Campaign ID is required"),
   species: z.string().min(1, "Species is required"),
-})
+}).strict()
 
 export type CloneCampaignFormData = z.infer<typeof cloneCampaignSchema>
 
@@ -84,7 +93,7 @@ export const insuranceClaimSchema = z.object({
   changedBy: z.string().min(1, "changedBy is required"),
   evidence: z.array(z.string().min(1, "Each evidence key must not be empty")).min(1, "At least one evidence file is required"),
   description: z.string().max(2000, "Description cannot exceed 2000 characters").optional(),
-});
+}).strict();
 
 export type InsuranceClaimFormData = z.infer<typeof insuranceClaimSchema>;
 
@@ -137,36 +146,19 @@ export function getTokenSymbol(tokenOrAddress: string): string {
 }
 
 export const withdrawStreamSchema = z.object({
-  amount: z
-    .string()
-    .min(1, "Amount is required")
-    .refine((val) => {
-      const num = parseFloat(val)
-      return !isNaN(num) && num > 0
-    }, "Amount must be a positive number")
-    .refine((val) => TOKEN_AMOUNT_REGEX.test(val), "Amount cannot exceed 7 decimal places"),
+  amount: tokenAmountSchema,
   
-  withdrawTo: z
-    .string()
-    .min(1, "Withdraw address is required")
-    .refine((address) => StellarService.validateStellarAddress(address), "Invalid Stellar address format"),
+  withdrawTo: stellarAddressSchema,
   
   useMax: z.boolean(),
   useSelf: z.boolean(),
-})
+}).strict()
 
 export type WithdrawStreamFormData = z.infer<typeof withdrawStreamSchema>
 
 export const depositStreamSchema = z.object({
-  amount: z
-    .string()
-    .min(1, "Amount is required")
-    .refine((val) => {
-      const num = parseFloat(val)
-      return !isNaN(num) && num > 0
-    }, "Amount must be a positive number")
-    .refine((val) => TOKEN_AMOUNT_REGEX.test(val), "Amount cannot exceed 7 decimal places"),
-})
+  amount: tokenAmountSchema,
+}).strict()
 
 export type DepositStreamFormData = z.infer<typeof depositStreamSchema>
 
@@ -178,16 +170,9 @@ export const updateCampaignSchema = z.object({
   id: z.union([z.number(), z.string()]),
   name: z.string().min(1, "Campaign name is required"),
   description: z.string().min(1, "Description is required"),
-  goalAmount: z
-    .string()
-    .min(1, "Goal amount is required")
-    .refine((val) => {
-      const num = parseFloat(val)
-      return !isNaN(num) && num > 0
-    }, "Goal amount must be a positive number")
-    .refine((val) => TOKEN_AMOUNT_REGEX.test(val), "Goal amount cannot exceed 7 decimal places"),
+  goalAmount: tokenAmountSchema,
   deadline: z.string().min(1, "Deadline is required"),
-})
+}).strict()
 
 export type UpdateCampaignFormData = z.infer<typeof updateCampaignSchema>
 

@@ -65,3 +65,45 @@ export interface CampaignCompletedEvent {
   goalAmount?: string;
   metadata?: Record<string, unknown>;
 }
+
+/**
+ * A campaign webhook subscription as stored server-side.
+ *
+ * `accountId` scopes the subscription to its owning account so that reads,
+ * updates, rotations and revocations can be authorized against the caller.
+ * `secret` is the HMAC signing secret and must never be returned by read
+ * endpoints — use {@link CampaignWebhookSubscriptionPublic} for responses.
+ */
+export interface CampaignWebhookSubscription {
+  id: string;
+  /** Owning account; used to enforce cross-account isolation. */
+  accountId: string;
+  campaignId: string;
+  url: string;
+  events: CampaignWebhookEvent[];
+  /** HMAC signing secret. Only revealed once, at creation or rotation. */
+  secret: string;
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+  /** Timestamp of the most recent secret rotation, if any. */
+  secretRotatedAt?: string;
+}
+
+/**
+ * Public projection of a campaign webhook subscription. Omits `secret` so
+ * that read endpoints can never leak the signing secret.
+ */
+export type CampaignWebhookSubscriptionPublic = Omit<
+  CampaignWebhookSubscription,
+  "secret"
+>;
+
+/**
+ * Response returned when a subscription is created or its secret is rotated.
+ * This is the only place the plaintext secret is exposed.
+ */
+export interface CampaignWebhookSubscriptionWithSecret
+  extends CampaignWebhookSubscriptionPublic {
+  secret: string;
+}

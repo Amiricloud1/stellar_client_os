@@ -11,6 +11,9 @@ import type { CampaignDataSource, CampaignQueryInput } from "@/services/campaign
 import { getCampaignSequelService } from "@/services/campaign-sequel.service";
 import { getCampaignAnalyticsDashboard } from "@/services/campaign-analytics-dashboard.service";
 import { getGrantProgramService } from "@/services/grant-program.service";
+import { requirePolicy } from "@/api/api-policy";
+import { parseArgs, ValidationError } from "@/api/api-schemas";
+import { getWebhookSubscriptionService } from "@/services/webhook-subscription.service";
 import type {
   RegionFilter,
   CategoryFilter,
@@ -26,10 +29,36 @@ interface ResolverContext {
   /** Optional custom data source — used in tests to inject fixtures. */
   dataSource?: StreamDataSource;
   campaignDataSource?: CampaignDataSource;
+  /** Authenticated account id, populated by the API auth middleware. */
+  accountId?: string;
+  /** Roles granted to the authenticated account. */
+  roles?: string[];
 }
 
 function resolveDataSource(ctx: ResolverContext, fallback?: StreamDataSource): StreamDataSource {
   return ctx.dataSource ?? fallback ?? new DefaultStreamDataSource();
+}
+
+/**
+ * Enforce the route policy for a resolver and validate its arguments against the
+ * shared schemas. Invalid or unknown input is surfaced as a consistent
+ * 400-style `ValidationError` (see `api-schemas.ts`).
+ */
+function guard<T>(
+  route: string,
+  ctx: ResolverContext,
+  args: unknown,
+  schema: Parameters<typeof parseArgs>[1],
+): T {
+  requirePolicy(route, { accountId: ctx.accountId, roles: ctx.roles });
+  return parseArgs(args, schema) as T;
+}
+
+function requireAccountId(ctx: ResolverContext): string {
+  if (!ctx.accountId) {
+    throw new ValidationError("Authentication required", [{ path: "accountId", message: "missing account" }]);
+  }
+  return ctx.accountId;
 }
 
 function toBigInt(value: string): bigint {
@@ -85,7 +114,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
     Query: {
       campaigns: async (
         _: unknown,
-        args: {
+        rawArgs: {
           filter?: CampaignQueryInput["filter"];
           sort?: CampaignQueryInput["sort"];
           pagination?: PaginationInput;
@@ -93,6 +122,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         },
         ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.campaigns", ctx, rawArgs, "campaigns");
         const campaigns = await queryCampaigns({
           filter: args.filter,
           sort: args.sort,
@@ -105,13 +135,14 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
 
       trees: async (
         _: unknown,
-        args: {
+        rawArgs: {
           filter?: { planter?: string; region?: string; status?: StreamStatusFilter; search?: string };
           pagination?: PaginationInput;
           network?: Network;
         },
         ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.trees", ctx, rawArgs, "trees");
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const filter = args.filter ?? {};
         const filtered = streams.filter((stream) => {
@@ -138,9 +169,10 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
 
       planters: async (
         _: unknown,
-        args: { region?: string; pagination?: PaginationInput; network?: Network },
+        rawArgs: { region?: string; pagination?: PaginationInput; network?: Network },
         ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.planters", ctx, rawArgs, "planters");
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const groups = new Map<string, { region: string | null; treeCount: number; sponsoredAmount: bigint }>();
         for (const stream of streams) {
@@ -160,9 +192,10 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
 
       contracts: async (
         _: unknown,
-        args: { pagination?: PaginationInput; network?: Network },
+        rawArgs: { pagination?: PaginationInput; network?: Network },
         ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.contracts", ctx, rawArgs, "contracts");
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const groups = new Map<string, { symbol: string; streamCount: number; totalVolume: bigint }>();
         for (const stream of streams) {
@@ -187,9 +220,10 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
        */
       globalMetrics: async (
         _: unknown,
-        args: { network?: Network },
+        rawArgs: { network?: Network },
         ctx: ResolverContext
       ) => {
+        const args = guard<typeof rawArgs>("Query.globalMetrics", ctx, rawArgs, "network");
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
         return service.getGlobalMetrics(args.network ?? "testnet");
       },
@@ -207,13 +241,14 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
        */
       regionMetrics: async (
         _: unknown,
-        args: {
+        rawArgs: {
           filter?: RegionFilter;
           pagination?: PaginationInput;
           network?: Network;
         },
         ctx: ResolverContext
       ) => {
+        const args = guard<typeof rawArgs>("Query.regionMetrics", ctx, rawArgs, "regionMetrics");
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
         return service.getRegionMetrics(
           args.filter,
@@ -234,13 +269,14 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
        */
       categoryMetrics: async (
         _: unknown,
-        args: {
+        rawArgs: {
           filter?: CategoryFilter;
           pagination?: PaginationInput;
           network?: Network;
         },
         ctx: ResolverContext
       ) => {
+        const args = guard<typeof rawArgs>("Query.categoryMetrics", ctx, rawArgs, "categoryMetrics");
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
         return service.getCategoryMetrics(
           args.filter,
@@ -261,13 +297,14 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
        */
       assetMetrics: async (
         _: unknown,
-        args: {
+        rawArgs: {
           filter?: AssetFilter;
           pagination?: PaginationInput;
           network?: Network;
         },
         ctx: ResolverContext
       ) => {
+        const args = guard<typeof rawArgs>("Query.assetMetrics", ctx, rawArgs, "assetMetrics");
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
         return service.getAssetMetrics(
           args.filter,
@@ -290,18 +327,20 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
        */
       sponsorImpact: async (
         _: unknown,
-        args: { address: string; network?: Network },
+        rawArgs: { address: string; network?: Network },
         ctx: ResolverContext
       ) => {
+        const args = guard<typeof rawArgs>("Query.sponsorImpact", ctx, rawArgs, "sponsorImpact");
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
         return service.getSponsorImpact(args.address, args.network ?? "testnet");
       },
 
       campaignSequels: async (
         _: unknown,
-        args: { campaignId: string; relation?: "SEQUEL" | "PREQUEL" | "SPINOFF" | "RELATED" },
+        rawArgs: { campaignId: string; relation?: "SEQUEL" | "PREQUEL" | "SPINOFF" | "RELATED" },
         ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.campaignSequels", ctx, rawArgs, "campaignSequels");
         const sequels = await getCampaignSequelService(ctx.campaignDataSource).getSequels(args.campaignId, {
           relation: args.relation,
         });
@@ -316,9 +355,10 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
 
       nextInSeries: async (
         _: unknown,
-        args: { campaignId: string },
+        rawArgs: { campaignId: string },
         ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.nextInSeries", ctx, rawArgs, "campaignId");
         const result = await getCampaignSequelService(ctx.campaignDataSource).getNextInSeries(args.campaignId);
         if (!result) return null;
         return {
@@ -332,20 +372,25 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
 
       campaignAnalytics: async (
         _: unknown,
-        args: { campaignId: string; network?: Network },
+        rawArgs: { campaignId: string; network?: Network },
+        ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.campaignAnalytics", ctx, rawArgs, "campaignAnalytics");
         return getCampaignAnalyticsDashboard(args.campaignId);
       },
 
-      grantPrograms: async () => {
+      grantPrograms: async (_: unknown, rawArgs: unknown, ctx: ResolverContext) => {
+        guard("Query.grantPrograms", ctx, rawArgs, "empty");
         const programs = await getGrantProgramService().listPrograms();
         return programs.map(toProgramPayload);
       },
 
       grantProgramSummary: async (
         _: unknown,
-        args: { programId: string; campaignId: string },
+        rawArgs: { programId: string; campaignId: string },
+        ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.grantProgramSummary", ctx, rawArgs, "grantProgramSummary");
         const summary = await getGrantProgramService().getProgramSummary(args.programId, args.campaignId);
         if (!summary) return null;
         return {
@@ -356,21 +401,39 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
 
       campaignGrantAllocations: async (
         _: unknown,
-        args: { campaignId: string },
+        rawArgs: { campaignId: string },
+        ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.campaignGrantAllocations", ctx, rawArgs, "campaignId");
         const allocations = await getGrantProgramService().getCampaignAllocations(args.campaignId);
         return allocations.map((allocation) => ({
           ...allocation,
           allocatedAt: Math.floor(allocation.allocatedAt / 1000),
         }));
       },
+
+      /**
+       * List webhook subscriptions owned by the authenticated account.
+       * Secrets are never returned after creation (issue #69).
+       */
+      webhookSubscriptions: async (
+        _: unknown,
+        rawArgs: { pagination?: PaginationInput },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Query.webhookSubscriptions", ctx, rawArgs, "pagination");
+        const accountId = requireAccountId(ctx);
+        const subscriptions = await getWebhookSubscriptionService().listSubscriptions(accountId);
+        return paginate(subscriptions.map(toWebhookPayload), args.pagination);
+      },
     },
     Mutation: {
       cloneCampaign: async (
         _: unknown,
-        args: { id: string; network?: Network },
+        rawArgs: { id: string; network?: Network },
         ctx: ResolverContext
       ) => {
+        const args = guard<typeof rawArgs>("Mutation.cloneCampaign", ctx, rawArgs, "cloneCampaign");
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const campaign = streams.find((stream) => stream.id === args.id);
         if (!campaign) throw new Error(`Campaign ${args.id} not found`);
@@ -386,13 +449,14 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
        */
       updateCampaign: async (
         _: unknown,
-        args: {
+        rawArgs: {
           id: string;
           input: { name?: string; description?: string; goalAmount?: string; deadline?: number };
           network?: Network;
         },
         ctx: ResolverContext
       ) => {
+        const args = guard<typeof rawArgs>("Mutation.updateCampaign", ctx, rawArgs, "updateCampaign");
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const campaign = streams.find((stream) => stream.id === args.id);
         if (!campaign) throw new Error(`Campaign ${args.id} not found`);
@@ -407,6 +471,68 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
           endTime: args.input.deadline ?? campaign.endTime,
         };
       },
+
+      /**
+       * Create a webhook subscription for the authenticated account.
+       * The signing secret is returned exactly once, on creation (issue #69).
+       */
+      createWebhookSubscription: async (
+        _: unknown,
+        rawArgs: { input: { url: string; events: string[]; description?: string } },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Mutation.createWebhookSubscription", ctx, rawArgs, "createWebhookSubscription");
+        const accountId = requireAccountId(ctx);
+        const { subscription, secret } = await getWebhookSubscriptionService().createSubscription(accountId, args.input);
+        return { ...toWebhookPayload(subscription), secret };
+      },
+
+      /**
+       * Rotate the signing secret for a subscription owned by the authenticated
+       * account. The new secret is returned exactly once (issue #69).
+       */
+      rotateWebhookSecret: async (
+        _: unknown,
+        rawArgs: { id: string },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Mutation.rotateWebhookSecret", ctx, rawArgs, "webhookId");
+        const accountId = requireAccountId(ctx);
+        const { subscription, secret } = await getWebhookSubscriptionService().rotateSecret(accountId, args.id);
+        return { ...toWebhookPayload(subscription), secret };
+      },
+
+      /**
+       * Revoke a subscription owned by the authenticated account. Cross-account
+       * access is rejected by the service (issue #69).
+       */
+      revokeWebhookSubscription: async (
+        _: unknown,
+        rawArgs: { id: string },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Mutation.revokeWebhookSubscription", ctx, rawArgs, "webhookId");
+        const accountId = requireAccountId(ctx);
+        const subscription = await getWebhookSubscriptionService().revokeSubscription(accountId, args.id);
+        return toWebhookPayload(subscription);
+      },
     },
+  };
+}
+
+/**
+ * Map a stored subscription to its public GraphQL shape. The signing secret is
+ * intentionally omitted — it is only ever returned from create/rotate.
+ */
+function toWebhookPayload(subscription: import("@/services/webhook-subscription.service").WebhookSubscription) {
+  return {
+    id: subscription.id,
+    url: subscription.url,
+    events: subscription.events,
+    description: subscription.description ?? null,
+    status: subscription.status,
+    createdAt: Math.floor(subscription.createdAt / 1000),
+    updatedAt: Math.floor(subscription.updatedAt / 1000),
+    lastDeliveredAt: subscription.lastDeliveredAt ? Math.floor(subscription.lastDeliveredAt / 1000) : null,
   };
 }

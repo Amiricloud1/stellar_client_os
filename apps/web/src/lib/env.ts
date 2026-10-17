@@ -62,6 +62,32 @@ const envSchema = z.object({
     .string()
     .transform((val: string) => val === "true")
     .optional(),
+
+  // Optional: Trusted reverse proxies (comma-separated CIDR/IP list).
+  // Only requests arriving from these addresses may supply forwarding headers
+  // (X-Forwarded-For / X-Real-IP) used for rate-limit identity keys.
+  // Defaults to an empty list, meaning forwarding headers are ignored.
+  TRUSTED_PROXIES: z
+    .string()
+    .optional()
+    .transform((val: string | undefined) =>
+      (val ?? "")
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0),
+    ),
+
+  // Optional: Unified rate-limit policy overrides, per route class.
+  // Each value is a positive integer; unset values fall back to the
+  // per-class defaults defined in the rate-limit policy module.
+  RATE_LIMIT_AUTH_MAX: z.coerce.number().int().positive().optional(),
+  RATE_LIMIT_AUTH_WINDOW_MS: z.coerce.number().int().positive().optional(),
+  RATE_LIMIT_WRITE_MAX: z.coerce.number().int().positive().optional(),
+  RATE_LIMIT_WRITE_WINDOW_MS: z.coerce.number().int().positive().optional(),
+  RATE_LIMIT_READ_MAX: z.coerce.number().int().positive().optional(),
+  RATE_LIMIT_READ_WINDOW_MS: z.coerce.number().int().positive().optional(),
+  RATE_LIMIT_WEBHOOK_MAX: z.coerce.number().int().positive().optional(),
+  RATE_LIMIT_WEBHOOK_WINDOW_MS: z.coerce.number().int().positive().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -88,6 +114,15 @@ export function validateEnv(): Env {
     NEXT_PUBLIC_USDT_CONTRACT_ID: process.env.NEXT_PUBLIC_USDT_CONTRACT_ID,
     NEXT_PUBLIC_EURC_CONTRACT_ID: process.env.NEXT_PUBLIC_EURC_CONTRACT_ID,
     NEXT_PUBLIC_OFFRAMP_MOCK: process.env.NEXT_PUBLIC_OFFRAMP_MOCK,
+    TRUSTED_PROXIES: process.env.TRUSTED_PROXIES,
+    RATE_LIMIT_AUTH_MAX: process.env.RATE_LIMIT_AUTH_MAX,
+    RATE_LIMIT_AUTH_WINDOW_MS: process.env.RATE_LIMIT_AUTH_WINDOW_MS,
+    RATE_LIMIT_WRITE_MAX: process.env.RATE_LIMIT_WRITE_MAX,
+    RATE_LIMIT_WRITE_WINDOW_MS: process.env.RATE_LIMIT_WRITE_WINDOW_MS,
+    RATE_LIMIT_READ_MAX: process.env.RATE_LIMIT_READ_MAX,
+    RATE_LIMIT_READ_WINDOW_MS: process.env.RATE_LIMIT_READ_WINDOW_MS,
+    RATE_LIMIT_WEBHOOK_MAX: process.env.RATE_LIMIT_WEBHOOK_MAX,
+    RATE_LIMIT_WEBHOOK_WINDOW_MS: process.env.RATE_LIMIT_WEBHOOK_WINDOW_MS,
   };
 
   const result = envSchema.safeParse(env);
@@ -127,6 +162,36 @@ export const env = process.env.NODE_ENV === 'test'
       NEXT_PUBLIC_STELLAR_HORIZON_URL: process.env.NEXT_PUBLIC_STELLAR_HORIZON_URL ?? 'https://horizon-testnet.stellar.org',
       NEXT_PUBLIC_USDT_CONTRACT_ID: process.env.NEXT_PUBLIC_USDT_CONTRACT_ID ?? '',
       NEXT_PUBLIC_EURC_CONTRACT_ID: process.env.NEXT_PUBLIC_EURC_CONTRACT_ID ?? '',
+      // Test-mode fallbacks: no trusted proxies (forwarding headers ignored)
+      // and no rate-limit overrides (per-class defaults apply).
+      TRUSTED_PROXIES: (process.env.TRUSTED_PROXIES ?? '')
+        .split(',')
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0),
+      RATE_LIMIT_AUTH_MAX: process.env.RATE_LIMIT_AUTH_MAX
+        ? Number(process.env.RATE_LIMIT_AUTH_MAX)
+        : undefined,
+      RATE_LIMIT_AUTH_WINDOW_MS: process.env.RATE_LIMIT_AUTH_WINDOW_MS
+        ? Number(process.env.RATE_LIMIT_AUTH_WINDOW_MS)
+        : undefined,
+      RATE_LIMIT_WRITE_MAX: process.env.RATE_LIMIT_WRITE_MAX
+        ? Number(process.env.RATE_LIMIT_WRITE_MAX)
+        : undefined,
+      RATE_LIMIT_WRITE_WINDOW_MS: process.env.RATE_LIMIT_WRITE_WINDOW_MS
+        ? Number(process.env.RATE_LIMIT_WRITE_WINDOW_MS)
+        : undefined,
+      RATE_LIMIT_READ_MAX: process.env.RATE_LIMIT_READ_MAX
+        ? Number(process.env.RATE_LIMIT_READ_MAX)
+        : undefined,
+      RATE_LIMIT_READ_WINDOW_MS: process.env.RATE_LIMIT_READ_WINDOW_MS
+        ? Number(process.env.RATE_LIMIT_READ_WINDOW_MS)
+        : undefined,
+      RATE_LIMIT_WEBHOOK_MAX: process.env.RATE_LIMIT_WEBHOOK_MAX
+        ? Number(process.env.RATE_LIMIT_WEBHOOK_MAX)
+        : undefined,
+      RATE_LIMIT_WEBHOOK_WINDOW_MS: process.env.RATE_LIMIT_WEBHOOK_WINDOW_MS
+        ? Number(process.env.RATE_LIMIT_WEBHOOK_WINDOW_MS)
+        : undefined,
     } as ReturnType<typeof validateEnv>)
   : validateEnv();
 
