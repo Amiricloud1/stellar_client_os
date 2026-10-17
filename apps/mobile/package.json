@@ -4,6 +4,20 @@
   "private": true,
   "description": "Fundable Protocol mobile client (Expo / React Native)",
   "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "web": "expo start --web",
+    "build:android:dev": "eas build --platform android --profile development",
+    "build:android:preview": "eas build --platform android --profile preview",
+    "build:android:prod": "eas build --platform android --profile production",
+    "build:ios:dev": "eas build --platform ios --profile development",
+    "build:ios:preview": "eas build --platform ios --profile preview",
+    "build:ios:prod": "eas build --platform ios --profile production",
+    "build:all:prod": "eas build --platform all --profile production",
+    "submit:android": "eas submit --platform android --profile production",
+    "submit:ios": "eas submit --platform ios --profile production",
+    "update": "eas update --auto",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
@@ -11,5 +25,33 @@
   "devDependencies": {
     "typescript": "^5",
     "vitest": "^3.0.0"
+  },
+  "peerDependencies": {
+    "expo": ">=52.0.0",
+    "expo-build-properties": ">=0.13.0",
+    "expo-notifications": ">=0.29.0",
+    "expo-secure-store": ">=14.0.0",
+    "react": ">=18.0.0",
+    "react-native": ">=0.73.0"
+  },
+  "peerDependenciesMeta": {
+    "expo": {
+      "optional": true
+    },
+    "expo-build-properties": {
+      "optional": true
+    },
+    "expo-notifications": {
+      "optional": true
+    },
+    "expo-secure-store": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    },
+    "react-native": {
+      "optional": true
+    }
   }
 }

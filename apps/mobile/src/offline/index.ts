@@ -13,18 +13,23 @@ import { type KeyValueStorage, getOfflineStorage } from "./storage";
 import type { CampaignDetail, CampaignSummary } from "./types";
 import { OfflineWishlist } from "./wishlist";
 import { WishlistSyncQueue } from "./sync";
+import { IdempotentActionQueue } from "./actionQueue";
 
 export * from "./storage";
 export * from "./types";
 export * from "./campaignCache";
 export * from "./wishlist";
 export * from "./sync";
+export * from "./encryptedStorage";
+export * from "./actionQueue";
+export * from "./conflictResolution";
 
 export interface OfflineServices {
   cache: CampaignCache<CampaignSummary[], CampaignDetail>;
   repository: CampaignRepository<CampaignSummary[], CampaignDetail>;
   wishlist: OfflineWishlist;
   queue: WishlistSyncQueue;
+  actionQueue: IdempotentActionQueue;
 }
 
 let services: OfflineServices | null = null;
@@ -47,6 +52,7 @@ export function getOfflineServices(storage?: KeyValueStorage): OfflineServices {
       repository: new CampaignRepository(cache),
       wishlist: new OfflineWishlist(resolved),
       queue: new WishlistSyncQueue(resolved),
+      actionQueue: new IdempotentActionQueue(resolved),
     };
   }
   return services;
