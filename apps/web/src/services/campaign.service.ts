@@ -6,6 +6,10 @@ import { pushNotificationService } from "./push-notification.service";
 import { campaignImpactNftService } from "./campaign-impact-nft.service";
 import type { CampaignWebhookEvent } from "@/types/webhook";
 import type { CampaignLocalizedContent } from "@/lib/translation";
+import {
+  campaignMetricsCache,
+  type CampaignMetricsCache,
+} from "./campaign-metrics-cache.service";
 
 export type CampaignStatus = "DRAFT" | "PENDING_VERIFICATION" | "ACTIVE" | "PAUSED" | "COMPLETED" | "FAILED";
 
@@ -274,6 +278,39 @@ export interface CampaignDataSource {
   saveCampaign(campaign: CampaignRecord): Promise<CampaignRecord>;
 }
 
+/**
+ * Invalidate cached campaign metrics after a mutation or chain correction.
+ *
+ * Every write path in this service funnels through here so authoritative
+ * totals (raised amount, sponsor count, tree count, CO2) can never remain
+ * stale after a mutation. Invalidation is best-effort: a cache hiccup must
+ * never fail the underlying write.
+ */
+export function invalidateCampaignMetrics(
+  campaignId: string,
+  cache: CampaignMetricsCache = campaignMetricsCache,
+): void {
+  try {
+    cache.invalidate(campaignId);
+  } catch (error) {
+    console.error(`[Campaign metrics cache] Failed to invalidate ${campaignId}:`, error);
+  }
+}
+
+/**
+ * Persist a campaign and invalidate its cached metrics in one step. All
+ * mutation helpers in this module should save through this wrapper.
+ */
+async function persistCampaign(
+  dataSource: CampaignDataSource,
+  campaign: CampaignRecord,
+  cache: CampaignMetricsCache = campaignMetricsCache,
+): Promise<CampaignRecord> {
+  const saved = await dataSource.saveCampaign(campaign);
+  invalidateCampaignMetrics(saved.id, cache);
+  return saved;
+}
+
 export interface CampaignFilter {
   status?: CampaignStatus;
   creator?: string;
@@ -330,6 +367,7 @@ export class InMemoryCampaignDataSource implements CampaignDataSource {
       impactMilestonesReached: [...new Set([...alreadyReached, ...currentMilestones])],
     };
     this.campaigns.set(campaign.id, saved);
+    invalidateCampaignMetrics(saved.id);
 
     for (const milestone of newlyReached) {
       try {
@@ -719,7 +757,7 @@ export async function recordCampaignContribution(
     milestonesNotified: [...notified, ...newlyReached],
     updatedAt: now,
   };
-  await dataSource.saveCampaign(updated);
+  await persistCampaign(dataSource, updated);
 
   // Platform-funded creator grant matching: campaigns from underrepresented
   // communities get their first `matchPercentage`% of funds matched
@@ -821,7 +859,7 @@ gpsLocations: input.gpsLocations,
   };
   campaign.statusHistory[0].campaignId = campaign.id;
   campaign.statusHistory[0].id = `${campaign.id}:${now}:0`;
-  return dataSource.saveCampaign(campaign);
+  return persistCampaign(dataSource, campaign);
 }
 
 export async function reviewCampaignNonprofitPartner(
@@ -842,7 +880,7 @@ export async function reviewCampaignNonprofitPartner(
     verifiedAt: verificationStatus === "VERIFIED" ? now : undefined,
     verifiedBy: verificationStatus === "VERIFIED" ? reviewer.trim() : undefined,
   };
-  return dataSource.saveCampaign({ ...campaign, nonprofitPartner: partner, updatedAt: now });
+  return persistCampaign(dataSource, { ...campaign, nonprofitPartner: partner, updatedAt: now });
 }
 
 /**
@@ -881,7 +919,7 @@ export async function autoTranslateCampaignDescription(
   if (campaign.translations?.[targetLanguage]) return campaign;
   if (!translator) throw new Error("No campaign translator configured");
   const translated = await translator(campaign.description ?? "", targetLanguage, sourceLanguage);
-  return dataSource.saveCampaign({
+  return persistCampaign(dataSource, {
     ...campaign,
     language: sourceLanguage,
     translations: {
@@ -992,7 +1030,7 @@ export async function transitionCampaignStatus(
       reason,
     }],
   };
-  const saved = await dataSource.saveCampaign(next);
+  const saved = await persistCampaign(dataSource, next);
   if (toStatus === "COMPLETED") {
     void new CampaignWebhookService().campaignCompleted({
       completionId: `${campaign.id}:completed:${now}`,
@@ -1047,7 +1085,7 @@ export async function submitCampaignInsuranceClaim(
     status: "PENDING",
   };
 
-  return dataSource.saveCampaign({
+  return persistCampaign(dataSource, {
     ...campaign,
     insuranceClaim: claim,
     updatedAt: now,
@@ -1237,7 +1275,7 @@ export async function issueCampaignCarbonCertificates(
       updatedAt: now,
     };
   });
-  return dataSource.saveCampaign({
+  return persistCampaign(dataSource, {
     ...campaign,
     carbonCertificates: [...existingCertificates, ...certificates],
     updatedAt: now,
@@ -1264,7 +1302,7 @@ export async function listCarbonCreditCertificate(
       listedAt: now,
       updatedAt: now,
     };
-    await dataSource.saveCampaign({
+    await persistCampaign(dataSource, {
       ...campaign,
       carbonCertificates: certificates.map((item) => item.id === certificateId ? updatedCertificate : item),
       updatedAt: now,
@@ -1292,7 +1330,7 @@ export async function transferCarbonCreditCertificate(
       status: "transferred",
       updatedAt: now,
     };
-    await dataSource.saveCampaign({
+    await persistCampaign(dataSource, {
       ...campaign,
       carbonCertificates: certificates.map((item) => item.id === certificateId ? updatedCertificate : item),
       updatedAt: now,
@@ -1300,4 +1338,37 @@ export async function transferCarbonCreditCertificate(
     return updatedCertificate;
   }
   return null;
+}
+
+/**
+ * Apply an authoritative chain correction to a campaign's totals.
+ *
+ * Chain reorgs and reconciliation jobs can revise the on-chain raised amount,
+ * sponsor count, or tree count after the fact. Any such correction must
+ * invalidate the cached metrics so subsequent reads observe the corrected
+ * totals rather than a stale snapshot. Returns the updated campaign, or
+ * `null` when the campaign is unknown.
+ */
+export async function applyCampaignChainCorrection(
+  campaignId: string,
+  correction: {
+    raisedAmount?: string;
+    sponsorCount?: number;
+    treeCount?: number;
+    co2Sequestration?: string;
+  },
+  dataSource: CampaignDataSource = getCampaignDataSource(),
+  now = Date.now(),
+): Promise<CampaignRecord | null> {
+  const campaign = await getCampaign(campaignId, dataSource);
+  if (!campaign) return null;
+  const corrected: CampaignRecord = {
+    ...campaign,
+    raisedAmount: correction.raisedAmount ?? campaign.raisedAmount,
+    sponsorCount: correction.sponsorCount ?? campaign.sponsorCount,
+    treeCount: correction.treeCount ?? campaign.treeCount,
+    co2Sequestration: correction.co2Sequestration ?? campaign.co2Sequestration,
+    updatedAt: now,
+  };
+  return persistCampaign(dataSource, corrected);
 }
