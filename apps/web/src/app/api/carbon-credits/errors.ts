@@ -1,6 +1,12 @@
 import { z } from "zod";
 import { isStellarAccount } from "@/lib/admin-auth";
 import { CarbonMarketError, type CarbonMarketErrorCode } from "@/services/carbon-credit-market.service";
+import {
+  apiErrorResponse,
+  getRequestId,
+  validationErrorResponse,
+  type ApiErrorCode,
+} from "@/lib/api-errors";
 
 /** Bearer token for the impact oracle that issues credits from verified campaigns. */
 export const ISSUER_TOKEN_ENV = "CARBON_MARKET_ADMIN_TOKEN";
@@ -19,25 +25,47 @@ const ERROR_STATUS: Record<CarbonMarketErrorCode, number> = {
   INSUFFICIENT_LISTING_QUANTITY: 409,
 };
 
-export function jsonResponse(data: unknown, status = 200): Response {
-  return Response.json({ data }, { status, headers: NO_STORE_HEADERS });
-}
+const ERROR_CODE: Record<CarbonMarketErrorCode, ApiErrorCode> = {
+  INVALID_INPUT: "VALIDATION_ERROR",
+  SELF_TRADE: "VALIDATION_ERROR",
+  NOT_LISTING_OWNER: "FORBIDDEN",
+  LISTING_NOT_FOUND: "NOT_FOUND",
+  INSUFFICIENT_CREDITS: "CONFLICT",
+  LISTING_NOT_OPEN: "CONFLICT",
+  INSUFFICIENT_LISTING_QUANTITY: "CONFLICT",
+};
 
-export function badRequest(message: string): Response {
-  return Response.json({ error: message }, { status: 400, headers: NO_STORE_HEADERS });
-}
-
-export function errorResponse(error: unknown): Response {
-  if (error instanceof CarbonMarketError) {
-    return Response.json(
-      { error: error.message, code: error.code },
-      { status: ERROR_STATUS[error.code], headers: NO_STORE_HEADERS },
-    );
-  }
+export function jsonResponse(data: unknown, status = 200, requestId?: string): Response {
   return Response.json(
-    { error: "Carbon credit market request failed" },
-    { status: 500, headers: NO_STORE_HEADERS },
+    { data },
+    { status, headers: { ...NO_STORE_HEADERS, ...(requestId ? { "X-Request-Id": requestId } : {}) } },
   );
+}
+
+export function badRequest(message: string, requestId?: string): Response {
+  return apiErrorResponse({
+    code: "VALIDATION_ERROR",
+    message,
+    status: 400,
+    requestId,
+  });
+}
+
+export function errorResponse(error: unknown, requestId?: string): Response {
+  if (error instanceof CarbonMarketError) {
+    return apiErrorResponse({
+      code: ERROR_CODE[error.code],
+      message: error.message,
+      status: ERROR_STATUS[error.code],
+      requestId,
+    });
+  }
+  return apiErrorResponse({
+    code: "INTERNAL_ERROR",
+    message: "Carbon credit market request failed",
+    status: 500,
+    requestId,
+  });
 }
 
 /** Parses a JSON body against `schema`, returning the data or a 400 response. */
@@ -45,19 +73,20 @@ export async function parseBody<T>(
   request: Request,
   schema: z.ZodType<T, z.ZodTypeDef, unknown>,
 ): Promise<{ data: T } | { response: Response }> {
+  const requestId = getRequestId(request);
   let body: unknown;
   try {
     body = await request.json();
   } catch {
-    return { response: badRequest("Body must be JSON") };
+    return { response: badRequest("Body must be JSON", requestId) };
   }
   const parsed = schema.safeParse(body);
   if (!parsed.success) {
     return {
-      response: Response.json(
-        { error: "Invalid carbon credit payload", details: parsed.error.flatten() },
-        { status: 400, headers: NO_STORE_HEADERS },
-      ),
+      response: validationErrorResponse(parsed.error, {
+        message: "Invalid carbon credit payload",
+        requestId,
+      }),
     };
   }
   return { data: parsed.data };

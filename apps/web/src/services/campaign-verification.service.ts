@@ -13,6 +13,27 @@ import {
 
 export { VERIFICATION_EVENT_TYPES };
 
+/**
+ * Coarse verification states surfaced to the UI and E2E specs. They are derived
+ * from the audit trail so the same derivation is used in production and in
+ * deterministic fixtures (no live chain or funds required).
+ */
+export const VERIFICATION_STATES = [
+  "unverified",
+  "pending",
+  "verified",
+  "rejected",
+] as const;
+
+export type VerificationState = (typeof VERIFICATION_STATES)[number];
+
+const STATE_BY_EVENT_TYPE: Record<VerificationEventType, VerificationState> = {
+  "verification.requested": "pending",
+  "verification.approved": "verified",
+  "verification.rejected": "rejected",
+  "verification.revoked": "unverified",
+};
+
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -108,4 +129,39 @@ export function verifyVerificationAuditTrail(entries: readonly VerificationAudit
 
 export function isVerificationEventType(value: unknown): value is VerificationEventType {
   return typeof value === "string" && (VERIFICATION_EVENT_TYPES as readonly string[]).includes(value);
+}
+
+export function isVerificationState(value: unknown): value is VerificationState {
+  return typeof value === "string" && (VERIFICATION_STATES as readonly string[]).includes(value);
+}
+
+/**
+ * Derives the current verification state from an audit trail. The latest
+ * recognized event wins; an empty or unrecognized trail is "unverified".
+ */
+export function deriveVerificationState(
+  entries: readonly VerificationAuditEntry[] | null | undefined,
+): VerificationState {
+  if (!entries || entries.length === 0) return "unverified";
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const eventType = entries[index]?.eventType;
+    if (eventType && isVerificationEventType(eventType)) {
+      return STATE_BY_EVENT_TYPE[eventType];
+    }
+  }
+  return "unverified";
+}
+
+/**
+ * Resolves the verification state for a campaign. Returns null when the
+ * campaign does not exist so callers can distinguish "missing" from
+ * "unverified".
+ */
+export async function getCampaignVerificationState(
+  campaignId: string,
+  dataSource: CampaignDataSource = getCampaignDataSource(),
+): Promise<VerificationState | null> {
+  const campaign = await getCampaign(campaignId, dataSource);
+  if (!campaign) return null;
+  return deriveVerificationState(campaign.verificationAuditTrail);
 }
