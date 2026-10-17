@@ -125,7 +125,8 @@ export function WalletModal() {
     <Dialog open={isModalOpen} onOpenChange={(open) => !open && closeModal()}>
       <DialogContent
         onCloseAutoFocus={handleCloseAutoFocus}
-        className="w-full max-w-sm sm:max-w-md p-1 overflow-hidden border-white/10 bg-[#0F1621] rounded-3xl shadow-2xl mx-4 sm:mx-auto"
+        data-testid="wallet-modal-dialog"
+        className="w-[calc(100vw-2rem)] max-w-sm sm:max-w-md max-h-[90dvh] overflow-y-auto p-1 overflow-x-hidden border-white/10 bg-[#0F1621] rounded-3xl shadow-2xl mx-auto"
         aria-modal="true"
       >
         {/* Glossy overlay */}

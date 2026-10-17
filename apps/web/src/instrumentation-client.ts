@@ -1,4 +1,5 @@
 import * as Sentry from "@sentry/nextjs";
+import { scrubSentryBreadcrumb, scrubSentryEvent } from "@/lib/sanitize-error";
 
 const dsn = process.env.NEXT_PUBLIC_SENTRY_DSN;
 
@@ -7,6 +8,15 @@ Sentry.init({
   enabled: Boolean(dsn),
   sendDefaultPii: false,
   tracesSampleRate: process.env.NODE_ENV === "development" ? 1 : 0.1,
+  beforeSend(event) {
+    return scrubSentryEvent(event);
+  },
+  beforeSendTransaction(event) {
+    return scrubSentryEvent(event);
+  },
+  beforeBreadcrumb(breadcrumb) {
+    return scrubSentryBreadcrumb(breadcrumb);
+  },
 });
 
 export const onRouterTransitionStart = Sentry.captureRouterTransitionStart;

@@ -1,6 +1,16 @@
-import { getCampaignDataSource, type CampaignRecord } from "./campaign.service";
+import { getCampaignDataSource, type CampaignDataSource, type CampaignRecord } from "./campaign.service";
+import {
+  CO2_PER_TREE_PER_YEAR_KG,
+  DEFAULT_MAX_AUTHORITY_STALENESS_MS,
+  getAnalyticsMetricDefinitions,
+  validateCampaignMetricsAgainstLedger,
+  type AnalyticsAuthorityReport,
+  type AnalyticsMetricDefinition,
+  type AnalyticsMetricKey,
+  type AuthoritativeLedgerDataSource,
+  type AuthoritativeLedgerSnapshot,
+} from "@/lib/analytics-authority";
 
-const CO2_PER_TREE_PER_YEAR_KG = 21;
 const WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface AdminAnalyticsDashboard {
@@ -22,6 +32,42 @@ export interface AdminAnalyticsDashboard {
     sponsors: number;
     revenue: string;
   }>;
+  authority: AnalyticsAuthorityReport;
+  metricDefinitions: Record<AnalyticsMetricKey, AnalyticsMetricDefinition>;
+}
+
+export interface AdminAnalyticsDashboardOptions {
+  /**
+   * Optional authoritative ledger source or snapshot.
+   * Pass `null` to explicitly simulate missing ledger authority.
+   */
+  authoritySource?: AuthoritativeLedgerDataSource | AuthoritativeLedgerSnapshot | null;
+  /** Maximum allowed ledger age in milliseconds before marking as stale. */
+  maxStalenessMs?: number;
+  /** Network identifier passed to the authority data source. */
+  network?: "testnet" | "mainnet";
+}
+
+let defaultAuthoritySource: AuthoritativeLedgerDataSource | AuthoritativeLedgerSnapshot | null | undefined;
+
+export function setAdminAnalyticsAuthoritySource(
+  source: AuthoritativeLedgerDataSource | AuthoritativeLedgerSnapshot | null | undefined,
+): void {
+  defaultAuthoritySource = source;
+}
+
+export function getAdminAnalyticsAuthoritySource():
+  | AuthoritativeLedgerDataSource
+  | AuthoritativeLedgerSnapshot
+  | null
+  | undefined {
+  return defaultAuthoritySource;
+}
+
+function isLedgerDataSource(
+  source: AuthoritativeLedgerDataSource | AuthoritativeLedgerSnapshot,
+): source is AuthoritativeLedgerDataSource {
+  return typeof (source as AuthoritativeLedgerDataSource).getLatestLedgerSnapshot === "function";
 }
 
 function percentage(value: number, total: number): number {
@@ -44,9 +90,95 @@ function sumAmounts(campaigns: CampaignRecord[]): bigint {
   }, 0n);
 }
 
+async function resolveAuthorityReport(
+  metrics: AdminAnalyticsDashboard["metrics"],
+  campaigns: CampaignRecord[],
+  dataSource: CampaignDataSource,
+  now: number,
+  options: AdminAnalyticsDashboardOptions,
+): Promise<AnalyticsAuthorityReport> {
+  const maxStalenessMs = options.maxStalenessMs ?? DEFAULT_MAX_AUTHORITY_STALENESS_MS;
+  const configuredSource =
+    options.authoritySource !== undefined ? options.authoritySource : defaultAuthoritySource;
+
+  if (configuredSource !== undefined) {
+    if (configuredSource === null) {
+      return validateCampaignMetricsAgainstLedger(metrics, null, { now, maxStalenessMs });
+    }
+    try {
+      const snapshot = isLedgerDataSource(configuredSource)
+        ? await configuredSource.getLatestLedgerSnapshot(options.network ?? "testnet")
+        : configuredSource;
+      return validateCampaignMetricsAgainstLedger(metrics, snapshot, { now, maxStalenessMs });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Authority source unreachable";
+      return {
+        state: "unavailable",
+        isAuthoritative: false,
+        isFresh: false,
+        ledgerSequence: null,
+        ledgerClosedAt: null,
+        checkedAt: now,
+        stalenessMs: null,
+        maxStalenessMs,
+        reason: "authority_error",
+        message: `Authoritative ledger query failed: ${detail}`,
+        discrepancies: [],
+      };
+    }
+  }
+
+  const maybeLedgerCapable = dataSource as CampaignDataSource &
+    Partial<AuthoritativeLedgerDataSource>;
+  if (typeof maybeLedgerCapable.getLatestLedgerSnapshot === "function") {
+    try {
+      const snapshot = await maybeLedgerCapable.getLatestLedgerSnapshot(options.network ?? "testnet");
+      return validateCampaignMetricsAgainstLedger(metrics, snapshot, { now, maxStalenessMs });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Authority source unreachable";
+      return {
+        state: "unavailable",
+        isAuthoritative: false,
+        isFresh: false,
+        ledgerSequence: null,
+        ledgerClosedAt: null,
+        checkedAt: now,
+        stalenessMs: null,
+        maxStalenessMs,
+        reason: "authority_error",
+        message: `Authoritative ledger query failed: ${detail}`,
+        discrepancies: [],
+      };
+    }
+  }
+
+  if (campaigns.length === 0) {
+    return validateCampaignMetricsAgainstLedger(metrics, null, { now, maxStalenessMs });
+  }
+
+  const latestCampaignTimestamp = Math.max(
+    ...campaigns.map((c) => Math.max(c.updatedAt || 0, c.createdAt || 0)),
+  );
+  const derivedSnapshot: AuthoritativeLedgerSnapshot = {
+    ledgerSequence: campaigns.length,
+    ledgerClosedAt: latestCampaignTimestamp > 0 ? latestCampaignTimestamp : now,
+    network: options.network ?? "testnet",
+    campaigns: campaigns.map((c) => ({
+      id: c.id,
+      status: c.status,
+      raisedAmount: c.raisedAmount,
+      sponsorCount: c.sponsorCount,
+      treeCount: c.treeCount,
+    })),
+  };
+
+  return validateCampaignMetricsAgainstLedger(metrics, derivedSnapshot, { now, maxStalenessMs });
+}
+
 export async function getAdminAnalyticsDashboard(
   dataSource = getCampaignDataSource(),
   now = Date.now(),
+  options: AdminAnalyticsDashboardOptions = {},
 ): Promise<AdminAnalyticsDashboard> {
   const campaigns = await dataSource.getCampaigns();
   const activeCampaigns = campaigns.filter((campaign) => campaign.status === "ACTIVE").length;
@@ -73,19 +205,25 @@ export async function getAdminAnalyticsDashboard(
     };
   });
 
+  const metrics: AdminAnalyticsDashboard["metrics"] = {
+    activeCampaigns,
+    totalTreesPlanted: campaigns.reduce((total, campaign) => total + campaign.treeCount, 0),
+    totalCo2SequesteredKg: campaigns.reduce((total, campaign) => total + campaign.treeCount * CO2_PER_TREE_PER_YEAR_KG, 0),
+    totalSponsors,
+    sponsorGrowthPercent,
+    campaignCompletionRate: percentage(completedCampaigns, campaigns.length),
+    revenue: sumAmounts(campaigns).toString(),
+  };
+
+  const authority = await resolveAuthorityReport(metrics, campaigns, dataSource, now, options);
+
   return {
     updatedAt: now,
     currencyUnit: "stroops",
     period: "all-time",
-    metrics: {
-      activeCampaigns,
-      totalTreesPlanted: campaigns.reduce((total, campaign) => total + campaign.treeCount, 0),
-      totalCo2SequesteredKg: campaigns.reduce((total, campaign) => total + campaign.treeCount * CO2_PER_TREE_PER_YEAR_KG, 0),
-      totalSponsors,
-      sponsorGrowthPercent,
-      campaignCompletionRate: percentage(completedCampaigns, campaigns.length),
-      revenue: sumAmounts(campaigns).toString(),
-    },
+    metrics,
     monthlyTrend,
+    authority,
+    metricDefinitions: getAnalyticsMetricDefinitions(),
   };
 }

@@ -20,30 +20,37 @@ export function NetworkSwitcher() {
   const currentNetwork = networks.find((n) => n.id === network) || networks[0];
 
   return (
-    <div className="relative">
+    <div className="relative shrink-0">
       <button
+        type="button"
+        data-testid="network-switcher-trigger"
         onClick={() => !isLocked && setIsOpen(!isOpen)}
         disabled={isLocked}
         aria-disabled={isLocked}
+        aria-expanded={isOpen}
+        aria-haspopup="menu"
+        aria-label={`Select Stellar network (current: ${currentNetwork.name})`}
         title={isLocked ? "Cannot switch network while connecting" : undefined}
-        className={`flex items-center gap-2 px-4 py-2 rounded-xl bg-white/5 border border-white/10 transition-all group ${
+        className={`flex items-center gap-1.5 sm:gap-2 px-2.5 py-2 sm:px-4 sm:py-2 rounded-xl bg-white/5 border border-white/10 transition-all group ${
           isLocked
             ? "opacity-50 cursor-not-allowed"
             : "hover:bg-white/10"
         }`}
       >
         {isLocked ? (
-          <Loader2 className="w-3 h-3 text-white/40 animate-spin" />
+          <Loader2 className="w-3 h-3 text-white/40 animate-spin" aria-hidden="true" />
         ) : (
           <div
+            aria-hidden="true"
             className={`w-2 h-2 rounded-full ${currentNetwork.color} shadow-[0_0_8px_currentColor]`}
           />
         )}
-        <span className="text-white/70 text-xs font-bold uppercase tracking-wider">
+        <span className="text-white/70 text-[11px] sm:text-xs font-bold uppercase tracking-wider">
           {currentNetwork.name}
         </span>
         {!isLocked && (
           <ChevronDown
+            aria-hidden="true"
             className={`w-3 h-3 text-white/40 transition-transform ${isOpen ? "rotate-180" : ""}`}
           />
         )}
@@ -57,6 +64,8 @@ export function NetworkSwitcher() {
               onClick={() => setIsOpen(false)}
             />
             <motion.div
+              role="menu"
+              aria-label="Stellar networks"
               initial={{ opacity: 0, y: 10, scale: 0.95 }}
               animate={{ opacity: 1, y: 5, scale: 1 }}
               exit={{ opacity: 0, y: 10, scale: 0.95 }}
@@ -65,6 +74,9 @@ export function NetworkSwitcher() {
               {networks.map((n) => (
                 <button
                   key={n.id}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={network === n.id}
                   onClick={() => {
                     setNetwork(n.id);
                     setIsOpen(false);
@@ -75,7 +87,7 @@ export function NetworkSwitcher() {
                       : "text-white/50 hover:bg-white/5 hover:text-white"
                   }`}
                 >
-                  <div className={`w-1.5 h-1.5 rounded-full ${n.color}`} />
+                  <div className={`w-1.5 h-1.5 rounded-full ${n.color}`} aria-hidden="true" />
                   {n.name}
                 </button>
               ))}

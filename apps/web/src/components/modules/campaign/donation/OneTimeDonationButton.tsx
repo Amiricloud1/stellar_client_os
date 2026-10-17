@@ -88,7 +88,7 @@ export function OneTimeDonationButton({
             role="dialog"
             aria-modal="true"
             aria-labelledby={titleId}
-            className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl border border-white/10 bg-zinc-950 p-4 text-zinc-100 shadow-2xl"
+            className="max-h-[90dvh] w-full max-w-[calc(100vw-2rem)] sm:max-w-lg overflow-x-hidden overflow-y-auto rounded-2xl border border-white/10 bg-zinc-950 p-4 text-zinc-100 shadow-2xl"
           >
             <div className="mb-3 flex items-center justify-between">
               <h2 id={titleId} className="text-sm font-medium text-zinc-400">
