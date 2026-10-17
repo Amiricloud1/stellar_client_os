@@ -9,6 +9,11 @@ import { DISTRIBUTOR_CONTRACT_ID } from '@/lib/env';
 import { SOROBAN_RPC_URL, NETWORK_PASSPHRASE } from '@/lib/constants';
 import { amountToStroops } from '@/utils/amount-validation';
 import { getStellarServerOptions } from '@/utils/rpc-connection-options';
+import {
+  createChainBoundGuard,
+  NetworkChangedError,
+  StaleConfirmationError,
+} from '@/utils/chain-bound-transaction';
 import type { DistributionState } from '@/types/distribution';
 
 const IS_MAINNET = process.env.NEXT_PUBLIC_STELLAR_NETWORK === 'public';
@@ -101,7 +106,7 @@ async function checkSenderBalance(
  * Handles validation, balance checks, wallet signing, and toast notifications.
  */
 export function useDistributionTransaction() {
-  const { address, signTransaction } = useWallet();
+  const { address, signTransaction, networkPassphrase } = useWallet();
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const execute = useCallback(
@@ -184,6 +189,13 @@ export function useDistributionTransaction() {
       setIsSubmitting(true);
       notify.loading('Building transaction...');
 
+      // Bind the whole simulation/signing/confirmation flow to the network
+      // identity observed at the start. Any network switch aborts the flow.
+      const guard = createChainBoundGuard({
+        expectedNetworkPassphrase: networkPassphrase ?? NETWORK_PASSPHRASE,
+        getCurrentNetworkPassphrase: () => networkPassphrase ?? NETWORK_PASSPHRASE,
+      });
+
       try {
         const client = new DistributorClient({
           contractId: DISTRIBUTOR_CONTRACT_ID,
@@ -209,16 +221,28 @@ export function useDistributionTransaction() {
           });
         }
 
+        // Simulation is complete; ensure the network has not changed since.
+        guard.assertNetworkUnchanged();
+
         notify.loading('Awaiting wallet signature...');
 
         // Wrap the wallet's signTransaction (returns string) into the shape
         // the SDK's AssembledTransaction.signAndSend expects: { signedTxXdr: string }
         const sdkSigner = async (xdr: string) => {
+          // Re-check immediately before signing so a switch during the
+          // simulation window cannot produce a signature on the wrong chain.
+          guard.assertNetworkUnchanged();
           const signedTxXdr = await signTransaction(xdr);
+          // And again after signing, before the signed envelope is broadcast.
+          guard.assertNetworkUnchanged();
           return { signedTxXdr };
         };
 
         const sent = await tx.signAndSend({ signTransaction: sdkSigner });
+
+        // Final check before reporting success: confirmation must belong to
+        // the same chain the flow started on.
+        guard.assertNetworkUnchanged();
 
         const txHash = sent.sendTransactionResponse?.hash ?? '';
         notify.success(
@@ -228,6 +252,17 @@ export function useDistributionTransaction() {
 
         return true;
       } catch (err) {
+        if (err instanceof NetworkChangedError) {
+          notify.error(
+            'Network changed during the transaction. The flow was aborted — please review and confirm again.'
+          );
+          return false;
+        }
+        if (err instanceof StaleConfirmationError) {
+          notify.error('This confirmation is stale. Please review and confirm the transaction again.');
+          return false;
+        }
+
         const message = err instanceof Error ? err.message : 'Transaction failed';
 
         // Surface friendly messages for known contract errors
@@ -246,7 +281,7 @@ export function useDistributionTransaction() {
         setIsSubmitting(false);
       }
     },
-    [address, signTransaction]
+    [address, signTransaction, networkPassphrase]
   );
 
   return { execute, isSubmitting };

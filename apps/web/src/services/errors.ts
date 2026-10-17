@@ -158,6 +158,62 @@ export class ValidationError extends StellarError {
 }
 
 /**
+ * Error thrown when the authenticated caller does not own the requested resource.
+ * Used by tax document generation to reject cross-account access (issue #61).
+ */
+export class UnauthorizedOwnerError extends StellarError {
+  public readonly resourceType: string;
+  public readonly resourceId: string;
+
+  constructor(resourceType: string, resourceId: string) {
+    super(
+      `Authenticated user is not authorized to access ${resourceType} ${resourceId}.`,
+      'UNAUTHORIZED_OWNER'
+    );
+    this.name = 'UnauthorizedOwnerError';
+    this.resourceType = resourceType;
+    this.resourceId = resourceId;
+    Object.setPrototypeOf(this, UnauthorizedOwnerError.prototype);
+  }
+}
+
+/**
+ * Error thrown when a profile lacks verified attributes required for an operation.
+ * Used by tax document generation to require a verified tax identity (issue #61).
+ */
+export class UnverifiedProfileError extends StellarError {
+  public readonly missingAttributes: string[];
+
+  constructor(missingAttributes: string[]) {
+    super(
+      `Profile is not verified for this operation. Missing verified attributes: ${missingAttributes.join(', ')}.`,
+      'UNVERIFIED_PROFILE'
+    );
+    this.name = 'UnverifiedProfileError';
+    this.missingAttributes = missingAttributes;
+    Object.setPrototypeOf(this, UnverifiedProfileError.prototype);
+  }
+}
+
+/**
+ * Error thrown when a caller attempts to access another account's resources.
+ * Used by tax document generation to reject cross-account access (issue #61).
+ */
+export class CrossAccountAccessError extends StellarError {
+  public readonly resourceType: string;
+
+  constructor(resourceType: string) {
+    super(
+      `Cross-account access to ${resourceType} is not permitted.`,
+      'CROSS_ACCOUNT_ACCESS'
+    );
+    this.name = 'CrossAccountAccessError';
+    this.resourceType = resourceType;
+    Object.setPrototypeOf(this, CrossAccountAccessError.prototype);
+  }
+}
+
+/**
  * Parse and transform SDK errors into user-friendly error classes
  */
 export function parseError(error: unknown): StellarError {

@@ -8,8 +8,155 @@ import { PaymentStreamClient } from '../../../../packages/sdk/src/PaymentStreamC
 import { DistributorClient } from '../../../../packages/sdk/src/DistributorClient';
 import { createBatches } from '../../../../packages/sdk/src/utils/batchDistribution';
 import { Stream, StreamStatus } from '../types';
+import {
+    DEFAULT_PAGE_LIMIT,
+    MAX_PAGE_LIMIT,
+    type PageInfo,
+    type PaginationInput,
+    type SortInput,
+} from '../../../../packages/shared/src/pagination';
 
 type WalletSigner = (xdr: string) => Promise<string>;
+
+/**
+ * Envelope returned by paginated list endpoints. Mirrors the shared
+ * `PageInfo` metadata so callers can page deterministically.
+ */
+export interface PaginatedResponse<T> {
+    items: T[];
+    pageInfo: PageInfo;
+}
+
+/**
+ * Error raised when the API rejects pagination or sort parameters.
+ * Exposed so callers can distinguish client-side validation failures
+ * from transport errors.
+ */
+export class PaginationError extends Error {
+    readonly code: string;
+    readonly status: number;
+
+    constructor(message: string, options: { code?: string; status?: number } = {}) {
+        super(message);
+        this.name = 'PaginationError';
+        this.code = options.code ?? 'INVALID_PAGINATION';
+        this.status = options.status ?? 400;
+    }
+}
+
+function normalizePagination(pagination?: PaginationInput): Required<Pick<PaginationInput, 'limit'>> & PaginationInput {
+    const limit = pagination?.limit ?? DEFAULT_PAGE_LIMIT;
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE_LIMIT) {
+        throw new PaginationError(
+            `limit must be an integer between 1 and ${MAX_PAGE_LIMIT}`,
+            { code: 'INVALID_PAGE_LIMIT' }
+        );
+    }
+    if (pagination?.cursor !== undefined && typeof pagination.cursor !== 'string') {
+        throw new PaginationError('cursor must be a string', { code: 'INVALID_CURSOR' });
+    }
+    return { ...pagination, limit };
+}
+
+function normalizeSort(sort?: SortInput): SortInput | undefined {
+    if (!sort) return undefined;
+    if (!sort.field || typeof sort.field !== 'string') {
+        throw new PaginationError('sort field is required', { code: 'INVALID_SORT_FIELD' });
+    }
+    if (sort.direction !== 'asc' && sort.direction !== 'desc') {
+        throw new PaginationError('sort direction must be "asc" or "desc"', {
+            code: 'INVALID_SORT_DIRECTION',
+        });
+    }
+    return sort;
+}
+
+function buildListQuery(pagination?: PaginationInput, sort?: SortInput): string {
+    const params = new URLSearchParams();
+    const normalizedPagination = normalizePagination(pagination);
+    params.set('limit', String(normalizedPagination.limit));
+    if (normalizedPagination.cursor) params.set('cursor', normalizedPagination.cursor);
+
+    const normalizedSort = normalizeSort(sort);
+    if (normalizedSort) {
+        params.set('sort', normalizedSort.field);
+        params.set('order', normalizedSort.direction);
+    }
+    return params.toString();
+}
+
+function parsePageInfo(raw: unknown): PageInfo {
+    if (!raw || typeof raw !== 'object') {
+        throw new PaginationError('Response is missing pageInfo metadata', {
+            code: 'INVALID_PAGE_INFO',
+            status: 502,
+        });
+    }
+    const info = raw as Record<string, unknown>;
+    const limit = Number(info.limit);
+    if (!Number.isInteger(limit) || limit < 1) {
+        throw new PaginationError('pageInfo.limit is invalid', {
+            code: 'INVALID_PAGE_INFO',
+            status: 502,
+        });
+    }
+    return {
+        limit,
+        hasNextPage: Boolean(info.hasNextPage),
+        hasPreviousPage: Boolean(info.hasPreviousPage),
+        nextCursor: typeof info.nextCursor === 'string' ? info.nextCursor : null,
+        prevCursor: typeof info.prevCursor === 'string' ? info.prevCursor : null,
+        total: typeof info.total === 'number' ? info.total : undefined,
+    };
+}
+
+async function parsePaginatedResponse<T>(response: Response): Promise<PaginatedResponse<T>> {
+    let body: unknown;
+    try {
+        body = await response.json();
+    } catch {
+        throw new PaginationError('Failed to parse paginated response', {
+            code: 'INVALID_RESPONSE',
+            status: response.status || 502,
+        });
+    }
+
+    if (!response.ok) {
+        const errorBody = (body ?? {}) as { error?: string; code?: string };
+        throw new PaginationError(errorBody.error ?? `Request failed with status ${response.status}`, {
+            code: errorBody.code ?? 'REQUEST_FAILED',
+            status: response.status,
+        });
+    }
+
+    const envelope = (body ?? {}) as { items?: unknown; pageInfo?: unknown };
+    if (!Array.isArray(envelope.items)) {
+        throw new PaginationError('Response is missing items array', {
+            code: 'INVALID_RESPONSE',
+            status: 502,
+        });
+    }
+
+    return {
+        items: envelope.items as T[],
+        pageInfo: parsePageInfo(envelope.pageInfo),
+    };
+}
+
+async function fetchPaginated<T>(
+    path: string,
+    pagination?: PaginationInput,
+    sort?: SortInput,
+    signal?: AbortSignal
+): Promise<PaginatedResponse<T>> {
+    throwIfAborted(signal);
+    const query = buildListQuery(pagination, sort);
+    const response = await fetch(`${path}?${query}`, { signal });
+    throwIfAborted(signal);
+    return parsePaginatedResponse<T>(response);
+}
+
+export { buildListQuery, parsePageInfo, parsePaginatedResponse };
 
 function deriveHorizonUrl(): string {
     if (env.NEXT_PUBLIC_STELLAR_HORIZON_URL) return env.NEXT_PUBLIC_STELLAR_HORIZON_URL;
@@ -108,6 +255,25 @@ export async function fetchUserStreams(address: string, signal?: AbortSignal): P
     const streams = await stellarService.getStreams(address);
     throwIfAborted(signal);
     return streams.map(mapServiceStream);
+}
+
+/**
+ * Paginated variant of {@link fetchUserStreams}. Sends shared pagination and
+ * sort parameters and returns the shared `PageInfo` metadata envelope.
+ */
+export async function fetchUserStreamsPage(
+    address: string,
+    pagination?: PaginationInput,
+    sort?: SortInput,
+    signal?: AbortSignal
+): Promise<PaginatedResponse<Stream>> {
+    const page = await fetchPaginated<ServiceStream>(
+        `/api/streams/${encodeURIComponent(address)}`,
+        pagination,
+        sort,
+        signal
+    );
+    return { items: page.items.map(mapServiceStream), pageInfo: page.pageInfo };
 }
 
 export async function createStream(params: {

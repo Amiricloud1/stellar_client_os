@@ -2,6 +2,10 @@ import { QueryClient, QueryKey, useMutation, useQueryClient } from '@tanstack/re
 import toast from 'react-hot-toast';
 import { withdraw } from '@/lib/api';
 import { useWallet } from '@/providers/StellarWalletProvider';
+import {
+    ChainIdentityMismatchError,
+    useChainBoundTransaction,
+} from '@/hooks/use-chain-bound-transaction';
 
 type WithdrawInput = Parameters<typeof withdraw>[0];
 
@@ -9,6 +13,7 @@ interface WithdrawMutationContext {
     previousStreams: Array<[QueryKey, unknown]>;
     streamQueryKey?: QueryKey;
     previousStream?: unknown;
+    chainGuard?: { assertCurrentChain: () => void };
 }
 
 function restorePreviousStreams(
@@ -29,13 +34,22 @@ function restorePreviousStreams(
 export function useWithdraw() {
     const queryClient = useQueryClient();
     const { address, signTransaction } = useWallet();
+    const { beginChainBoundTransaction } = useChainBoundTransaction();
 
     return useMutation({
-        mutationFn: (params: WithdrawInput) => {
+        mutationFn: async (params: WithdrawInput) => {
+            // Bind this flow to the chain identity captured at start. If the
+            // wallet network changes mid-flight, abort before signing.
+            const guard = beginChainBoundTransaction();
+            guard.assertCurrentChain();
+
             return withdraw({
                 ...params,
                 sender: params.sender || address || undefined,
-                signTransaction,
+                signTransaction: (transaction: string, options?: unknown) => {
+                    guard.assertCurrentChain();
+                    return signTransaction(transaction, options as never);
+                },
             });
         },
         onMutate: async (variables): Promise<WithdrawMutationContext> => {
@@ -74,10 +88,16 @@ export function useWithdraw() {
                     queryClient.invalidateQueries({ queryKey: ['stream', variables.streamId] });
                 }
             }
+
+            if (_error instanceof ChainIdentityMismatchError) {
+                // Network switched mid-flight: the flow is stale and must be
+                // re-confirmed against the new chain before retrying.
+                toast.error('Network changed. Please review and confirm the withdrawal again.');
+            }
         },
         onSettled: (_data, _error, variables) => {
             // Only show error toast on final failure (after all retries)
-            if (_error) {
+            if (_error && !(_error instanceof ChainIdentityMismatchError)) {
                 toast.error('Withdraw failed. Refreshing latest data.');
             }
 

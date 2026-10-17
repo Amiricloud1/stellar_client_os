@@ -21,6 +21,52 @@ export const STELLAR_SECRET_KEY_PATTERN = /\bS[A-Z0-9]{55}\b/g;
 const STELLAR_TRUNCATED_PATTERN = /\bG[A-Z0-9]{4}\.\.\.[A-Z0-9]{5}\b/g;
 
 /**
+ * Replacement marker for redacted tax identifiers
+ */
+export const TAX_ID_REDACTED = '[TAX_ID_REDACTED]';
+
+/**
+ * Pattern to match US-style Taxpayer Identification Numbers (SSN / ITIN / EIN).
+ * Matches both dashed (123-45-6789) and undashed (123456789) forms.
+ */
+const TAX_ID_PATTERN = /\b\d{3}-?\d{2}-?\d{4}\b|\b\d{2}-?\d{7}\b/g;
+
+/**
+ * Object keys whose values are considered tax identifiers and must be redacted
+ * regardless of the value's shape (e.g. non-US formats, alphanumeric IDs).
+ */
+const TAX_ID_KEY_PATTERN = /(tax.?id|tin|ssn|itin|ein|vat|taxpayer)/i;
+
+/**
+ * Redact tax identifiers from a string.
+ *
+ * Masks US-style TINs (SSN/ITIN/EIN) in both dashed and undashed forms.
+ * Non-string input is returned unchanged.
+ *
+ * @param input - The string to redact
+ * @returns The string with tax identifiers replaced by {@link TAX_ID_REDACTED}
+ *
+ * @example
+ * redactTaxIds('ssn 123-45-6789') // 'ssn [TAX_ID_REDACTED]'
+ */
+export function redactTaxIds(input: string): string {
+  if (!input || typeof input !== 'string') {
+    return input;
+  }
+  return input.replace(TAX_ID_PATTERN, TAX_ID_REDACTED);
+}
+
+/**
+ * Determine whether an object key refers to a tax identifier.
+ *
+ * @param key - The property name to check
+ * @returns True when the key denotes a tax identifier field
+ */
+export function isTaxIdKey(key: string): boolean {
+  return typeof key === 'string' && TAX_ID_KEY_PATTERN.test(key);
+}
+
+/**
  * Options for sanitization
  */
 type SanitizeOptions = {
@@ -55,6 +101,9 @@ export function sanitizeErrorString(
   } = options;
 
   let sanitized = input;
+
+  // Redact tax identifiers first so numeric IDs never leak into logs
+  sanitized = redactTaxIds(sanitized);
 
   // Replace full public keys
   sanitized = sanitized.replace(STELLAR_PUBLIC_KEY_PATTERN, (match) => {
@@ -107,6 +156,11 @@ export function sanitizeObject<T = unknown>(
   if (typeof obj === 'object') {
     const result: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(obj)) {
+      // Redact values held under tax-identifier keys regardless of shape
+      if (isTaxIdKey(key) && value !== null && value !== undefined) {
+        result[key] = TAX_ID_REDACTED;
+        continue;
+      }
       // Don't sanitize keys, only values
       result[key] = sanitizeObject(value, options);
     }
@@ -143,7 +197,9 @@ export function sanitizeError(
 
   for (const prop of customProps) {
     const value = errorRecord[prop];
-    if (typeof value === 'string') {
+    if (isTaxIdKey(prop) && value !== null && value !== undefined) {
+      safeErrorRecord[prop] = TAX_ID_REDACTED;
+    } else if (typeof value === 'string') {
       safeErrorRecord[prop] = sanitizeErrorString(value, options);
     } else if (value && typeof value === 'object') {
       safeErrorRecord[prop] = sanitizeObject(value, options);

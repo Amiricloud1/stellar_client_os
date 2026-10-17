@@ -7,11 +7,64 @@ interface GuardOptions {
     cooldownMs?: number;
 }
 
+/**
+ * Chain identity captured at simulation time. Any change to `networkId` or
+ * `passphrase` between simulation, signing, and confirmation means the flow is
+ * stale and must be aborted (issue #70). */
+export interface ChainIdentity {
+    networkId: string;
+    passphrase: string;
+}
+
+export type ChainGuardPhase = "idle" | "simulating" | "signing" | "confirming";
+
+export type ChainGuardAbortReason = "network-changed" | "reconfirmation-required";
+
+export interface ChainGuardState {
+    /** Chain identity captured when the flow started (simulation time). */
+    simulatedChain: ChainIdentity | null;
+    /** Current phase of the guarded flow. */
+    phase: ChainGuardPhase;
+    /** Set when the flow was aborted because the chain identity changed. */
+    abortReason: ChainGuardAbortReason | null;
+    /** True when the user must re-confirm after a network switch. */
+    requiresReconfirmation: boolean;
+}
+
 interface UseTransactionGuardReturn {
     isSubmitting: boolean;
     isCoolingDown: boolean;
     isGuardActive: boolean;
     runWithGuard: <T>(fn: () => Promise<T>, options?: GuardOptions) => Promise<T | undefined>;
+    /** Chain-bound state for in-flight wallet transactions. */
+    chainGuard: ChainGuardState;
+    /**
+     * Begin a chain-bound flow. Captures `chain` as the simulated identity and
+     * returns a context whose `assertChain` must be called before signing and
+     * before confirmation. Returns `null` if the guard is already active.
+     */
+    beginChainFlow: (chain: ChainIdentity) => ChainFlowContext | null;
+    /** Clear a chain-guard abort and require the user to confirm again. */
+    acknowledgeReconfirmation: () => void;
+}
+
+export interface ChainFlowContext {
+    /** Chain identity captured at simulation time. */
+    readonly simulatedChain: ChainIdentity;
+    /** Advance the phase (e.g. "signing", "confirming"). */
+    setPhase: (phase: ChainGuardPhase) => void;
+    /**
+     * Compare the live chain identity against the simulated one. On mismatch the
+     * flow is aborted, the simulation invalidated, and renewed confirmation is
+     * required. Returns `true` when the chain still matches.
+     */
+    assertChain: (current: ChainIdentity) => boolean;
+    /** Mark the flow as finished (success or error) and release the guard. */
+    finish: () => void;
+}
+
+function chainIdentitiesEqual(a: ChainIdentity, b: ChainIdentity): boolean {
+    return a.networkId === b.networkId && a.passphrase === b.passphrase;
 }
 
 /**
@@ -37,10 +90,18 @@ export function useTransactionGuard(
 ): UseTransactionGuardReturn {
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [isCoolingDown, setIsCoolingDown] = useState(false);
+    const [chainGuard, setChainGuard] = useState<ChainGuardState>({
+        simulatedChain: null,
+        phase: "idle",
+        abortReason: null,
+        requiresReconfirmation: false,
+    });
     const cooldownRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const lockRef = useRef(false);
     const prevStatusRef = useRef<MutationStatus | undefined>(mutationStatus);
     const cooldownOverrideRef = useRef<number | undefined>(undefined);
+    const chainGuardRef = useRef<ChainGuardState>(chainGuard);
+    chainGuardRef.current = chainGuard;
 
     const isMutationTracked = mutationStatus !== undefined;
     const isMutationPending = mutationStatus === "pending";
@@ -87,6 +148,74 @@ export function useTransactionGuard(
         }
     }, [mutationStatus, isMutationTracked, defaultCooldownMs]);
 
+    const beginChainFlow = useCallback(
+        (chain: ChainIdentity): ChainFlowContext | null => {
+            if (lockRef.current || isSubmitting) {
+                return null;
+            }
+            lockRef.current = true;
+            setIsSubmitting(true);
+            setChainGuard({
+                simulatedChain: { ...chain },
+                phase: "simulating",
+                abortReason: null,
+                requiresReconfirmation: false,
+            });
+
+            let aborted = false;
+
+            const abort = (reason: ChainGuardAbortReason) => {
+                aborted = true;
+                lockRef.current = false;
+                setIsSubmitting(false);
+                setChainGuard({
+                    // Invalidate the simulation: the captured identity is cleared
+                    // so it cannot be reused for signing/confirmation.
+                    simulatedChain: null,
+                    phase: "idle",
+                    abortReason: reason,
+                    requiresReconfirmation: true,
+                });
+            };
+
+            return {
+                simulatedChain: { ...chain },
+                setPhase: (phase: ChainGuardPhase) => {
+                    if (aborted) return;
+                    setChainGuard((prev) => ({ ...prev, phase }));
+                },
+                assertChain: (current: ChainIdentity) => {
+                    if (aborted) return false;
+                    if (!chainIdentitiesEqual(chain, current)) {
+                        abort("network-changed");
+                        return false;
+                    }
+                    return true;
+                },
+                finish: () => {
+                    if (aborted) return;
+                    lockRef.current = false;
+                    setIsSubmitting(false);
+                    setChainGuard({
+                        simulatedChain: null,
+                        phase: "idle",
+                        abortReason: null,
+                        requiresReconfirmation: false,
+                    });
+                },
+            };
+        },
+        [isSubmitting]
+    );
+
+    const acknowledgeReconfirmation = useCallback(() => {
+        setChainGuard((prev) => ({
+            ...prev,
+            abortReason: null,
+            requiresReconfirmation: false,
+        }));
+    }, []);
+
     const runWithGuard = useCallback(
         async <T,>(fn: () => Promise<T>, options?: GuardOptions): Promise<T | undefined> => {
             if (isGuardActive) {
@@ -126,5 +255,8 @@ export function useTransactionGuard(
         isCoolingDown,
         isGuardActive,
         runWithGuard,
+        chainGuard,
+        beginChainFlow,
+        acknowledgeReconfirmation,
     };
 }

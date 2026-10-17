@@ -32,16 +32,48 @@ export const CONTRACT_ERRORS: Record<number, string> = {
 };
 
 /**
+ * Error codes used by the SDK for identity/ownership and chain-identity guards.
+ *
+ * These are SDK-level (not contract-level) codes so the web layer can map them to
+ * typed errors without relying on string matching. They are stable and safe to
+ * branch on in application code.
+ */
+export const SDK_ERROR_CODES = {
+  /** The authenticated caller does not own the resource being accessed. */
+  UNAUTHORIZED_OWNER: "UNAUTHORIZED_OWNER",
+  /** The authenticated caller's profile is not verified for the requested action. */
+  UNVERIFIED_PROFILE: "UNVERIFIED_PROFILE",
+  /** The caller attempted to access a resource owned by a different account. */
+  CROSS_ACCOUNT_ACCESS: "CROSS_ACCOUNT_ACCESS",
+  /** The in-flight flow was started on a different network than the current one. */
+  CHAIN_IDENTITY_MISMATCH: "CHAIN_IDENTITY_MISMATCH",
+  /** The in-flight flow is stale (network switched or flow superseded) and must be restarted. */
+  STALE_TRANSACTION_FLOW: "STALE_TRANSACTION_FLOW",
+  /** The user must re-confirm the transaction after a network switch. */
+  CONFIRMATION_REQUIRED: "CONFIRMATION_REQUIRED",
+} as const;
+
+export type SdkErrorCode = (typeof SDK_ERROR_CODES)[keyof typeof SDK_ERROR_CODES];
+
+/**
  * Represents a parsed Soroban contract error with context
  */
 export interface ParsedContractError {
-  type: "contract_error" | "simulation_error" | "transaction_error" | "unknown";
+  type:
+    | "contract_error"
+    | "simulation_error"
+    | "transaction_error"
+    | "authorization_error"
+    | "chain_identity_error"
+    | "unknown";
   code?: number;
   message: string;
   details?: string;
   originalError?: unknown;
   operation?: string;
   suggestion?: string;
+  /** Stable SDK-level error code, when the error originates from an SDK guard. */
+  sdkCode?: SdkErrorCode;
 }
 
 /**
@@ -405,10 +437,11 @@ export function parseContractError(error: unknown, operationContext?: string): P
  */
 export class FundableStellarError extends Error {
   public readonly code?: number;
-  public readonly type: string;
+  public readonly type: ParsedContractError["type"];
   public readonly details?: string;
   public readonly suggestion?: string;
   public readonly operation?: string;
+  public readonly sdkCode?: SdkErrorCode;
 
   constructor(parsed: ParsedContractError) {
     super(parsed.message);
@@ -418,6 +451,7 @@ export class FundableStellarError extends Error {
     this.details = parsed.details;
     this.suggestion = parsed.suggestion;
     this.operation = parsed.operation;
+    this.sdkCode = parsed.sdkCode;
 
     // Set prototype for instanceof checks
     Object.setPrototypeOf(this, FundableStellarError.prototype);
@@ -428,6 +462,9 @@ export class FundableStellarError extends Error {
    */
   toString(): string {
     let result = `${this.name}: ${this.message}`;
+    if (this.sdkCode !== undefined) {
+      result += ` [SDK Code: ${this.sdkCode}]`;
+    }
     if (this.code !== undefined) {
       result += ` [Code: ${this.code}]`;
     }
@@ -459,6 +496,139 @@ export class FundableStellarError extends Error {
       result += `\n\n💡 ${this.suggestion}`;
     }
     return result;
+  }
+}
+
+/**
+ * Error raised when the authenticated caller does not own the resource.
+ * Maps to {@link SDK_ERROR_CODES.UNAUTHORIZED_OWNER}.
+ */
+export class UnauthorizedOwnerError extends FundableStellarError {
+  constructor(operation?: string, details?: string) {
+    super({
+      type: "authorization_error",
+      sdkCode: SDK_ERROR_CODES.UNAUTHORIZED_OWNER,
+      message: "You are not authorized to access this resource",
+      details,
+      suggestion: "Ensure you are signed in as the account that owns this resource.",
+      operation,
+    });
+    this.name = "UnauthorizedOwnerError";
+    Object.setPrototypeOf(this, UnauthorizedOwnerError.prototype);
+  }
+}
+
+/**
+ * Error raised when the caller's profile is not verified for the requested action.
+ * Maps to {@link SDK_ERROR_CODES.UNVERIFIED_PROFILE}.
+ */
+export class UnverifiedProfileError extends FundableStellarError {
+  constructor(operation?: string, details?: string) {
+    super({
+      type: "authorization_error",
+      sdkCode: SDK_ERROR_CODES.UNVERIFIED_PROFILE,
+      message: "Your profile must be verified before performing this action",
+      details,
+      suggestion: "Complete identity verification in your profile settings and try again.",
+      operation,
+    });
+    this.name = "UnverifiedProfileError";
+    Object.setPrototypeOf(this, UnverifiedProfileError.prototype);
+  }
+}
+
+/**
+ * Error raised when a caller attempts to access a resource owned by another account.
+ * Maps to {@link SDK_ERROR_CODES.CROSS_ACCOUNT_ACCESS}.
+ */
+export class CrossAccountAccessError extends FundableStellarError {
+  constructor(operation?: string, details?: string) {
+    super({
+      type: "authorization_error",
+      sdkCode: SDK_ERROR_CODES.CROSS_ACCOUNT_ACCESS,
+      message: "This resource belongs to a different account",
+      details,
+      suggestion: "Sign in with the account that owns this resource.",
+      operation,
+    });
+    this.name = "CrossAccountAccessError";
+    Object.setPrototypeOf(this, CrossAccountAccessError.prototype);
+  }
+}
+
+/**
+ * Error raised when an in-flight transaction flow was started on a different
+ * network than the one currently selected. The flow must be aborted and restarted.
+ * Maps to {@link SDK_ERROR_CODES.CHAIN_IDENTITY_MISMATCH}.
+ */
+export class ChainIdentityMismatchError extends FundableStellarError {
+  public readonly expectedNetwork?: string;
+  public readonly actualNetwork?: string;
+
+  constructor(
+    expectedNetwork?: string,
+    actualNetwork?: string,
+    operation?: string,
+  ) {
+    super({
+      type: "chain_identity_error",
+      sdkCode: SDK_ERROR_CODES.CHAIN_IDENTITY_MISMATCH,
+      message: "The network changed while this transaction was in progress",
+      details:
+        expectedNetwork !== undefined || actualNetwork !== undefined
+          ? `Expected network: ${expectedNetwork ?? "unknown"}, current network: ${
+              actualNetwork ?? "unknown"
+            }`
+          : undefined,
+      suggestion:
+        "The transaction was aborted because the network changed. Restart the flow on the current network.",
+      operation,
+    });
+    this.name = "ChainIdentityMismatchError";
+    this.expectedNetwork = expectedNetwork;
+    this.actualNetwork = actualNetwork;
+    Object.setPrototypeOf(this, ChainIdentityMismatchError.prototype);
+  }
+}
+
+/**
+ * Error raised when an in-flight transaction flow is stale (superseded or
+ * invalidated by a network switch) and can no longer be safely completed.
+ * Maps to {@link SDK_ERROR_CODES.STALE_TRANSACTION_FLOW}.
+ */
+export class StaleTransactionFlowError extends FundableStellarError {
+  constructor(operation?: string, details?: string) {
+    super({
+      type: "chain_identity_error",
+      sdkCode: SDK_ERROR_CODES.STALE_TRANSACTION_FLOW,
+      message: "This transaction flow is no longer valid",
+      details,
+      suggestion: "Start a new transaction to continue.",
+      operation,
+    });
+    this.name = "StaleTransactionFlowError";
+    Object.setPrototypeOf(this, StaleTransactionFlowError.prototype);
+  }
+}
+
+/**
+ * Error raised when the user must re-confirm a transaction after a network
+ * switch before it can be signed or submitted.
+ * Maps to {@link SDK_ERROR_CODES.CONFIRMATION_REQUIRED}.
+ */
+export class ConfirmationRequiredError extends FundableStellarError {
+  constructor(operation?: string, details?: string) {
+    super({
+      type: "chain_identity_error",
+      sdkCode: SDK_ERROR_CODES.CONFIRMATION_REQUIRED,
+      message: "Please re-confirm this transaction on the current network",
+      details,
+      suggestion:
+        "The network changed. Review and confirm the transaction again before continuing.",
+      operation,
+    });
+    this.name = "ConfirmationRequiredError";
+    Object.setPrototypeOf(this, ConfirmationRequiredError.prototype);
   }
 }
 

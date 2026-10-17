@@ -11,6 +11,14 @@ import type { CampaignDataSource, CampaignQueryInput } from "@/services/campaign
 import { getCampaignSequelService } from "@/services/campaign-sequel.service";
 import { getCampaignAnalyticsDashboard } from "@/services/campaign-analytics-dashboard.service";
 import { getGrantProgramService } from "@/services/grant-program.service";
+import {
+  buildPageInfo,
+  normalizePagination,
+  paginateItems,
+  resolveSort,
+  validatePagination,
+} from "@/services/pagination.service";
+import type { PageInfo, PaginationInput as SharedPaginationInput, SortInput } from "@/services/pagination.service";
 import type {
   RegionFilter,
   CategoryFilter,
@@ -40,10 +48,45 @@ function toBigInt(value: string): bigint {
   }
 }
 
-function paginate<T>(items: T[], pagination?: PaginationInput): T[] {
-  const limit = Math.min(Math.max(pagination?.limit ?? 20, 1), 100);
-  const offset = Math.max(pagination?.offset ?? 0, 0);
-  return items.slice(offset, offset + limit);
+/**
+ * Shared pagination contract (issue #59).
+ *
+ * Every list resolver accepts the same `pagination` input, validates it via
+ * `validatePagination`, clamps it to the shared page limits, and returns a
+ * `PageInfo` object alongside the items so clients can page deterministically.
+ */
+interface PaginatedResult<T> {
+  items: T[];
+  pageInfo: PageInfo;
+}
+
+function toSharedPagination(pagination?: PaginationInput): SharedPaginationInput | undefined {
+  if (!pagination) return undefined;
+  return { limit: pagination.limit, offset: pagination.offset };
+}
+
+function paginate<T>(
+  items: T[],
+  pagination?: PaginationInput,
+  sort?: SortInput,
+): PaginatedResult<T> {
+  const normalized = normalizePagination(toSharedPagination(pagination));
+  const sorted = resolveSort(items, sort);
+  const page = paginateItems(sorted, normalized);
+  return {
+    items: page.items,
+    pageInfo: buildPageInfo(sorted.length, normalized),
+  };
+}
+
+function validateListArgs(pagination?: PaginationInput, sort?: SortInput): void {
+  validatePagination(toSharedPagination(pagination));
+  if (sort && (!sort.field || typeof sort.field !== "string")) {
+    throw new Error("sort.field must be a non-empty string");
+  }
+  if (sort?.direction && sort.direction !== "ASC" && sort.direction !== "DESC") {
+    throw new Error("sort.direction must be ASC or DESC");
+  }
 }
 
 function toCampaignPayload(campaign: import("@/services/campaign.service").CampaignRecord) {
@@ -93,14 +136,19 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         },
         ctx: ResolverContext,
       ) => {
+        validateListArgs(args.pagination);
+        const normalized = normalizePagination(toSharedPagination(args.pagination));
         const campaigns = await queryCampaigns({
           filter: args.filter,
           sort: args.sort,
-          limit: args.pagination?.limit,
-          offset: args.pagination?.offset,
+          limit: normalized.limit,
+          offset: normalized.offset,
           network: args.network,
         }, ctx.campaignDataSource);
-        return campaigns.map(toCampaignPayload);
+        return {
+          items: campaigns.map(toCampaignPayload),
+          pageInfo: buildPageInfo(campaigns.length, normalized),
+        };
       },
 
       trees: async (
@@ -108,10 +156,12 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         args: {
           filter?: { planter?: string; region?: string; status?: StreamStatusFilter; search?: string };
           pagination?: PaginationInput;
+          sort?: SortInput;
           network?: Network;
         },
         ctx: ResolverContext,
       ) => {
+        validateListArgs(args.pagination, args.sort);
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const filter = args.filter ?? {};
         const filtered = streams.filter((stream) => {
@@ -133,14 +183,15 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
           asset: stream.asset,
           sponsoredAmount: stream.totalAmount,
           createdAt: stream.createdAt,
-        })), args.pagination);
+        })), args.pagination, args.sort);
       },
 
       planters: async (
         _: unknown,
-        args: { region?: string; pagination?: PaginationInput; network?: Network },
+        args: { region?: string; pagination?: PaginationInput; sort?: SortInput; network?: Network },
         ctx: ResolverContext,
       ) => {
+        validateListArgs(args.pagination, args.sort);
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const groups = new Map<string, { region: string | null; treeCount: number; sponsoredAmount: bigint }>();
         for (const stream of streams) {
@@ -155,14 +206,15 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
           region: value.region,
           treeCount: value.treeCount,
           sponsoredAmount: value.sponsoredAmount.toString(),
-        })), args.pagination);
+        })), args.pagination, args.sort);
       },
 
       contracts: async (
         _: unknown,
-        args: { pagination?: PaginationInput; network?: Network },
+        args: { pagination?: PaginationInput; sort?: SortInput; network?: Network },
         ctx: ResolverContext,
       ) => {
+        validateListArgs(args.pagination, args.sort);
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const groups = new Map<string, { symbol: string; streamCount: number; totalVolume: bigint }>();
         for (const stream of streams) {
@@ -176,7 +228,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
           symbol: value.symbol,
           streamCount: value.streamCount,
           totalVolume: value.totalVolume.toString(),
-        })), args.pagination);
+        })), args.pagination, args.sort);
       },
 
       /**
@@ -210,16 +262,19 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         args: {
           filter?: RegionFilter;
           pagination?: PaginationInput;
+          sort?: SortInput;
           network?: Network;
         },
         ctx: ResolverContext
       ) => {
+        validateListArgs(args.pagination, args.sort);
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return service.getRegionMetrics(
+        const rows = await service.getRegionMetrics(
           args.filter,
-          args.pagination,
+          undefined,
           args.network ?? "testnet"
         );
+        return paginate(rows, args.pagination, args.sort);
       },
 
       /**
@@ -237,16 +292,19 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         args: {
           filter?: CategoryFilter;
           pagination?: PaginationInput;
+          sort?: SortInput;
           network?: Network;
         },
         ctx: ResolverContext
       ) => {
+        validateListArgs(args.pagination, args.sort);
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return service.getCategoryMetrics(
+        const rows = await service.getCategoryMetrics(
           args.filter,
-          args.pagination,
+          undefined,
           args.network ?? "testnet"
         );
+        return paginate(rows, args.pagination, args.sort);
       },
 
       /**
@@ -264,16 +322,19 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         args: {
           filter?: AssetFilter;
           pagination?: PaginationInput;
+          sort?: SortInput;
           network?: Network;
         },
         ctx: ResolverContext
       ) => {
+        validateListArgs(args.pagination, args.sort);
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return service.getAssetMetrics(
+        const rows = await service.getAssetMetrics(
           args.filter,
-          args.pagination,
+          undefined,
           args.network ?? "testnet"
         );
+        return paginate(rows, args.pagination, args.sort);
       },
 
       /**
@@ -337,9 +398,13 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         return getCampaignAnalyticsDashboard(args.campaignId);
       },
 
-      grantPrograms: async () => {
+      grantPrograms: async (
+        _: unknown,
+        args: { pagination?: PaginationInput; sort?: SortInput } = {},
+      ) => {
+        validateListArgs(args.pagination, args.sort);
         const programs = await getGrantProgramService().listPrograms();
-        return programs.map(toProgramPayload);
+        return paginate(programs.map(toProgramPayload), args.pagination, args.sort);
       },
 
       grantProgramSummary: async (
@@ -356,13 +421,14 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
 
       campaignGrantAllocations: async (
         _: unknown,
-        args: { campaignId: string },
+        args: { campaignId: string; pagination?: PaginationInput; sort?: SortInput },
       ) => {
+        validateListArgs(args.pagination, args.sort);
         const allocations = await getGrantProgramService().getCampaignAllocations(args.campaignId);
-        return allocations.map((allocation) => ({
+        return paginate(allocations.map((allocation) => ({
           ...allocation,
           allocatedAt: Math.floor(allocation.allocatedAt / 1000),
-        }));
+        })), args.pagination, args.sort);
       },
     },
     Mutation: {

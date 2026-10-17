@@ -2,6 +2,7 @@ import { QueryClient, QueryKey, useMutation, useQueryClient } from '@tanstack/re
 import toast from 'react-hot-toast';
 import { createStream } from '@/lib/api';
 import { useWallet } from '@/providers/StellarWalletProvider';
+import { useTransactionGuard } from '@/hooks/use-transaction-guard';
 
 type CreateStreamInput = Omit<Parameters<typeof createStream>[0], 'sender' | 'signTransaction'> & {
     sender?: string;
@@ -29,6 +30,7 @@ function restorePreviousStreams(
 export function useCreateStream() {
     const queryClient = useQueryClient();
     const { address, signTransaction } = useWallet();
+    const transactionGuard = useTransactionGuard();
 
     return useMutation({
         mutationFn: (params: CreateStreamInput) => {
@@ -37,10 +39,17 @@ export function useCreateStream() {
                 throw new Error('Wallet not connected');
             }
 
+            // Bind the flow to the chain identity at start; abort if the network
+            // switches before signing/confirmation completes.
+            const guard = transactionGuard.begin('create-stream');
+
             return createStream({
                 ...params,
                 sender,
-                signTransaction,
+                signTransaction: guard.wrapSignTransaction(signTransaction),
+                assertChainUnchanged: guard.assertChainUnchanged,
+            }).finally(() => {
+                guard.finish();
             });
         },
         onMutate: async (newStream): Promise<CreateStreamMutationContext> => {
@@ -63,11 +72,17 @@ export function useCreateStream() {
 
             return { previousStreams };
         },
-        onError: (_error, _newStream, context) => {
+        onError: (error, _newStream, context) => {
             const restored = restorePreviousStreams(queryClient, context?.previousStreams);
             if (!restored) {
                 queryClient.invalidateQueries({ queryKey: ['streams'] });
             }
+
+            if (transactionGuard.isChainChangedError(error)) {
+                toast.error('Network changed. Please review and confirm the stream again.');
+                return;
+            }
+
             toast.error('Failed to create stream. Refreshing latest data.');
         },
         onSettled: () => {

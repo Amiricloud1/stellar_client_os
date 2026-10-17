@@ -2,12 +2,21 @@ import { QueryClient, QueryKey, useMutation, useQueryClient } from '@tanstack/re
 import toast from 'react-hot-toast';
 import { distribute } from '@/lib/api';
 import { useWallet } from '@/providers/StellarWalletProvider';
+import { useChainGuard } from '@/hooks/use-chain-guard';
 import { createBatches } from '../../../../packages/sdk/src/utils/batchDistribution';
 
 type DistributeInput = Parameters<typeof distribute>[0];
 
 interface DistributeMutationContext {
     previousStreams: Array<[QueryKey, unknown]>;
+}
+
+function isChainChangedError(error: unknown): boolean {
+    return (
+        typeof error === 'object' &&
+        error !== null &&
+        (error as { code?: unknown }).code === 'CHAIN_CHANGED'
+    );
 }
 
 function restorePreviousStreams(
@@ -28,6 +37,7 @@ function restorePreviousStreams(
 export function useDistribute() {
     const queryClient = useQueryClient();
     const { address, signTransaction } = useWallet();
+    const { assertChainUnchanged, beginFlow } = useChainGuard();
 
     return useMutation({
         mutationFn: async (params: DistributeInput) => {
@@ -36,12 +46,26 @@ export function useDistribute() {
                 throw new Error('Wallet not connected');
             }
 
+            // Bind the whole (possibly batched) flow to the chain identity at start.
+            const flow = beginFlow();
+
+            const runBatch = async (batchParams: DistributeInput) => {
+                assertChainUnchanged(flow);
+                const result = await distribute({
+                    ...batchParams,
+                    sender,
+                    signTransaction,
+                });
+                assertChainUnchanged(flow);
+                return result;
+            };
+
             const BATCH_SIZE = 100;
             if (params.recipients.length > BATCH_SIZE) {
                 const recipientBatches = createBatches(params.recipients, BATCH_SIZE);
                 if (typeof params.amounts === 'bigint') {
                     for (const batch of recipientBatches) {
-                        await distribute({
+                        await runBatch({
                             ...params,
                             recipients: batch,
                             sender,
@@ -52,7 +76,7 @@ export function useDistribute() {
                 } else {
                     const amountBatches = createBatches(params.amounts, BATCH_SIZE);
                     for (let i = 0; i < recipientBatches.length; i++) {
-                        await distribute({
+                        await runBatch({
                             ...params,
                             recipients: recipientBatches[i],
                             amounts: amountBatches[i],
@@ -64,7 +88,7 @@ export function useDistribute() {
                 }
             }
 
-            return distribute({
+            return runBatch({
                 ...params,
                 sender,
                 signTransaction,
@@ -83,10 +107,14 @@ export function useDistribute() {
 
             return { previousStreams };
         },
-        onError: (_error, _variables, context) => {
+        onError: (error, _variables, context) => {
             const restored = restorePreviousStreams(queryClient, context?.previousStreams);
             if (!restored) {
                 queryClient.invalidateQueries({ queryKey: ['streams'] });
+            }
+            if (isChainChangedError(error)) {
+                toast.error('Network changed. Distribution aborted; please review and confirm again.');
+                return;
             }
             toast.error('Distribution failed. Refreshing latest data.');
         },

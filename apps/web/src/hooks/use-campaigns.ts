@@ -10,10 +10,52 @@ import { useSyncQueue } from "./use-sync-queue";
 // currently-visible cards are in the DOM.  We fetch up to 500 at a time and
 // append on scroll (infinite load pattern) to support 10k+ campaign lists
 // without a single blocking request.
+//
+// Issue #59: pagination and sorting are standardized across list endpoints.
+// The API enforces a maximum page size (see shared pagination contract), so
+// this value is clamped to the server-advertised limit when one is returned.
 // ---------------------------------------------------------------------------
 const PAGE_SIZE = 500;
 
-export function useCampaigns() {
+// Stable default ordering shared with the other list endpoints (campaigns,
+// backers, audit, analytics).  `createdAt` is unique per campaign so the
+// ordering is deterministic across pages.
+const DEFAULT_SORT = "createdAt";
+const DEFAULT_ORDER = "desc";
+
+export interface PageInfo {
+  limit: number;
+  offset: number;
+  total: number;
+  hasMore: boolean;
+  sort: string;
+  order: "asc" | "desc";
+}
+
+export interface UseCampaignsOptions {
+  /** Page size requested from the API (clamped to the server max). */
+  limit?: number;
+  /** Field to sort by; must be one of the shared sortable fields. */
+  sort?: string;
+  /** Sort direction. */
+  order?: "asc" | "desc";
+}
+
+const DEFAULT_PAGE_INFO: PageInfo = {
+  limit: PAGE_SIZE,
+  offset: 0,
+  total: 0,
+  hasMore: true,
+  sort: DEFAULT_SORT,
+  order: DEFAULT_ORDER,
+};
+
+export function useCampaigns(options: UseCampaignsOptions = {}) {
+  const {
+    limit: requestedLimit = PAGE_SIZE,
+    sort = DEFAULT_SORT,
+    order = DEFAULT_ORDER,
+  } = options;
   const defaultCampaigns = [
     {
       id: "camp-101",
@@ -45,6 +87,12 @@ export function useCampaigns() {
   const [campaigns, setCampaigns] = useState<any[]>(defaultCampaigns);
   const [isLoading, setIsLoading] = useState(true);
   const [hasMore, setHasMore] = useState(true);
+  const [pageInfo, setPageInfo] = useState<PageInfo>({
+    ...DEFAULT_PAGE_INFO,
+    limit: requestedLimit,
+    sort,
+    order,
+  });
   const { isOnline } = useSyncQueue();
 
   useEffect(() => {
@@ -70,14 +118,38 @@ export function useCampaigns() {
       }
 
       let offset = 0;
+      let pageLimit = requestedLimit;
       const accumulated: any[] = [];
+      let lastPageInfo: PageInfo | null = null;
 
       try {
         while (true) {
-          const res = await fetch(`/api/campaigns?limit=${PAGE_SIZE}&offset=${offset}`);
+          const params = new URLSearchParams({
+            limit: String(pageLimit),
+            offset: String(offset),
+            sort,
+            order,
+          });
+          const res = await fetch(`/api/campaigns?${params.toString()}`);
           if (!res.ok) break;
 
           const { data, pagination } = await res.json();
+
+          // Issue #59: the API returns shared PageInfo metadata.  Use it as
+          // the source of truth for the effective limit, total count and
+          // whether more pages exist, so ordering stays stable across pages.
+          if (pagination) {
+            lastPageInfo = {
+              limit: pagination.limit ?? pageLimit,
+              offset: pagination.offset ?? offset,
+              total: pagination.total ?? 0,
+              hasMore: Boolean(pagination.hasMore),
+              sort: pagination.sort ?? sort,
+              order: pagination.order ?? order,
+            };
+            // Respect the server-advertised max page size on subsequent pages.
+            pageLimit = lastPageInfo.limit;
+          }
 
           // Map backend records to UI format
           const formatted = (data as any[]).map((c) => ({
@@ -99,14 +171,22 @@ export function useCampaigns() {
           }));
 
           accumulated.push(...formatted);
-          offset += PAGE_SIZE;
+          offset += pageLimit;
 
-          // Stop when the API returns fewer items than the page size,
-          // meaning we've fetched all available campaigns.
-          if (!data || data.length < PAGE_SIZE) {
+          // Prefer the server's PageInfo to decide whether to continue; fall
+          // back to the short-page heuristic for older API responses.
+          const more = lastPageInfo
+            ? lastPageInfo.hasMore
+            : Boolean(data) && data.length >= pageLimit;
+
+          if (!more) {
             setHasMore(false);
             break;
           }
+        }
+
+        if (lastPageInfo) {
+          setPageInfo(lastPageInfo);
         }
 
         if (accumulated.length > 0) {
@@ -121,8 +201,8 @@ export function useCampaigns() {
     };
 
     fetchCampaigns();
-  }, [isOnline]);
+  }, [isOnline, requestedLimit, sort, order]);
 
-  return { campaigns, isLoading, hasMore };
+  return { campaigns, isLoading, hasMore, pageInfo };
 }
 

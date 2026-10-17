@@ -191,3 +191,83 @@ export const updateCampaignSchema = z.object({
 
 export type UpdateCampaignFormData = z.infer<typeof updateCampaignSchema>
 
+/**
+ * Shared pagination and sorting contract for list endpoints (issue #59).
+ *
+ * Every list endpoint (campaigns, backers, audit, analytics) validates its
+ * query parameters through these schemas so ordering is stable, page sizes are
+ * bounded, and invalid sort fields are rejected with a typed error.
+ */
+export const DEFAULT_PAGE = 1
+export const DEFAULT_PAGE_SIZE = 20
+export const MAX_PAGE_SIZE = 100
+
+/** Allowlisted sort fields per list resource. Unknown fields are rejected. */
+export const SORT_FIELDS = {
+  campaigns: ["createdAt", "deadline", "goalAmount", "name", "updatedAt"],
+  backers: ["contributedAt", "amount", "backerAddress"],
+  audit: ["timestamp", "action", "actor"],
+  analytics: ["date", "totalRaised", "backerCount", "campaignCount"],
+} as const
+
+export type SortResource = keyof typeof SORT_FIELDS
+
+export const sortDirectionSchema = z.enum(["asc", "desc"])
+
+export const paginationSchema = z.object({
+  page: z.coerce.number().int().min(1).default(DEFAULT_PAGE),
+  pageSize: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(MAX_PAGE_SIZE, `pageSize cannot exceed ${MAX_PAGE_SIZE}`)
+    .default(DEFAULT_PAGE_SIZE),
+})
+
+export type PaginationParams = z.infer<typeof paginationSchema>
+
+/** Typed error raised when a sort field is not in the resource allowlist. */
+export class InvalidSortFieldError extends Error {
+  readonly code = "INVALID_SORT_FIELD"
+  constructor(
+    readonly resource: SortResource,
+    readonly field: string,
+  ) {
+    super(`Invalid sort field "${field}" for ${resource}`)
+    this.name = "InvalidSortFieldError"
+  }
+}
+
+/**
+ * Build a schema that validates pagination plus a resource-scoped sort field
+ * and direction. `sortField` defaults to the first allowlisted field.
+ */
+export function createListQuerySchema<R extends SortResource>(resource: R) {
+  const fields = SORT_FIELDS[resource] as readonly string[]
+  return paginationSchema.extend({
+    sortField: z.enum(fields as [string, ...string[]]).default(fields[0]),
+    sortDirection: sortDirectionSchema.default("desc"),
+  })
+}
+
+export type ListQueryParams<R extends SortResource> = z.infer<
+  ReturnType<typeof createListQuerySchema<R>>
+>
+
+/**
+ * Parse and default list query parameters for a resource. Throws
+ * `InvalidSortFieldError` for unknown sort fields and a `ZodError` for other
+ * invalid input (e.g. pageSize above the maximum).
+ */
+export function parseListQuery<R extends SortResource>(
+  resource: R,
+  input: unknown,
+): ListQueryParams<R> {
+  const raw = (input ?? {}) as Record<string, unknown>
+  const fields = SORT_FIELDS[resource] as readonly string[]
+  if (raw.sortField !== undefined && !fields.includes(String(raw.sortField))) {
+    throw new InvalidSortFieldError(resource, String(raw.sortField))
+  }
+  return createListQuerySchema(resource).parse(raw) as ListQueryParams<R>
+}
+
