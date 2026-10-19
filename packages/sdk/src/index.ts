@@ -101,3 +101,13 @@ export {
   CONTRACT_ERRORS,
   type ParsedContractError,
 } from "./utils/errors.js";
+
+// Export exact decimal token amount utilities (issue #46)
+export * from "./utils/exact-decimal.js";
+
+// Export bounded Soroban RPC failover utilities (issue #41)
+export * from "./utils/rpcFailover.js";
+
+// Export contract event schema validation utilities (issue #35)
+export * from "./utils/event-validator.js";
+
