@@ -16,6 +16,7 @@
     "test:sdk:integration": "pnpm --filter @fundable/sdk test:integration",
     "lint": "pnpm --filter @fundable/web lint",
     "changeset": "changeset",
+    "changeset:dry-run": "tsx scripts/release-dry-run.ts",
     "changeset:version": "changeset version",
     "changeset:publish": "pnpm --filter @fundable/sdk build && changeset publish"
   },
