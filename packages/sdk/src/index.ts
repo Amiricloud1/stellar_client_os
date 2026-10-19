@@ -101,3 +101,10 @@ export {
   CONTRACT_ERRORS,
   type ParsedContractError,
 } from "./utils/errors.js";
+export {
+  normalizeError,
+  redactSensitive,
+  type NormalizedError,
+  type NormalizedErrorCode,
+  type ErrorCategory,
+} from "./utils/normalizeError.js";
