@@ -7,7 +7,41 @@ export const CAMPAIGN_WEBHOOK_EVENTS = [
 
 export type CampaignWebhookEvent = (typeof CAMPAIGN_WEBHOOK_EVENTS)[number];
 
-export interface TreeVerifiedEvent {
+/**
+ * Persistence contract for campaign webhook records.
+ *
+ * Campaign state and webhook subscriptions are the durable source of truth for
+ * the API. Records are persisted before any side effect (delivery attempt,
+ * event emission) is acknowledged, and every mutation happens inside a single
+ * transaction boundary so that a process restart never observes a partially
+ * written record.
+ *
+ * Durability-relevant fields:
+ * - `recordId`: stable primary key of the persisted record.
+ * - `sequence`: monotonically increasing per-campaign ordering token used to
+ *   detect gaps or replays after recovery.
+ * - `persistedAt`: ISO timestamp of the durable write (not the event time).
+ * - `schemaVersion`: version of the persisted shape, used for migrations.
+ *
+ * Migration implications: records written before these fields existed are
+ * treated as `schemaVersion: 1` with no `sequence`. Readers must tolerate their
+ * absence; writers must always populate them. Backfill assigns `sequence` in
+ * `persistedAt` order and bumps `schemaVersion` to the current value.
+ */
+export const CAMPAIGN_WEBHOOK_SCHEMA_VERSION = 2;
+
+export interface CampaignWebhookDurabilityFields {
+  /** Stable primary key of the persisted record. */
+  recordId?: string;
+  /** Monotonic per-campaign ordering token; absent on legacy (v1) records. */
+  sequence?: number;
+  /** ISO timestamp of the durable write, distinct from the event time. */
+  persistedAt?: string;
+  /** Persisted shape version; legacy records are treated as version 1. */
+  schemaVersion?: number;
+}
+
+export interface TreeVerifiedEvent extends CampaignWebhookDurabilityFields {
   verificationId: string;
   treeId: string;
   campaignId: string;
@@ -18,7 +52,7 @@ export interface TreeVerifiedEvent {
   metadata?: Record<string, unknown>;
 }
 
-export interface BatchVerifiedEvent {
+export interface BatchVerifiedEvent extends CampaignWebhookDurabilityFields {
   batchId: string;
   campaignId: string;
   treeIds: string[];
@@ -28,7 +62,7 @@ export interface BatchVerifiedEvent {
   metadata?: Record<string, unknown>;
 }
 
-export interface CampaignMilestoneReachedEvent {
+export interface CampaignMilestoneReachedEvent extends CampaignWebhookDurabilityFields {
   eventId: string;
   campaignId: string;
   campaignName?: string;
@@ -45,7 +79,7 @@ export interface CampaignMilestoneReachedEvent {
  */
 export type ImpactMilestone = "1000_trees" | "5000_trees" | "10_tons_co2";
 
-export interface CampaignImpactMilestoneEvent {
+export interface CampaignImpactMilestoneEvent extends CampaignWebhookDurabilityFields {
   eventId: string;
   campaignId: string;
   /** Milestone type: 1000_trees, 5000_trees, or 10_tons_co2 */
@@ -56,7 +90,7 @@ export interface CampaignImpactMilestoneEvent {
   co2Sequestration: string | null;
 }
 
-export interface CampaignCompletedEvent {
+export interface CampaignCompletedEvent extends CampaignWebhookDurabilityFields {
   completionId: string;
   campaignId: string;
   completedAt: string;

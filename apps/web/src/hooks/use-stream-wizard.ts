@@ -8,15 +8,27 @@ import {
   type WizardErrors,
   type WizardStreamData,
 } from "@/components/modules/payment-stream/wizard/wizard-config";
+import {
+  classifyWalletError,
+  type WalletErrorAction,
+  type WalletErrorRecovery,
+} from "@/lib/wallet/error-classifier";
 
 interface UseStreamWizardOptions {
   defaultToken: string;
   defaultDurationUnit: string;
+  /** Optional recovery hooks wired to the connected wallet/RPC layer. */
+  onRetry?: () => void | Promise<void>;
+  onSwitchNetwork?: (chainId?: number) => void | Promise<void>;
+  onReconnect?: () => void | Promise<void>;
 }
 
 export function useStreamWizard({
   defaultToken,
   defaultDurationUnit,
+  onRetry,
+  onSwitchNetwork,
+  onReconnect,
 }: UseStreamWizardOptions) {
   const initialData = useMemo(
     () => createInitialWizardData(defaultToken, defaultDurationUnit),
@@ -26,6 +38,8 @@ export function useStreamWizard({
   const [stepIndex, setStepIndex] = useState(0);
   const [data, setData] = useState<WizardStreamData>(initialData);
   const [errors, setErrors] = useState<WizardErrors>({});
+  const [recovery, setRecovery] = useState<WalletErrorRecovery | null>(null);
+  const [isRecovering, setIsRecovering] = useState(false);
 
   const currentStep = WIZARD_STEPS[stepIndex];
   const isFirstStep = stepIndex === 0;
@@ -78,8 +92,55 @@ export function useStreamWizard({
   const reset = useCallback(() => {
     setData(initialData);
     setErrors({});
+    setRecovery(null);
     setStepIndex(0);
   }, [initialData]);
+
+  /**
+   * Classify a wallet/RPC/simulation/contract failure into a safe recovery
+   * action. Form values are intentionally left untouched so the creator can
+   * retry without re-entering their stream configuration.
+   */
+  const reportError = useCallback((error: unknown) => {
+    const classified = classifyWalletError(error);
+    setRecovery(classified);
+    return classified;
+  }, []);
+
+  const clearRecovery = useCallback(() => {
+    setRecovery(null);
+  }, []);
+
+  const runRecovery = useCallback(
+    async (action?: WalletErrorAction) => {
+      const target = action ?? recovery?.action;
+      if (!target) return false;
+
+      setIsRecovering(true);
+      try {
+        switch (target) {
+          case "retry":
+            await onRetry?.();
+            break;
+          case "switch-network":
+            await onSwitchNetwork?.(recovery?.chainId);
+            break;
+          case "reconnect":
+            await onReconnect?.();
+            break;
+          default:
+            // Non-recoverable actions (e.g. "contact-support") leave the
+            // recovery state in place for the UI to surface guidance.
+            return false;
+        }
+        setRecovery(null);
+        return true;
+      } finally {
+        setIsRecovering(false);
+      }
+    },
+    [recovery, onRetry, onSwitchNetwork, onReconnect]
+  );
 
   const isDirty = useMemo(
     () => JSON.stringify(data) !== JSON.stringify(initialData),
@@ -95,6 +156,8 @@ export function useStreamWizard({
     data,
     errors,
     isDirty,
+    recovery,
+    isRecovering,
     setData,
     updateField,
     validateCurrentStep,
@@ -102,6 +165,9 @@ export function useStreamWizard({
     goBack,
     goToStep,
     reset,
+    reportError,
+    clearRecovery,
+    runRecovery,
   };
 }
 

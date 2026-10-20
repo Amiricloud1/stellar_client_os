@@ -42,6 +42,8 @@ pub enum DataKey {
     /// Number of planting batches recorded for a campaign
     /// (persistent storage).
     PlantingCount(u64),
+    /// Current storage schema version (instance storage).
+    SchemaVersion,
 }
 
 /// Verification state of a single planting batch.
@@ -277,6 +279,19 @@ pub struct AdminUpdatedEvent {
     pub new_admin: Address,
 }
 
+/// Emitted when the storage schema version is migrated.
+#[contractevent(topics = ["SchemaMigrated"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaMigratedEvent {
+    /// Previous schema version.
+    pub previous_version: u32,
+    /// New schema version.
+    pub new_version: u32,
+    /// Unix timestamp (seconds) of migration.
+    pub migrated_at: u64,
+}
+
+
 // ---------------------------------------------------------------------------
 // Error codes
 // ---------------------------------------------------------------------------
@@ -319,6 +334,9 @@ pub enum Error {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+/// Storage schema version for persistent layout migrations.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Full scale of the diversity score: `10_000` basis points = 100 %.
 const MAX_SCORE: u32 = 10_000;
@@ -416,6 +434,9 @@ impl CampaignDiversityContract {
             .instance()
             .set(&DataKey::Registrar, &registrar);
         env.storage().instance().set(&DataKey::CampaignCount, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
         env.storage()
             .instance()
             .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
@@ -1016,6 +1037,77 @@ impl CampaignDiversityContract {
         }
         .publish(&env);
     }
+
+    /// Return the storage schema version of the contract.
+    pub fn get_schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(1)
+    }
+
+    /// Perform idempotent bounded schema migration.
+    ///
+    /// Upgrades legacy storage layouts to the current schema version.
+    pub fn migrate_schema(env: Env) -> u32 {
+        Self::assert_initialized(&env);
+        Self::require_admin(&env);
+
+        let current_version = Self::get_schema_version(env.clone());
+        if current_version < SCHEMA_VERSION {
+            env.storage()
+                .instance()
+                .set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
+            env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+            SchemaMigratedEvent {
+                previous_version: current_version,
+                new_version: SCHEMA_VERSION,
+                migrated_at: env.ledger().timestamp(),
+            }
+            .publish(&env);
+        }
+
+        SCHEMA_VERSION
+    }
+
+    /// Pure deterministic scoring function.
+    ///
+    /// Computes the diversity score given species count, verified tree count,
+    /// and same-species ordered pairs sum. Exposed for auditability and
+    /// independent client-side or cross-contract verification.
+    ///
+    /// Inputs:
+    /// - `species_count`: distinct verified species count (0 ..= 64)
+    /// - `verified_tree_count`: total verified trees across all species
+    /// - `same_species_pairs`: sum of n_i * (n_i - 1) for each species
+    ///
+    /// Normalization:
+    /// Simpson's diversity index normalized to [0, 10_000] basis points where
+    /// an equally distributed planting across species achieves 10_000.
+    ///
+    /// Rounding:
+    /// Integer floor rounding at every division stage, ensuring exact deterministic
+    /// outcomes without floating point discrepancy.
+    pub fn calculate_score(
+        env: Env,
+        species_count: u32,
+        verified_tree_count: u64,
+        same_species_pairs: u128,
+    ) -> u32 {
+        Self::score_from_species(species_count, verified_tree_count, same_species_pairs, &env)
+    }
+
+    /// Recompute and update the diversity score of a campaign.
+    ///
+    /// Authority: restricted to admin.
+    /// Emits `DiversityScoreUpdatedEvent` if the score changes.
+    pub fn rescore_campaign(env: Env, campaign_id: u64) -> u32 {
+        Self::assert_initialized(&env);
+        Self::require_admin(&env);
+        Self::assert_campaign_exists(&env, campaign_id);
+        Self::rescore(&env, campaign_id)
+    }
+
 
     // -----------------------------------------------------------------------
     // Private helpers
@@ -2342,4 +2434,67 @@ mod tests {
 
         client.get_admin();
     }
+
+    #[test]
+    fn test_calculate_score_deterministic_and_reproducible() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client, _, _) = setup_contract(&env);
+
+        // 1 species or < 2 trees scores 0
+        assert_eq!(client.calculate_score(&1, &100, &9900), 0);
+        assert_eq!(client.calculate_score(&0, &0, &0), 0);
+
+        // 2 species with 50 trees each: total 100 trees
+        // ordered pairs: 2 * 50 * 49 = 4900
+        // total pairs = 100 * 99 = 9900
+        // coverage = 2/12 * 10000 = 1666
+        // evenness = 2 * (9900 - 4900) * 10000 / (9900 * 1) = 10000 (capped at 10000)
+        // score = 1666 * 10000 / 10000 = 1666
+        let score1 = client.calculate_score(&2, &100, &4900);
+        let score2 = client.calculate_score(&2, &100, &4900);
+        assert_eq!(score1, 1666);
+        assert_eq!(score1, score2);
+
+        // 12 species with 10 trees each: total 120 trees
+        // ordered pairs: 12 * 10 * 9 = 1080
+        // total pairs: 120 * 119 = 14280
+        // coverage: 10000
+        // evenness: 12 * (14280 - 1080) * 10000 / (14280 * 11) = 12 * 13200 * 10000 / 157080 = 158400000 / 157080 = 10084 -> capped at 10000
+        // score = 10000
+        assert_eq!(client.calculate_score(&12, &120, &1080), 10000);
+    }
+
+    #[test]
+    fn test_rescore_campaign_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+
+        client.register_campaign(&42);
+        client.record_planting(&42, &String::from_str(&env, "Oak"), &50, &Address::generate(&env));
+        client.record_planting(&42, &String::from_str(&env, "Pine"), &50, &Address::generate(&env));
+        client.verify_planting(&42, &1);
+        client.verify_planting(&42, &2);
+
+        let initial_score = client.get_diversity_score(&42);
+        assert_eq!(initial_score, 1666);
+
+        let rescored = client.rescore_campaign(&42);
+        assert_eq!(rescored, 1666);
+    }
+
+    #[test]
+    fn test_schema_migration_campaign_diversity() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client, _, _) = setup_contract(&env);
+
+        assert_eq!(client.get_schema_version(), SCHEMA_VERSION);
+        let version = client.migrate_schema();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(client.get_schema_version(), SCHEMA_VERSION);
+    }
 }
+

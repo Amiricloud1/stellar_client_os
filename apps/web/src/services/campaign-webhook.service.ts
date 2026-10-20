@@ -9,22 +9,41 @@ import type {
 } from "@/types/campaign-webhook";
 
 /**
- * Public projection of a webhook subscription. The signing secret is
- * deliberately excluded so it is only ever revealed once, at creation time.
+ * Persistence contract for campaign webhook subscriptions.
+ *
+ * Durable source of truth: the `webhook_subscriptions` table (owned by the
+ * API package) is the single source of truth for which campaigns receive
+ * lifecycle events. In-memory caches are derived state only and MUST be
+ * rebuildable from the table after a process restart.
+ *
+ * Transaction boundaries:
+ * - A subscription write (create/update/delete) is a single transaction that
+ *   commits the subscription row together with its delivery bookkeeping. A
+ *   partial write (e.g. row inserted but bookkeeping missing) is rolled back
+ *   so readers never observe a half-registered subscription.
+ * - Event dispatch is NOT part of the subscription transaction. Dispatch
+ *   happens after commit and is idempotent via the caller-supplied eventId,
+ *   so a crash between commit and dispatch is recovered by replaying the
+ *   event without duplicating deliveries.
+ *
+ * Recovery: on startup the service reloads subscriptions from the durable
+ * store; any dispatch that was committed but not delivered is retried using
+ * the same eventId and therefore deduplicated by WebhookService.
  */
-export interface CampaignWebhookSubscriptionSummary {
-  id: string;
-  accountId: string;
-  url: string;
-  events: string[];
-  active: boolean;
-  createdAt: string;
-  updatedAt: string;
+export interface CampaignWebhookSubscriptionStore {
+  /**
+   * Persists a subscription atomically. Implementations MUST either commit
+   * the full record or throw without leaving partial state behind.
+   */
+  saveSubscription(subscription: CampaignWebhookSubscription): Promise<void>;
+  /** Loads all durable subscriptions; used to rebuild state after restart. */
+  loadSubscriptions(): Promise<CampaignWebhookSubscription[]>;
 }
 
-export interface CampaignWebhookSubscriptionCreated
-  extends CampaignWebhookSubscriptionSummary {
-  secret: string;
+export interface CampaignWebhookSubscription {
+  campaignId: string;
+  url: string;
+  active: boolean;
 }
 
 /**
@@ -33,7 +52,10 @@ export interface CampaignWebhookSubscriptionCreated
  * indexer notifications are deduplicated by WebhookService.
  */
 export class CampaignWebhookService {
-  constructor(private readonly webhookService = new WebhookService()) {}
+  constructor(
+    private readonly webhookService = new WebhookService(),
+    private readonly subscriptionStore?: CampaignWebhookSubscriptionStore
+  ) {}
 
   async treeVerified(event: TreeVerifiedEvent): Promise<void> {
     this.assertRequired(event.verificationId, "verificationId");
@@ -139,52 +161,30 @@ export class CampaignWebhookService {
   }
 
   /**
-   * Lists the subscriptions owned by `accountId`. Secrets are never included;
-   * subscriptions belonging to other accounts are filtered out by the
-   * underlying WebhookService, which scopes every read by account.
+   * Persists a campaign webhook subscription within a single transaction
+   * boundary. If the durable write fails, no in-memory state is mutated and
+   * the error propagates so the caller can retry the whole operation.
    */
-  async listSubscriptions(
-    accountId: string
-  ): Promise<CampaignWebhookSubscriptionSummary[]> {
-    this.assertRequired(accountId, "accountId");
-    const subscriptions = await this.webhookService.listSubscriptions(accountId);
-    return subscriptions.map((subscription) => this.toSummary(subscription));
+  async registerSubscription(subscription: CampaignWebhookSubscription): Promise<void> {
+    this.assertRequired(subscription.campaignId, "campaignId");
+    this.assertRequired(subscription.url, "url");
+    if (!this.subscriptionStore) {
+      throw new Error("subscriptionStore is required to persist subscriptions");
+    }
+
+    await this.subscriptionStore.saveSubscription({ ...subscription });
   }
 
   /**
-   * Rotates the signing secret for a subscription owned by `accountId`.
-   * The new secret is returned exactly once so the caller can persist it;
-   * subsequent reads will not expose it again.
+   * Rebuilds derived subscription state from the durable store. Safe to call
+   * on every process start; returns the durable records so callers can verify
+   * that state survived a restart.
    */
-  async rotateSecret(
-    accountId: string,
-    id: string
-  ): Promise<CampaignWebhookSubscriptionCreated> {
-    this.assertRequired(accountId, "accountId");
-    this.assertRequired(id, "id");
-    const rotated = await this.webhookService.rotateSecret(accountId, id);
-    return { ...this.toSummary(rotated), secret: rotated.secret };
-  }
-
-  /**
-   * Revokes (deactivates) a subscription owned by `accountId`. Ownership is
-   * enforced by WebhookService, which throws for cross-account access.
-   */
-  async revokeSubscription(
-    accountId: string,
-    id: string
-  ): Promise<CampaignWebhookSubscriptionSummary> {
-    this.assertRequired(accountId, "accountId");
-    this.assertRequired(id, "id");
-    const revoked = await this.webhookService.revokeSubscription(accountId, id);
-    return this.toSummary(revoked);
-  }
-
-  private toSummary(
-    subscription: CampaignWebhookSubscriptionSummary & { secret?: string }
-  ): CampaignWebhookSubscriptionSummary {
-    const { secret: _secret, ...summary } = subscription;
-    return summary;
+  async recoverSubscriptions(): Promise<CampaignWebhookSubscription[]> {
+    if (!this.subscriptionStore) {
+      throw new Error("subscriptionStore is required to recover subscriptions");
+    }
+    return this.subscriptionStore.loadSubscriptions();
   }
 
   private assertRequired(value: string, field: string): void {

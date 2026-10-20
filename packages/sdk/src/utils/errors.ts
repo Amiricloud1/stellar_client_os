@@ -32,6 +32,21 @@ export const CONTRACT_ERRORS: Record<number, string> = {
 };
 
 /**
+ * Stable, cross-package error classification.
+ *
+ * The web app maps these classes to recovery actions (retry, switch network,
+ * reconnect wallet, etc.), so the values here are part of the public API and
+ * must not change without a migration note.
+ */
+export type ErrorClass =
+  | "wallet"
+  | "rpc"
+  | "simulation"
+  | "contract"
+  | "transaction"
+  | "unknown";
+
+/**
  * Represents a parsed Soroban contract error with context
  */
 export interface ParsedContractError {
@@ -42,6 +57,103 @@ export interface ParsedContractError {
   originalError?: unknown;
   operation?: string;
   suggestion?: string;
+  /**
+   * Stable classification consumed by the web error classifier.
+   * Optional for backward compatibility with previously constructed values.
+   */
+  errorClass?: ErrorClass;
+}
+
+/**
+ * Maps a legacy `ParsedContractError.type` to the stable `ErrorClass`.
+ * Exposed for consumers that only have a legacy `type` value.
+ */
+export function toErrorClass(type: ParsedContractError["type"]): ErrorClass {
+  switch (type) {
+    case "contract_error":
+      return "contract";
+    case "simulation_error":
+      return "simulation";
+    case "transaction_error":
+      return "transaction";
+    default:
+      return "unknown";
+  }
+}
+
+/**
+ * Heuristically classifies a raw error as a wallet, RPC, simulation or
+ * contract failure. Used when no more specific information is available.
+ */
+export function classifyError(error: unknown): ErrorClass {
+  if (!error) {
+    return "unknown";
+  }
+
+  const message = (
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : typeof error === "object" && error !== null && "message" in error
+          ? String((error as Record<string, unknown>).message)
+          : ""
+  ).toLowerCase();
+
+  if (!message) {
+    return "unknown";
+  }
+
+  // Wallet / user-signing failures
+  if (
+    message.includes("user declined") ||
+    message.includes("user rejected") ||
+    message.includes("rejected by user") ||
+    message.includes("request rejected") ||
+    message.includes("wallet") ||
+    message.includes("not connected") ||
+    message.includes("not installed") ||
+    message.includes("no wallet")
+  ) {
+    return "wallet";
+  }
+
+  // RPC / network transport failures
+  if (
+    message.includes("network") ||
+    message.includes("fetch failed") ||
+    message.includes("failed to fetch") ||
+    message.includes("econnrefused") ||
+    message.includes("etimedout") ||
+    message.includes("timeout") ||
+    message.includes("502") ||
+    message.includes("503") ||
+    message.includes("504") ||
+    message.includes("rpc")
+  ) {
+    return "rpc";
+  }
+
+  // Simulation failures
+  if (
+    message.includes("simulation") ||
+    message.includes("insufficient fee") ||
+    message.includes("insufficient balance") ||
+    message.includes("xdr")
+  ) {
+    return "simulation";
+  }
+
+  // Contract failures
+  if (message.includes("contract error") || extractErrorCode(message) !== null) {
+    return "contract";
+  }
+
+  if (message.includes("transaction") || message.includes("failed")) {
+    return "transaction";
+  }
+
+  return "unknown";
 }
 
 /**
@@ -240,6 +352,7 @@ export function parseContractError(error: unknown, operationContext?: string): P
   if (!error) {
     return {
       type: "unknown",
+      errorClass: "unknown",
       message: "An unknown error occurred",
     };
   }
@@ -252,6 +365,7 @@ export function parseContractError(error: unknown, operationContext?: string): P
     if (errorCode !== null && errorCode in CONTRACT_ERRORS) {
       return {
         type: "contract_error",
+        errorClass: "contract",
         code: errorCode,
         message: CONTRACT_ERRORS[errorCode],
         details: errorMessage,
@@ -271,6 +385,7 @@ export function parseContractError(error: unknown, operationContext?: string): P
       const parsed = parseSimulationError(errorMessage);
       return {
         type: "simulation_error",
+        errorClass: "simulation",
         message: parsed.message,
         details: parsed.details,
         suggestion: parsed.suggestion,
@@ -286,6 +401,7 @@ export function parseContractError(error: unknown, operationContext?: string): P
     ) {
       return {
         type: "transaction_error",
+        errorClass: "transaction",
         message: "Transaction execution failed",
         details: errorMessage,
         suggestion: "Check the transaction parameters and network conditions",
@@ -296,6 +412,7 @@ export function parseContractError(error: unknown, operationContext?: string): P
 
     return {
       type: "unknown",
+      errorClass: classifyError(error),
       message: errorMessage || "An error occurred",
       operation: operationContext,
       originalError: error,
@@ -309,6 +426,7 @@ export function parseContractError(error: unknown, operationContext?: string): P
     if (errorCode !== null && errorCode in CONTRACT_ERRORS) {
       return {
         type: "contract_error",
+        errorClass: "contract",
         code: errorCode,
         message: CONTRACT_ERRORS[errorCode],
         suggestion: getSuggestionForErrorCode(errorCode),
@@ -319,6 +437,7 @@ export function parseContractError(error: unknown, operationContext?: string): P
 
     return {
       type: "unknown",
+      errorClass: classifyError(error),
       message: error,
       operation: operationContext,
       originalError: error,
@@ -335,6 +454,7 @@ export function parseContractError(error: unknown, operationContext?: string): P
       if (errorCode !== null && errorCode in CONTRACT_ERRORS) {
         return {
           type: "contract_error",
+          errorClass: "contract",
           code: errorCode,
           message: CONTRACT_ERRORS[errorCode],
           details: String(errorObj.message || ""),
@@ -350,6 +470,7 @@ export function parseContractError(error: unknown, operationContext?: string): P
       const parsed = parseTransactionResultXdr(String(errorObj.resultXdr));
       return {
         type: "transaction_error",
+        errorClass: "transaction",
         message: parsed.message,
         details: parsed.details,
         suggestion: parsed.suggestion,
@@ -366,6 +487,7 @@ export function parseContractError(error: unknown, operationContext?: string): P
       if (errorCode !== null && errorCode in CONTRACT_ERRORS) {
         return {
           type: "contract_error",
+          errorClass: "contract",
           code: errorCode,
           message: CONTRACT_ERRORS[errorCode],
           details: message,
@@ -377,6 +499,7 @@ export function parseContractError(error: unknown, operationContext?: string): P
 
       return {
         type: "unknown",
+        errorClass: classifyError(error),
         message: message,
         operation: operationContext,
         originalError: error,
@@ -385,6 +508,7 @@ export function parseContractError(error: unknown, operationContext?: string): P
 
     return {
       type: "unknown",
+      errorClass: classifyError(error),
       message: "An unknown error occurred",
       operation: operationContext,
       originalError: error,
@@ -393,6 +517,7 @@ export function parseContractError(error: unknown, operationContext?: string): P
 
   return {
     type: "unknown",
+    errorClass: "unknown",
     message: "An unexpected error occurred",
     operation: operationContext,
     originalError: error,
@@ -406,6 +531,7 @@ export function parseContractError(error: unknown, operationContext?: string): P
 export class FundableStellarError extends Error {
   public readonly code?: number;
   public readonly type: string;
+  public readonly errorClass: ErrorClass;
   public readonly details?: string;
   public readonly suggestion?: string;
   public readonly operation?: string;
@@ -415,6 +541,7 @@ export class FundableStellarError extends Error {
     this.name = "FundableStellarError";
     this.code = parsed.code;
     this.type = parsed.type;
+    this.errorClass = parsed.errorClass ?? toErrorClass(parsed.type);
     this.details = parsed.details;
     this.suggestion = parsed.suggestion;
     this.operation = parsed.operation;
@@ -428,6 +555,7 @@ export class FundableStellarError extends Error {
    */
   toString(): string {
     let result = `${this.name}: ${this.message}`;
+    result += ` [Class: ${this.errorClass}]`;
     if (this.code !== undefined) {
       result += ` [Code: ${this.code}]`;
     }

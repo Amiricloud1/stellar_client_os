@@ -491,9 +491,186 @@ describe("signAndWait", () => {
     await vi.runAllTimersAsync();
     vi.useRealTimers();
 
-    const result = await promise;
-
     expect(result.result).toBe(123n);
     expect(result.ledger).toBe(3333);
   });
+
+  describe("status modeling and cancellation (Issue #42)", () => {
+    it("returns status SUCCESS on confirmed transaction", async () => {
+      const tx = createMockAssembledTx("ok", "txstatus_success");
+      mockGetTransaction.mockResolvedValue({
+        status: rpc.Api.GetTransactionStatus.SUCCESS,
+        ledger: 1001,
+      });
+
+      const result = await waitForTransaction(tx, "https://test.stellar.org");
+      expect(result.status).toBe("SUCCESS");
+      expect(result.hash).toBe("txstatus_success");
+      expect(result.ledger).toBe(1001);
+    });
+
+    it("notifies onStatusChange when status changes to PENDING then SUCCESS", async () => {
+      const tx = createMockAssembledTx("ok", "txstatus_change");
+      const onStatusChange = vi.fn();
+      mockGetTransaction
+        .mockResolvedValueOnce({ status: "PENDING" })
+        .mockResolvedValueOnce({
+          status: rpc.Api.GetTransactionStatus.SUCCESS,
+          ledger: 1002,
+        });
+
+      vi.useFakeTimers();
+      const promise = waitForTransaction(tx, "https://test.stellar.org", {
+        pollInterval: 100,
+        onStatusChange,
+      });
+
+      await vi.runAllTimersAsync();
+      vi.useRealTimers();
+
+      const result = await promise;
+      expect(result.status).toBe("SUCCESS");
+      expect(onStatusChange).toHaveBeenCalledWith("PENDING");
+      expect(onStatusChange).toHaveBeenCalledWith("SUCCESS");
+    });
+
+    it("notifies NOT_FOUND when RPC returns not found or rejects with not found", async () => {
+      const tx = createMockAssembledTx("ok", "txstatus_notfound");
+      const onStatusChange = vi.fn();
+      mockGetTransaction
+        .mockResolvedValueOnce({ status: "NOT_FOUND" })
+        .mockRejectedValueOnce(new Error("Entry not found"))
+        .mockResolvedValueOnce({
+          status: rpc.Api.GetTransactionStatus.SUCCESS,
+          ledger: 1003,
+        });
+
+      vi.useFakeTimers();
+      const promise = waitForTransaction(tx, "https://test.stellar.org", {
+        pollInterval: 100,
+        onStatusChange,
+      });
+
+      await vi.runAllTimersAsync();
+      vi.useRealTimers();
+
+      await promise;
+      expect(onStatusChange).toHaveBeenCalledWith("NOT_FOUND");
+    });
+
+    it("handles EXPIRED status with typed error when throwOnFailure is true", async () => {
+      const tx = createMockAssembledTx(null, "txstatus_expired");
+      mockGetTransaction.mockResolvedValue({ status: "EXPIRED" });
+
+      await expect(
+        waitForTransaction(tx, "https://test.stellar.org", { timeout: 5000 }),
+      ).rejects.toThrow(/Transaction expired/);
+    });
+
+    it("returns typed result without throwing when throwOnFailure is false for FAILED, EXPIRED, TIMEOUT", async () => {
+      const txFailed = createMockAssembledTx(null, "tx_failed_typed");
+      mockGetTransaction.mockResolvedValueOnce({
+        status: rpc.Api.GetTransactionStatus.FAILED,
+        ledger: 888,
+        resultXdr: "xdr_dummy",
+      });
+
+      const failedResult = await waitForTransaction(txFailed, "https://test.stellar.org", {
+        throwOnFailure: false,
+      });
+      expect(failedResult.status).toBe("FAILED");
+      expect(failedResult.ledger).toBe(888);
+      expect(failedResult.error).toBeDefined();
+
+      const txExpired = createMockAssembledTx(null, "tx_expired_typed");
+      mockGetTransaction.mockResolvedValueOnce({ status: "EXPIRED" });
+      const expiredResult = await waitForTransaction(txExpired, "https://test.stellar.org", {
+        throwOnFailure: false,
+      });
+      expect(expiredResult.status).toBe("EXPIRED");
+      expect(expiredResult.error).toContain("expired");
+
+      const txTimeout = createMockAssembledTx(null, "tx_timeout_typed");
+      mockGetTransaction.mockResolvedValue({ status: "PENDING" });
+      vi.useFakeTimers();
+      const timeoutPromise = waitForTransaction(txTimeout, "https://test.stellar.org", {
+        timeout: 200,
+        pollInterval: 100,
+        throwOnFailure: false,
+      });
+      await vi.runAllTimersAsync();
+      vi.useRealTimers();
+      const timeoutResult = await timeoutPromise;
+      expect(timeoutResult.status).toBe("TIMEOUT");
+      expect(timeoutResult.error).toContain("timeout");
+    });
+
+    it("cancels immediately when signal is already aborted", async () => {
+      const tx = createMockAssembledTx(null, "tx_aborted_immediate");
+      const controller = new AbortController();
+      controller.abort(new Error("Operation canceled by user"));
+
+      await expect(
+        waitForTransaction(tx, "https://test.stellar.org", {
+          signal: controller.signal,
+        }),
+      ).rejects.toThrow("Operation canceled by user");
+
+      // With throwOnFailure: false
+      const result = await waitForTransaction(tx, "https://test.stellar.org", {
+        signal: controller.signal,
+        throwOnFailure: false,
+      });
+      expect(result.status).toBe("ABORTED");
+      expect(result.error).toContain("Operation canceled by user");
+    });
+
+    it("cancels during polling when AbortSignal fires", async () => {
+      const tx = createMockAssembledTx(null, "tx_aborted_during");
+      mockGetTransaction.mockResolvedValue({ status: "PENDING" });
+      const controller = new AbortController();
+
+      vi.useFakeTimers();
+      const promise = waitForTransaction(tx, "https://test.stellar.org", {
+        pollInterval: 200,
+        signal: controller.signal,
+      });
+
+      // Fire abort after first poll
+      controller.abort(new Error("User stopped wait"));
+
+      const rejection = expect(promise).rejects.toThrow("User stopped wait");
+      await vi.runAllTimersAsync();
+      await rejection;
+      vi.useRealTimers();
+    });
+
+    it("wraps and propagates errors thrown by onPoll and onStatusChange callbacks", async () => {
+      const tx = createMockAssembledTx(null, "tx_callback_err");
+      mockGetTransaction.mockResolvedValue({ status: "PENDING" });
+
+      const onPoll = vi.fn().mockImplementation(() => {
+        throw new Error("Telemetry failure");
+      });
+
+      await expect(
+        waitForTransaction(tx, "https://test.stellar.org", {
+          onPoll,
+          timeout: 2000,
+        }),
+      ).rejects.toThrow("Error in onPoll callback: Telemetry failure");
+
+      const onStatusChange = vi.fn().mockImplementation(() => {
+        throw new Error("UI crashed");
+      });
+
+      await expect(
+        waitForTransaction(tx, "https://test.stellar.org", {
+          onStatusChange,
+          timeout: 2000,
+        }),
+      ).rejects.toThrow("Error in onStatusChange callback: UI crashed");
+    });
+  });
 });
+

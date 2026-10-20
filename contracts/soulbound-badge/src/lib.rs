@@ -68,6 +68,15 @@ pub struct ContractFullEvent {
     pub timestamp: u64,
 }
 
+/// Emitted when an admin revokes a soulbound badge.
+#[contractevent(topics = ["badge_revoked"])]
+#[derive(Clone)]
+pub struct BadgeRevokedEvent {
+    pub badge_id: u64,
+    pub owner: Address,
+    pub timestamp: u64,
+}
+
 /// Custom errors for the contract
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -85,6 +94,10 @@ pub enum Error {
     InvalidToken = 10,
     /// The badge ID counter has reached `u64::MAX`; no more badges can be minted.
     ContractFull = 11,
+    /// Soulbound badges are non-transferable and cannot be transferred between accounts.
+    NonTransferable = 12,
+    /// The badge has been revoked.
+    BadgeRevoked = 13,
 }
 
 // Storage keys
@@ -96,6 +109,7 @@ pub enum DataKey {
     UserContribution(Address),
     Badge(u64),
     UserBadges(Address),
+    RevokedBadge(u64),
 }
 
 // Constants for milestone thresholds
@@ -321,6 +335,48 @@ impl SoulboundBadgeContract {
         env.storage().instance()
             .get(&DataKey::AcceptedToken)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
+    }
+
+    /// Soulbound badges are strictly non-transferable.
+    /// Any call to transfer is rejected immediately with `Error::NonTransferable`.
+    pub fn transfer(_env: Env, _from: Address, _to: Address, _badge_id: u64) -> Result<(), Error> {
+        Err(Error::NonTransferable)
+    }
+
+    /// Admin-only: revoke an issued badge.
+    pub fn revoke_badge(env: Env, admin: Address, badge_id: u64) -> Result<(), Error> {
+        let stored_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        admin.require_auth();
+
+        let badge: Badge = env.storage().persistent()
+            .get(&DataKey::Badge(badge_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::BadgeNotFound));
+
+        let revoke_key = DataKey::RevokedBadge(badge_id);
+        if env.storage().persistent().has(&revoke_key) {
+            return Err(Error::BadgeRevoked);
+        }
+        env.storage().persistent().set(&revoke_key, &true);
+        env.storage().persistent().extend_ttl(&revoke_key, LEDGER_THRESHOLD, LEDGER_BUMP);
+
+        BadgeRevokedEvent {
+            badge_id,
+            owner: badge.owner,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Check if a badge has been revoked.
+    pub fn is_badge_revoked(env: Env, badge_id: u64) -> bool {
+        env.storage().persistent().has(&DataKey::RevokedBadge(badge_id))
     }
 
     /// Check and mint badges for newly achieved milestones
@@ -966,5 +1022,95 @@ mod test {
         let badge = client.get_badge(&badge_id);
         assert_eq!(badge.minted_at, 12345);
         assert_eq!(badge.total_contributed, 1_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #25: Non-transferability, revocation, and metadata immutability
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_soulbound_badge_transfer_is_strictly_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(SoulboundBadgeContract, ());
+        let client = SoulboundBadgeContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        client.initialize(&admin, &token);
+        let badges = client.record_contribution(&owner, &1_000);
+        let badge_id = badges.get(0).unwrap();
+
+        // Attempting to transfer must fail with NonTransferable (#12)
+        let transfer_result = client.try_transfer(&owner, &recipient, &badge_id);
+        assert_eq!(transfer_result, Err(Ok(Error::NonTransferable)));
+
+        // Verify badge owner remains unchanged
+        let badge = client.get_badge(&badge_id);
+        assert_eq!(badge.owner, owner);
+    }
+
+    #[test]
+    fn test_badge_revocation_lifecycle_and_negative_authorization() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(SoulboundBadgeContract, ());
+        let client = SoulboundBadgeContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let token = Address::generate(&env);
+        let owner = Address::generate(&env);
+
+        client.initialize(&admin, &token);
+        let badges = client.record_contribution(&owner, &1_000);
+        let badge_id = badges.get(0).unwrap();
+
+        assert_eq!(client.is_badge_revoked(&badge_id), false);
+
+        // Stranger attempting revocation must fail with Unauthorized (#3)
+        let unauthorized_revoke = client.try_revoke_badge(&stranger, &badge_id);
+        assert_eq!(unauthorized_revoke, Err(Ok(Error::Unauthorized)));
+        assert_eq!(client.is_badge_revoked(&badge_id), false);
+
+        // Admin revokes successfully
+        let revoke_res = client.try_revoke_badge(&admin, &badge_id);
+        assert_eq!(revoke_res, Ok(Ok(())));
+        assert_eq!(client.is_badge_revoked(&badge_id), true);
+
+        // Second revocation attempt fails with BadgeRevoked (#13)
+        let double_revoke = client.try_revoke_badge(&admin, &badge_id);
+        assert_eq!(double_revoke, Err(Ok(Error::BadgeRevoked)));
+    }
+
+    #[test]
+    fn test_immutable_badge_metadata_invariants() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(SoulboundBadgeContract, ());
+        let client = SoulboundBadgeContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let owner = Address::generate(&env);
+
+        client.initialize(&admin, &token);
+        let badges = client.record_contribution(&owner, &10_000); // Mints Bronze & Silver
+        let bronze_id = badges.get(0).unwrap();
+        let silver_id = badges.get(1).unwrap();
+
+        let bronze = client.get_badge(&bronze_id);
+        let silver = client.get_badge(&silver_id);
+
+        // Assert immutable metadata fields
+        assert_eq!(bronze.owner, owner);
+        assert_eq!(bronze.milestone_level, MilestoneLevel::Bronze);
+        assert_eq!(silver.owner, owner);
+        assert_eq!(silver.milestone_level, MilestoneLevel::Silver);
+        assert_eq!(bronze.badge_id, bronze_id);
+        assert_eq!(silver.badge_id, silver_id);
     }
 }

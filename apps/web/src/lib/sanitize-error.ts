@@ -117,40 +117,155 @@ export function sanitizeObject<T = unknown>(
 }
 
 /**
- * Sanitize an error object for safe telemetry reporting
- * 
- * @param error - The error object to sanitize
+ * A single field-level validation error, safe to return to clients.
+ */
+export type FieldError = {
+  /** Dot-notation path of the offending field, e.g. `amount` or `recipient.address` */
+  field: string;
+  /** Machine-readable reason, e.g. `required`, `invalid_format` */
+  code: string;
+  /** Human-readable, already-sanitized explanation */
+  message: string;
+};
+
+/**
+ * The only shape ever returned to clients or logged externally.
+ * Stack traces, `cause` chains and arbitrary internal properties are dropped.
+ */
+export type SanitizedError = {
+  /** Stable machine-readable error code, e.g. `VALIDATION_ERROR` */
+  code: string;
+  /** Human-readable, already-sanitized message */
+  message: string;
+  /** Correlation ID shared with server logs */
+  requestId?: string;
+  /** Field-level validation errors, when applicable */
+  fieldErrors?: FieldError[];
+};
+
+/**
+ * Properties that are always preserved (after sanitization) when present.
+ */
+const PRESERVED_PROPERTIES = ['code', 'requestId'] as const;
+
+/**
+ * Properties that are never copied, even if present on the source error.
+ */
+const STRIPPED_PROPERTIES = new Set([
+  'message',
+  'name',
+  'stack',
+  'cause',
+  'requestId',
+  'code',
+  'fieldErrors',
+]);
+
+const DEFAULT_ERROR_CODE = 'INTERNAL_ERROR';
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Normalize any thrown value (Error, string, object, undefined, ...) into a
+ * `SanitizedError`. Never throws, never leaks stack traces or `cause` chains.
+ *
+ * @param error - The thrown value to sanitize
  * @param options - Sanitization options
- * @returns A sanitized copy of the error with safe properties
+ * @returns A plain, JSON-safe object suitable for API responses and logs
  */
 export function sanitizeError(
-  error: Error,
+  error: unknown,
   options: SanitizeOptions = {}
-): Error {
-  const safeError = new Error(sanitizeErrorString(error.message, options));
-  
-  // Copy over safe properties
-  safeError.name = sanitizeErrorString(error.name, options);
-  safeError.stack = error.stack ? sanitizeErrorString(error.stack, options) : undefined;
+): SanitizedError {
+  const result: SanitizedError = {
+    code: DEFAULT_ERROR_CODE,
+    message: 'An unexpected error occurred',
+  };
 
-  // Copy any custom properties if they exist
-  const customProps = Object.getOwnPropertyNames(error).filter(
-    (prop) => prop !== 'message' && prop !== 'name' && prop !== 'stack'
-  );
+  if (error === null || error === undefined) {
+    return result;
+  }
 
-  const errorRecord = error as Error & Record<string, unknown>;
-  const safeErrorRecord = safeError as Error & Record<string, unknown>;
+  // Non-object throws (string, number, boolean, symbol, bigint)
+  if (typeof error !== 'object') {
+    if (typeof error === 'string' && error.length > 0) {
+      result.message = sanitizeErrorString(error, options);
+    }
+    return result;
+  }
 
-  for (const prop of customProps) {
-    const value = errorRecord[prop];
-    if (typeof value === 'string') {
-      safeErrorRecord[prop] = sanitizeErrorString(value, options);
-    } else if (value && typeof value === 'object') {
-      safeErrorRecord[prop] = sanitizeObject(value, options);
-    } else {
-      safeErrorRecord[prop] = value;
+  const record = error as Record<string, unknown>;
+
+  // Message: prefer `message`, fall back to `error` (e.g. from JSON payloads)
+  const rawMessage =
+    typeof record.message === 'string'
+      ? record.message
+      : typeof record.error === 'string'
+        ? record.error
+        : undefined;
+  if (rawMessage) {
+    result.message = sanitizeErrorString(rawMessage, options);
+  }
+
+  // Preserved scalar properties
+  for (const prop of PRESERVED_PROPERTIES) {
+    const value = record[prop];
+    if (typeof value === 'string' && value.length > 0) {
+      result[prop] = sanitizeErrorString(value, options);
     }
   }
 
-  return safeError;
+  // Field errors: keep only well-formed entries, sanitize their messages
+  if (Array.isArray(record.fieldErrors)) {
+    const fieldErrors: FieldError[] = [];
+    for (const entry of record.fieldErrors) {
+      if (!isPlainObject(entry)) continue;
+      const field = entry.field;
+      const code = entry.code;
+      const message = entry.message;
+      if (typeof field !== 'string' || typeof code !== 'string') continue;
+      fieldErrors.push({
+        field: sanitizeErrorString(field, options),
+        code: sanitizeErrorString(code, options),
+        message:
+          typeof message === 'string'
+            ? sanitizeErrorString(message, options)
+            : '',
+      });
+    }
+    if (fieldErrors.length > 0) {
+      result.fieldErrors = fieldErrors;
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Build a `SanitizedError` from an arbitrary thrown value, guaranteeing that
+ * only `code`, `message`, `requestId` and `fieldErrors` are present.
+ *
+ * This is the function API handlers should use before serializing an error
+ * into a response body or an external log sink. It intentionally ignores
+ * `stack`, `cause` and every other property on the source error.
+ *
+ * @param error - The thrown value to sanitize
+ * @param options - Sanitization options
+ * @returns A plain, JSON-safe object
+ */
+export function toClientError(
+  error: unknown,
+  options: SanitizeOptions = {}
+): SanitizedError {
+  return sanitizeError(error, options);
+}
+
+/**
+ * Determine whether a property name should be copied when sanitizing.
+ * Exposed for tests and for callers that need to mirror the allow-list.
+ */
+export function isStrippedProperty(prop: string): boolean {
+  return STRIPPED_PROPERTIES.has(prop);
 }
