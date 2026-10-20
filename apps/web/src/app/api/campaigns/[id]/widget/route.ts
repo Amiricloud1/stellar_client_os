@@ -134,6 +134,7 @@ import {
   widgetIframeSrc,
   WIDGET_IFRAME_MIN_HEIGHT,
 } from "@/lib/widget-theme";
+import { applySecurityHeaders } from "@/lib/security-headers";
 
 export async function GET(
   request: Request,
@@ -144,10 +145,13 @@ export async function GET(
 
   const campaign = await getCampaign(id);
   if (!campaign) {
-    return new Response("Campaign not found.", {
-      status: 404,
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-    });
+    return applySecurityHeaders(
+      new Response("Campaign not found.", {
+        status: 404,
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      }),
+      { allowFraming: false, isProduction: true }
+    );
   }
 
   const themeParam = url.searchParams.get("theme") ?? undefined;
@@ -155,27 +159,34 @@ export async function GET(
 
   // ?format=meta → JSON metadata + copy-paste snippet for campaign owners.
   if (url.searchParams.get("format") === "meta") {
-    return Response.json(
-      {
-        campaignId: id,
-        theme,
-        iframeSrc: widgetIframeSrc(id, url.origin, theme),
-        minHeight: WIDGET_IFRAME_MIN_HEIGHT,
-        snippet: buildEmbedSnippet(id, url.origin, theme),
-      },
-      { headers: { "Cache-Control": "no-store" } },
+    return applySecurityHeaders(
+      Response.json(
+        {
+          campaignId: id,
+          theme,
+          iframeSrc: widgetIframeSrc(id, url.origin, theme),
+          minHeight: WIDGET_IFRAME_MIN_HEIGHT,
+          snippet: buildEmbedSnippet(id, url.origin, theme),
+        },
+        { headers: { "Cache-Control": "no-store" } },
+      ),
+      { allowFraming: false, isProduction: true }
     );
   }
 
   const html = renderWidgetHtml(campaign, theme);
 
-  return new Response(html, {
-    status: 200,
-    headers: {
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "public, max-age=300, s-maxage=300",
-      // Note: no X-Frame-Options / CSP frame-ancestors is set here on purpose —
-      // absence is what allows any external site to embed this endpoint.
-    },
-  });
+  return applySecurityHeaders(
+    new Response(html, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "public, max-age=300, s-maxage=300",
+        // Note: no X-Frame-Options is set when allowFraming=true on purpose —
+        // absence of X-Frame-Options + frame-ancestors * allows external sites to embed this endpoint.
+      },
+    }),
+    { allowFraming: true, isProduction: true }
+  );
 }
+
