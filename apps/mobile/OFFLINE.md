@@ -341,6 +341,13 @@ Coverage:
   idempotency.
 - `__tests__/sync.test.ts` — queue collapse; flush without duplicates; failed
   ops stay queued; flush happens only on reconnect.
+- `__tests__/telemetry.test.ts` — failure classification; payload field
+  exclusions (no drafts / wallet data / raw messages); opt-out; deterministic
+  latency and retry counters; boundary cases (empty queue, clock regression,
+  throwing sink).
+- `__tests__/lifecycle.test.ts` — end-to-end offline browse → wishlist edits →
+  restart → conflict → reconnect flush; corrupted-queue recovery; empty-queue
+  reconnect.
 - `__tests__/offlineFlow.test.ts` — end-to-end offline browse → wishlist edits →
   sync-on-reconnect; empty-cache offline path.
 - `__tests__/encryptedStorage.test.ts` — cipher round-trips; corruption recovery;
@@ -349,6 +356,9 @@ Coverage:
   actions stay queued; in-flight not re-run; attemptCount increments.
 - `__tests__/conflictResolution.test.ts` — campaign server-wins; wishlist merge;
   permission-change classification; partial sync recovery; campaign list reconciliation.
+
+CI runs this suite (plus `typecheck`) via `.github/workflows/mobile-ci.yml` on
+every change touching `apps/mobile/`.
 
 > Note: the pre-existing `src/screens/CampaignDetailScreen.tsx` imports
 > `react-native` / `expo-notifications`, which are not part of this repo's
