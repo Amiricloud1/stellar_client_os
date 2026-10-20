@@ -1,4 +1,5 @@
 import type { AssembledTransaction } from '@stellar/stellar-sdk/contract';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { PAYMENT_STREAM_CONTRACT_ID, DISTRIBUTOR_CONTRACT_ID } from '@/lib/env';
 import { SOROBAN_RPC_URL, NETWORK_PASSPHRASE } from '@/lib/constants';
 import { env } from '@/lib/env';
@@ -10,6 +11,141 @@ import { createBatches } from '../../../../packages/sdk/src/utils/batchDistribut
 import { Stream, StreamStatus } from '../types';
 
 type WalletSigner = (xdr: string) => Promise<string>;
+
+/**
+ * Canonical API error contract.
+ *
+ * Every API response helper returns an {@link ApiEnvelope}. Failures carry a
+ * structured {@link ApiError} with a stable machine-readable `code`, a
+ * human-readable `message`, the `requestId` used to correlate server logs, and
+ * optional per-field validation errors. Stack traces are never serialized.
+ */
+export type ApiErrorCode =
+    | 'VALIDATION_ERROR'
+    | 'NOT_FOUND'
+    | 'UNAUTHORIZED'
+    | 'CONFLICT'
+    | 'INTERNAL_ERROR';
+
+export interface ApiFieldError {
+    field: string;
+    message: string;
+}
+
+export interface ApiError {
+    code: ApiErrorCode;
+    message: string;
+    requestId: string;
+    fieldErrors?: ApiFieldError[];
+}
+
+export interface ApiSuccess<T> {
+    ok: true;
+    data: T;
+    requestId: string;
+}
+
+export interface ApiFailure {
+    ok: false;
+    error: ApiError;
+}
+
+export type ApiEnvelope<T> = ApiSuccess<T> | ApiFailure;
+
+const REQUEST_ID_HEADER = 'x-request-id';
+
+const requestIdStorage = new AsyncLocalStorage<string>();
+
+let requestIdCounter = 0;
+
+function generateRequestId(): string {
+    const cryptoObj = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+    if (cryptoObj?.randomUUID) return cryptoObj.randomUUID();
+    requestIdCounter += 1;
+    return `req_${Date.now().toString(36)}_${requestIdCounter.toString(36)}`;
+}
+
+/**
+ * Returns the request ID for the current async context. When called inside
+ * {@link withRequestId} the propagated ID is returned; otherwise a fresh ID is
+ * generated (and, if a `Request` is supplied, its `x-request-id` header is
+ * honored as a fallback).
+ */
+export function getRequestId(request?: { headers?: { get(name: string): string | null } }): string {
+    const stored = requestIdStorage.getStore();
+    if (stored) return stored;
+    const headerValue = request?.headers?.get(REQUEST_ID_HEADER);
+    if (headerValue) return headerValue;
+    return generateRequestId();
+}
+
+/**
+ * Runs `fn` with a request ID bound to the async context so that logs and
+ * error envelopes emitted during the call share the same identifier.
+ */
+export function withRequestId<T>(requestId: string | undefined, fn: () => T): T {
+    return requestIdStorage.run(requestId ?? generateRequestId(), fn);
+}
+
+export class ApiRequestError extends Error {
+    readonly code: ApiErrorCode;
+    readonly fieldErrors?: ApiFieldError[];
+
+    constructor(code: ApiErrorCode, message: string, fieldErrors?: ApiFieldError[]) {
+        super(message);
+        this.name = 'ApiRequestError';
+        this.code = code;
+        this.fieldErrors = fieldErrors;
+    }
+}
+
+/**
+ * Normalizes any thrown value into a structured {@link ApiError}. Stack traces
+ * and other internal details are intentionally excluded from the output.
+ */
+export function toApiError(error: unknown, requestId: string = getRequestId()): ApiError {
+    if (error instanceof ApiRequestError) {
+        const apiError: ApiError = {
+            code: error.code,
+            message: error.message,
+            requestId,
+        };
+        if (error.fieldErrors && error.fieldErrors.length > 0) {
+            apiError.fieldErrors = error.fieldErrors.map(({ field, message }) => ({ field, message }));
+        }
+        return apiError;
+    }
+
+    return {
+        code: 'INTERNAL_ERROR',
+        message: 'An unexpected error occurred',
+        requestId,
+    };
+}
+
+export function apiSuccess<T>(data: T, requestId: string = getRequestId()): ApiSuccess<T> {
+    return { ok: true, data, requestId };
+}
+
+export function apiFailure(error: unknown, requestId: string = getRequestId()): ApiFailure {
+    return { ok: false, error: toApiError(error, requestId) };
+}
+
+/**
+ * Executes `fn` and wraps the outcome in an {@link ApiEnvelope}. Unexpected
+ * errors are converted to a generic `INTERNAL_ERROR` without leaking stacks.
+ */
+export async function runApi<T>(
+    fn: () => Promise<T> | T,
+    requestId: string = getRequestId()
+): Promise<ApiEnvelope<T>> {
+    try {
+        const data = await fn();
+        return apiSuccess(data, requestId);
+    } catch (error) {
+        return apiFailure(error, requestId);
+    }
+}
 
 function deriveHorizonUrl(): string {
     if (env.NEXT_PUBLIC_STELLAR_HORIZON_URL) return env.NEXT_PUBLIC_STELLAR_HORIZON_URL;

@@ -5,6 +5,29 @@ import { CampaignRecord } from "@/services/campaign.service";
 import { useSyncQueue } from "./use-sync-queue";
 
 // ---------------------------------------------------------------------------
+// E2E fixture injection.
+//
+// When running under Playwright (or any E2E harness) we must not depend on
+// live network data or real funds.  The harness sets a global fixture on
+// `window.__E2E_CAMPAIGNS__` before the app boots; when present we use it
+// verbatim and skip all fetching/caching.  This is a no-op in production
+// because the global is never defined there.
+// ---------------------------------------------------------------------------
+export type CampaignsFixture = {
+  campaigns?: any[];
+  /** Simulate a failed fetch so the error state can be asserted. */
+  error?: boolean;
+  /** Simulate a pending fetch so the loading state can be asserted. */
+  loading?: boolean;
+};
+
+function readFixture(): CampaignsFixture | null {
+  if (typeof window === "undefined") return null;
+  const fixture = (window as any).__E2E_CAMPAIGNS__;
+  return fixture && typeof fixture === "object" ? (fixture as CampaignsFixture) : null;
+}
+
+// ---------------------------------------------------------------------------
 // Page size used when fetching from the API.
 // Virtual scrolling makes it safe to load large pages because only the
 // currently-visible cards are in the DOM.  We fetch up to 500 at a time and
@@ -45,9 +68,30 @@ export function useCampaigns() {
   const [campaigns, setCampaigns] = useState<any[]>(defaultCampaigns);
   const [isLoading, setIsLoading] = useState(true);
   const [hasMore, setHasMore] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
   const { isOnline } = useSyncQueue();
 
   useEffect(() => {
+    // 0. Deterministic E2E fixtures take precedence over cache and network.
+    const fixture = readFixture();
+    if (fixture) {
+      if (fixture.error) {
+        setError(new Error("Failed to fetch campaigns"));
+        setIsLoading(false);
+        setHasMore(false);
+        return;
+      }
+      if (fixture.loading) {
+        setIsLoading(true);
+        return;
+      }
+      setCampaigns(fixture.campaigns ?? []);
+      setHasMore(false);
+      setIsLoading(false);
+      setError(null);
+      return;
+    }
+
     // 1. Load from cache first for fast offline access
     const cached = localStorage.getItem("campaigns_cache");
     if (cached) {
@@ -75,7 +119,10 @@ export function useCampaigns() {
       try {
         while (true) {
           const res = await fetch(`/api/campaigns?limit=${PAGE_SIZE}&offset=${offset}`);
-          if (!res.ok) break;
+          if (!res.ok) {
+            setError(new Error(`Failed to fetch campaigns (${res.status})`));
+            break;
+          }
 
           const { data, pagination } = await res.json();
 
@@ -111,10 +158,12 @@ export function useCampaigns() {
 
         if (accumulated.length > 0) {
           setCampaigns(accumulated);
+          setError(null);
           localStorage.setItem("campaigns_cache", JSON.stringify(accumulated));
         }
       } catch (e) {
         console.error("Failed to fetch campaigns", e);
+        setError(e instanceof Error ? e : new Error("Failed to fetch campaigns"));
       } finally {
         setIsLoading(false);
       }
@@ -123,6 +172,6 @@ export function useCampaigns() {
     fetchCampaigns();
   }, [isOnline]);
 
-  return { campaigns, isLoading, hasMore };
+  return { campaigns, isLoading, hasMore, error };
 }
 

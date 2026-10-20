@@ -39,6 +39,12 @@ import {
   resolveCampaignApiTier,
   type RateLimitOptions,
 } from "@/lib/rate-limit";
+import {
+  REQUEST_ID_HEADER,
+  resolveRequestId,
+  buildErrorResponse,
+  logWithRequestId,
+} from "@/lib/api/errors";
 
 // ── IP extraction ─────────────────────────────────────────────────────────────
 
@@ -92,17 +98,19 @@ export async function checkRateLimit(
   const headers = buildRateLimitHeaders(result);
 
   if (!result.allowed) {
-    return NextResponse.json(
-      {
-        error: "Too many requests",
-        code: "RATE_LIMIT_EXCEEDED",
-        retryAfter: headers["Retry-After"],
-      },
-      {
-        status: 429,
-        headers,
-      }
-    );
+    const requestId = resolveRequestId(req);
+    logWithRequestId(requestId, "warn", "rate_limit_exceeded", {
+      ip,
+      retryAfter: headers["Retry-After"],
+    });
+    return buildErrorResponse({
+      code: "RATE_LIMIT_EXCEEDED",
+      message: "Too many requests",
+      status: 429,
+      requestId,
+      headers,
+      details: { retryAfter: headers["Retry-After"] },
+    });
   }
 
   return null;
@@ -128,7 +136,11 @@ export function withRateLimit(
   return async (req: NextRequest): Promise<NextResponse> => {
     const limited = await checkRateLimit(req, limiter);
     if (limited) return limited;
-    return handler(req);
+    const response = await handler(req);
+    // Propagate the correlation ID on successful responses as well.
+    const requestId = resolveRequestId(req);
+    response.headers.set(REQUEST_ID_HEADER, requestId);
+    return response;
   };
 }
 
@@ -141,8 +153,25 @@ export function withCampaignApiRateLimit(handler: CampaignRouteHandler): Campaig
     if (getSkipIps().has(extractIp(nextReq))) return handler(req, ...args);
     const result = await new RateLimiter(redis, { limit: tier.hourlyLimit, windowMs: tier.windowMs, keyPrefix: "rl:campaign-api" }).check(identity);
     const headers = buildRateLimitHeaders(result);
-    if (!result.allowed) return NextResponse.json({ error: "Too many requests", code: "RATE_LIMIT_EXCEEDED", tier: tier.id, retryAfter: headers["Retry-After"] }, { status: 429, headers });
-    return handler(req, ...args);
+    if (!result.allowed) {
+      const requestId = resolveRequestId(req);
+      logWithRequestId(requestId, "warn", "rate_limit_exceeded", {
+        identity,
+        tier: tier.id,
+        retryAfter: headers["Retry-After"],
+      });
+      return buildErrorResponse({
+        code: "RATE_LIMIT_EXCEEDED",
+        message: "Too many requests",
+        status: 429,
+        requestId,
+        headers,
+        details: { tier: tier.id, retryAfter: headers["Retry-After"] },
+      });
+    }
+    const response = await handler(req, ...args);
+    response.headers.set(REQUEST_ID_HEADER, resolveRequestId(req));
+    return response;
   };
 }
 
