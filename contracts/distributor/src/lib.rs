@@ -50,6 +50,8 @@ impl DistributorContract {
     }
 
     
+    pub const MAX_RECIPIENTS: u32 = 1000;
+
     pub fn distribute_equal(
         env: Env,
         sender: Address,
@@ -59,16 +61,30 @@ impl DistributorContract {
     ) {
         sender.require_auth();
         
-        let recipient_count = recipients.len() as i128;
-        assert!(recipient_count > 0, "No recipients provided");
+        let recipient_len = recipients.len();
+        assert!(recipient_len > 0, "No recipients provided");
+        assert!(recipient_len <= Self::MAX_RECIPIENTS, "Too many recipients");
         assert!(total_amount > 0, "Amount must be positive");
+
+        // Reject duplicate recipients to guarantee token conservation
+        for i in 0..recipient_len {
+            let r_i = recipients.get(i).unwrap();
+            for j in (i + 1)..recipient_len {
+                let r_j = recipients.get(j).unwrap();
+                assert!(r_i != r_j, "Duplicate recipient address");
+            }
+        }
         
+        let recipient_count = recipient_len as i128;
         let amount_per_recipient = total_amount / recipient_count;
         assert!(amount_per_recipient > 0, "Amount too small to distribute");
+
+        // Debits equal credits: actual distributed amount equals amount_per_recipient * recipient_count.
+        // Any remainder (total_amount % recipient_count) is retained by the sender and documented.
+        let distributed_amount = amount_per_recipient * recipient_count;
         
         let token_client = token::Client::new(&env, &token);
         
-       
         let protocol_fee = Self::calculate_fee(&env, total_amount);
         
         if protocol_fee > 0 {
@@ -78,16 +94,14 @@ impl DistributorContract {
             token_client.transfer(&sender, &fee_address, &protocol_fee);
         }
         
-        
         for recipient in recipients.iter() {
             token_client.transfer(&sender, &recipient, &amount_per_recipient);
         }
         
-        
-        Self::update_global_stats(&env, total_amount);
-        Self::update_token_stats(&env, &token, total_amount, recipients.len());
-        Self::update_user_stats(&env, &sender, total_amount);
-        Self::record_history(&env, sender, token, total_amount, recipients.len());
+        Self::update_global_stats(&env, distributed_amount);
+        Self::update_token_stats(&env, &token, distributed_amount, recipients.len());
+        Self::update_user_stats(&env, &sender, distributed_amount);
+        Self::record_history(&env, sender, token, distributed_amount, recipients.len());
     }
 
   
@@ -102,6 +116,16 @@ impl DistributorContract {
         
         assert!(recipients.len() == amounts.len(), "Recipients and amounts must match");
         assert!(recipients.len() > 0, "No recipients provided");
+        assert!(recipients.len() <= Self::MAX_RECIPIENTS, "Too many recipients");
+
+        // Reject duplicate recipients
+        for i in 0..recipients.len() {
+            let r_i = recipients.get(i).unwrap();
+            for j in (i + 1)..recipients.len() {
+                let r_j = recipients.get(j).unwrap();
+                assert!(r_i != r_j, "Duplicate recipient address");
+            }
+        }
         
         let token_client = token::Client::new(&env, &token);
         
