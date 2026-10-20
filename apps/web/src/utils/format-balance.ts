@@ -103,3 +103,117 @@ export function formatBalance(amount: string): string {
 
   return finalInteger;
 }
+
+// ---------------------------------------------------------------------------
+// Exact amount formatting (no floating-point rounding errors)
+// ---------------------------------------------------------------------------
+
+/**
+ * Exact amount formatter for financial UI.
+ *
+ * Unlike {@link formatBalance} (which uses `parseFloat` and is susceptible to
+ * IEEE-754 rounding), this function parses the decimal string using integer
+ * arithmetic (matching Stellar's 7-decimal-place fixed-point representation)
+ * so that values like "100.0000001" and "9999999.9999999" round-trip without
+ * loss.
+ *
+ * The output is locale-formatted with thousands separators and up to
+ * `maxDecimals` significant decimal digits (trailing zeros stripped beyond
+ * 2 places).
+ *
+ * @param amount    - Stellar decimal string, e.g. "1234567.8900000"
+ * @param maxDecimals - Maximum fraction digits to display (default 7)
+ * @returns Human-readable string, e.g. "1,234,567.89"
+ *
+ * @example
+ * formatAmountExact("1234567.8900000") // "1,234,567.89"
+ * formatAmountExact("0.0000001")       // "0.0000001"
+ * formatAmountExact("0")               // "0"
+ * formatAmountExact("100.5000000")     // "100.50"
+ */
+export function formatAmountExact(
+  amount: string,
+  maxDecimals = 7,
+): string {
+  if (!amount || amount.trim() === "") return "0";
+
+  const trimmed = amount.trim();
+
+  // Handle edge-case: negative sign
+  const negative = trimmed.startsWith("-");
+  const abs = negative ? trimmed.slice(1) : trimmed;
+
+  // Split on the decimal point
+  const dotIdx = abs.indexOf(".");
+  const wholePart = dotIdx === -1 ? abs : abs.slice(0, dotIdx);
+  const rawFraction = dotIdx === -1 ? "" : abs.slice(dotIdx + 1);
+
+  // Validate: must be digits only after stripping sign/dot
+  if (!/^\d+$/.test(wholePart) || (rawFraction && !/^\d+$/.test(rawFraction))) {
+    return "0";
+  }
+
+  // Truncate fraction to maxDecimals (Stellar uses 7; we never need more)
+  const fraction = rawFraction.slice(0, maxDecimals).padEnd(maxDecimals, "0");
+
+  // Strip trailing zeros, keeping at least 2 decimal digits (Req 6.4)
+  let displayFraction = fraction.replace(/0+$/, "");
+  if (displayFraction.length > 0 && displayFraction.length < 2) {
+    displayFraction = displayFraction.padEnd(2, "0");
+  }
+
+  // Handle zero value
+  if (wholePart === "0" && displayFraction.replace(/0/g, "") === "") {
+    return "0";
+  }
+
+  // Add thousands separators to the whole part
+  const formattedWhole = wholePart.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+
+  const result =
+    displayFraction.length > 0
+      ? `${formattedWhole}.${displayFraction}`
+      : formattedWhole;
+
+  return negative ? `-${result}` : result;
+}
+
+/**
+ * Formats a Stellar amount expressed as bigint minor units (7 decimal places)
+ * into a human-readable display string with thousands separators.
+ *
+ * This is the display counterpart of `formatAmount` from `lib/decimal-amount`.
+ * The difference is that this function also adds commas to the whole part.
+ *
+ * @param units - BigInt minor units (1 XLM = 10_000_000n)
+ * @returns Formatted string, e.g. "1,234,567.89"
+ *
+ * @example
+ * formatUnitsExact(12345678900000n) // "1,234,567.89"
+ * formatUnitsExact(0n)              // "0"
+ */
+export function formatUnitsExact(units: bigint): string {
+  const SCALE = 10_000_000n; // 7 decimal places
+  const negative = units < 0n;
+  const abs = negative ? -units : units;
+  const whole = abs / SCALE;
+  const frac = (abs % SCALE).toString().padStart(7, "0");
+
+  // Strip trailing zeros; keep ≥ 2 decimal places only when there is a
+  // non-zero fractional part (mirrors formatAmountExact behaviour).
+  let displayFrac = frac.replace(/0+$/, "");
+  if (displayFrac.length > 0 && displayFrac.length < 2) {
+    displayFrac = displayFrac.padEnd(2, "0");
+  }
+
+  const formattedWhole = whole.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+
+  if (whole === 0n && displayFrac.replace(/0/g, "") === "") return "0";
+
+  const result =
+    displayFrac.length > 0
+      ? `${formattedWhole}.${displayFrac}`
+      : formattedWhole;
+
+  return negative ? `-${result}` : result;
+}
