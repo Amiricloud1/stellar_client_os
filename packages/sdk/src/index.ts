@@ -101,10 +101,5 @@ export {
   CONTRACT_ERRORS,
   type ParsedContractError,
 } from "./utils/errors.js";
-
-// Export network & contract configuration validator (Issue #47)
-export * from "./utils/config-validator.js";
-
-// Export multi-contract family event decoders (Issue #44)
-export * from "./utils/event-decoders.js";
+export * from "./utils/error-catalog.js";
 
