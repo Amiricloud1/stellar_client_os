@@ -6,6 +6,7 @@
  */
 
 import { DefaultStreamDataSource, getAnalyticsService } from "./analytics.service";
+import { withExecutionTimeout } from "./query-guard";
 import { getCampaignHealthAssessment, getCampaignRiskAssessment, getCampaignVerificationSummary, queryCampaigns } from "@/services/campaign.service";
 import type { CampaignDataSource, CampaignQueryInput } from "@/services/campaign.service";
 import { getCampaignSequelService } from "@/services/campaign-sequel.service";
@@ -30,6 +31,18 @@ interface ResolverContext {
 
 function resolveDataSource(ctx: ResolverContext, fallback?: StreamDataSource): StreamDataSource {
   return ctx.dataSource ?? fallback ?? new DefaultStreamDataSource();
+}
+
+/**
+ * Run an analytics resolver under the configured execution-time budget.
+ *
+ * Expensive aggregate queries (global/region/category/asset metrics and
+ * sponsor impact) are wrapped so that a slow data source cannot hold a
+ * request open indefinitely. The timeout is configurable via
+ * `GRAPHQL_EXECUTION_TIMEOUT_MS` (see `query-guard.ts`).
+ */
+function runAnalytics<T>(operation: () => Promise<T> | T): Promise<T> {
+  return withExecutionTimeout(operation);
 }
 
 function toBigInt(value: string): bigint {
@@ -191,7 +204,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext
       ) => {
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return service.getGlobalMetrics(args.network ?? "testnet");
+        return runAnalytics(() => service.getGlobalMetrics(args.network ?? "testnet"));
       },
 
       /**
@@ -215,10 +228,12 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext
       ) => {
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return service.getRegionMetrics(
-          args.filter,
-          args.pagination,
-          args.network ?? "testnet"
+        return runAnalytics(() =>
+          service.getRegionMetrics(
+            args.filter,
+            args.pagination,
+            args.network ?? "testnet"
+          )
         );
       },
 
@@ -242,10 +257,12 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext
       ) => {
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return service.getCategoryMetrics(
-          args.filter,
-          args.pagination,
-          args.network ?? "testnet"
+        return runAnalytics(() =>
+          service.getCategoryMetrics(
+            args.filter,
+            args.pagination,
+            args.network ?? "testnet"
+          )
         );
       },
 
@@ -269,10 +286,12 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext
       ) => {
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return service.getAssetMetrics(
-          args.filter,
-          args.pagination,
-          args.network ?? "testnet"
+        return runAnalytics(() =>
+          service.getAssetMetrics(
+            args.filter,
+            args.pagination,
+            args.network ?? "testnet"
+          )
         );
       },
 
@@ -294,7 +313,9 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext
       ) => {
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return service.getSponsorImpact(args.address, args.network ?? "testnet");
+        return runAnalytics(() =>
+          service.getSponsorImpact(args.address, args.network ?? "testnet")
+        );
       },
 
       campaignSequels: async (
@@ -334,7 +355,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         _: unknown,
         args: { campaignId: string; network?: Network },
       ) => {
-        return getCampaignAnalyticsDashboard(args.campaignId);
+        return runAnalytics(() => getCampaignAnalyticsDashboard(args.campaignId));
       },
 
       grantPrograms: async () => {

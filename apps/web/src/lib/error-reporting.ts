@@ -1,39 +1,69 @@
-import * as Sentry from '@sentry/nextjs';
-import { sanitizeError, sanitizeObject, sanitizeErrorString } from './sanitize-error';
+import * as Sentry from "@sentry/nextjs";
+import {
+  sanitizeError,
+  sanitizeObject,
+  sanitizeErrorString,
+  sanitizeUrl,
+  scrubSentryEvent,
+  scrubSentryBreadcrumb,
+} from "./sanitize-error";
 
-type ErrorContext = {
+export { scrubSentryEvent, scrubSentryBreadcrumb };
+
+export type ErrorContext = {
   boundaryName?: string;
   componentStack?: string;
   digest?: string;
+  requestId?: string;
 };
 
 function captureSentryError(error: Error, context: Record<string, unknown>): void {
   if (!process.env.NEXT_PUBLIC_SENTRY_DSN) return;
 
   Sentry.withScope((scope) => {
+    const requestId = context.requestId;
+    if (typeof requestId === 'string' && requestId.length > 0) {
+      // Tag the event so it can be correlated with the API response envelope
+      // and server logs that share the same request ID.
+      scope.setTag('request_id', requestId);
+      scope.setContext('request', { requestId });
+    }
     scope.setContext('fundable', context);
     Sentry.captureException(error);
   });
 }
 
 /**
- * Report a runtime error to the configured error reporting endpoint
- * All sensitive data (Stellar public keys, secret keys) are automatically sanitized
- * before being sent to prevent data exposure in telemetry logs
+ * Report a runtime error to the configured error reporting endpoint.
+ * All sensitive data (Stellar secret keys, tax IDs, signed transactions,
+ * evidence, and sensitive URL/body fields) are automatically sanitized
+ * before being sent to prevent data exposure in telemetry logs.
  */
 export function reportRuntimeError(error: Error, context: ErrorContext = {}): void {
-  if (process.env.NODE_ENV !== 'production' || typeof window === 'undefined') {
+  if (process.env.NODE_ENV !== "production" || typeof window === "undefined") {
     return;
   }
 
-  // Sanitize the error to mask Stellar public keys and secret keys
-  const sanitizedError = sanitizeError(error);
+  const sanitizeOpts = { maskFullKey: false };
+  const sanitizedError = sanitizeError(error, sanitizeOpts);
+  const sanitizedContext = sanitizeObject(context, sanitizeOpts);
 
-  // Sanitize context values to ensure no keys leak through
-  const sanitizedContext = sanitizeObject(context);
-  captureSentryError(sanitizedError, sanitizedContext as Record<string, unknown>);
+  const sentryContext: Record<string, unknown> = {
+    ...sanitizedContext,
+    boundaryName: sanitizedContext.boundaryName,
+    componentStack: sanitizedContext.componentStack,
+  };
+  if (sanitizedContext.digest !== undefined) {
+    sentryContext.digest = sanitizedContext.digest;
+  }
 
-  // Build payload with sanitized values
+  captureSentryError(sanitizedError, sentryContext);
+
+  const rawPath =
+    typeof window !== "undefined"
+      ? `${window.location.pathname}${window.location.search || ""}`
+      : undefined;
+
   const payload = {
     name: sanitizedError.name,
     message: sanitizedError.message,
@@ -41,6 +71,7 @@ export function reportRuntimeError(error: Error, context: ErrorContext = {}): vo
     boundaryName: sanitizedContext.boundaryName,
     componentStack: sanitizedContext.componentStack,
     digest: sanitizedContext.digest,
+    requestId: sanitizedContext.requestId,
     path: typeof window !== 'undefined' ? sanitizeErrorString(window.location.pathname) : undefined,
     timestamp: new Date().toISOString(),
   };
@@ -49,43 +80,47 @@ export function reportRuntimeError(error: Error, context: ErrorContext = {}): vo
 
   if (endpoint) {
     void fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       keepalive: true,
     }).catch(() => undefined);
     return;
   }
 
-  // Dispatch sanitized payload to prevent sensitive data exposure in custom events
-  window.dispatchEvent(new CustomEvent('fundable:runtime-error', { detail: payload }));
+  window.dispatchEvent(new CustomEvent("fundable:runtime-error", { detail: payload }));
 }
 
 /**
- * Report a caught error with additional context
- * Automatically sanitizes all data before reporting
+ * Report a caught error with additional context.
+ * Automatically sanitizes all sensitive data before reporting.
  */
 export function reportCaughtError(
   error: unknown,
   context: Record<string, unknown> = {}
 ): void {
-  if (process.env.NODE_ENV !== 'production' || typeof window === 'undefined') {
+  if (process.env.NODE_ENV !== "production" || typeof window === "undefined") {
     return;
   }
 
-  // Convert unknown error to Error object
+  const sanitizeOpts = { maskFullKey: false };
   const errorObj = error instanceof Error ? error : new Error(String(error));
 
-  // Sanitize the error and context
-  const sanitizedError = sanitizeError(errorObj);
-  const sanitizedContext = sanitizeObject(context);
+  const sanitizedError = sanitizeError(errorObj, sanitizeOpts);
+  const sanitizedContext = sanitizeObject(context, sanitizeOpts);
   captureSentryError(sanitizedError, sanitizedContext as Record<string, unknown>);
+
+  const rawPath =
+    typeof window !== "undefined"
+      ? `${window.location.pathname}${window.location.search || ""}`
+      : undefined;
 
   const payload = {
     name: sanitizedError.name,
     message: sanitizedError.message,
     stack: sanitizedError.stack,
     context: sanitizedContext,
+    requestId: sanitizedContext.requestId,
     path: typeof window !== 'undefined' ? sanitizeErrorString(window.location.pathname) : undefined,
     timestamp: new Date().toISOString(),
   };
@@ -94,13 +129,13 @@ export function reportCaughtError(
 
   if (endpoint) {
     void fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       keepalive: true,
     }).catch(() => undefined);
     return;
   }
 
-  window.dispatchEvent(new CustomEvent('fundable:runtime-error', { detail: payload }));
+  window.dispatchEvent(new CustomEvent("fundable:runtime-error", { detail: payload }));
 }

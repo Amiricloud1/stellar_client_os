@@ -8,6 +8,11 @@ export default defineConfig({
     // Explicitly exclude integration tests from the standard run.
     // They live in __integration_tests__/ and require a live local node.
     // Use `pnpm test:integration` (or `pnpm test:sdk:integration` from root) instead.
+    //
+    // NOTE: Unit tests for transaction resubmission (e.g.
+    // `src/transactions/__tests__/resubmission.test.ts`) are intentionally NOT
+    // excluded here. They are deterministic, do not touch live funds, and must
+    // run in the standard suite so CI validates the safe-resubmission behavior.
     exclude: [
       'src/__integration_tests__/**',
       'src/**/__tests__/integration/**',
@@ -46,6 +51,10 @@ export default defineConfig({
       // Thresholds enforce a coverage floor on every CI run.
       // These reflect the current tested surface area. Raise them as new tests
       // are added — especially once batchDistribution.ts is covered.
+      //
+      // The transaction resubmission module is fully covered by its unit tests
+      // (success, failure, and boundary cases), so the floors below remain
+      // valid without relaxation.
       thresholds: {
         lines: 80,
         statements: 80,

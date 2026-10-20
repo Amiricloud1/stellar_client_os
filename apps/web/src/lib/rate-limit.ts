@@ -623,6 +623,221 @@ export function createRateLimiter(
   });
 }
 
+// ── Concurrency limiter (semaphore) ───────────────────────────────────────────
+
+/**
+ * Stable error codes emitted when a bounded resource is exhausted. These are
+ * part of the public API contract — callers and clients may branch on them, so
+ * they must not change without a migration note.
+ */
+export const RESOURCE_LIMIT_ERROR_CODES = {
+  /** Too many concurrent compilations in flight. */
+  CONCURRENCY_EXCEEDED: "RESOURCE_CONCURRENCY_EXCEEDED",
+  /** The request did not complete within the configured deadline. */
+  TIMEOUT: "RESOURCE_TIMEOUT",
+  /** The request payload exceeded the configured byte budget. */
+  PAYLOAD_TOO_LARGE: "RESOURCE_PAYLOAD_TOO_LARGE",
+} as const;
+
+export type ResourceLimitErrorCode =
+  (typeof RESOURCE_LIMIT_ERROR_CODES)[keyof typeof RESOURCE_LIMIT_ERROR_CODES];
+
+/** Error thrown when a bounded resource (concurrency, timeout, size) is exceeded. */
+export class ResourceLimitError extends Error {
+  readonly code: ResourceLimitErrorCode;
+  /** Suggested HTTP status for API surfaces. */
+  readonly status: number;
+
+  constructor(code: ResourceLimitErrorCode, message?: string, status?: number) {
+    super(message ?? code);
+    this.name = "ResourceLimitError";
+    this.code = code;
+    this.status =
+      status ??
+      (code === RESOURCE_LIMIT_ERROR_CODES.TIMEOUT
+        ? 504
+        : code === RESOURCE_LIMIT_ERROR_CODES.PAYLOAD_TOO_LARGE
+          ? 413
+          : 429);
+  }
+}
+
+export interface ConcurrencyLimiterOptions {
+  /** Maximum number of in-flight operations. Must be >= 1. */
+  maxConcurrent: number;
+  /**
+   * How long a caller may wait for a slot before failing with
+   * `RESOURCE_CONCURRENCY_EXCEEDED`. Default: 0 (fail fast, no queueing).
+   */
+  acquireTimeoutMs?: number;
+  /** Injectable clock (ms). Defaults to `Date.now`. */
+  now?: () => number;
+}
+
+interface Waiter {
+  resolve: (release: () => void) => void;
+  reject: (err: ResourceLimitError) => void;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+/**
+ * Counting semaphore bounding concurrent work (e.g. contract compilation).
+ *
+ * - `acquire()` resolves with an idempotent `release()` function.
+ * - When all slots are busy and `acquireTimeoutMs` is 0, `acquire()` rejects
+ *   immediately with `RESOURCE_CONCURRENCY_EXCEEDED` (fail fast).
+ * - When `acquireTimeoutMs > 0`, callers queue FIFO up to that deadline.
+ * - `run(fn)` acquires, runs, and always releases — even on throw.
+ *
+ * Deterministic and testable: pass an injectable `now` clock; queueing
+ * deadlines are evaluated against it.
+ */
+export class ConcurrencyLimiter {
+  private readonly maxConcurrent: number;
+  private readonly acquireTimeoutMs: number;
+  private readonly now: () => number;
+  private active = 0;
+  private readonly waiters: Waiter[] = [];
+
+  constructor(options: ConcurrencyLimiterOptions) {
+    if (!Number.isFinite(options.maxConcurrent) || options.maxConcurrent < 1) {
+      throw new RangeError("maxConcurrent must be a finite number >= 1");
+    }
+    this.maxConcurrent = Math.floor(options.maxConcurrent);
+    this.acquireTimeoutMs = Math.max(0, options.acquireTimeoutMs ?? 0);
+    this.now = options.now ?? Date.now;
+  }
+
+  /** Number of slots currently held. */
+  get inFlight(): number {
+    return this.active;
+  }
+
+  /** Number of callers waiting for a slot. */
+  get queued(): number {
+    return this.waiters.length;
+  }
+
+  /** Acquire a slot. Resolves with an idempotent release function. */
+  acquire(): Promise<() => void> {
+    if (this.active < this.maxConcurrent) {
+      this.active += 1;
+      return Promise.resolve(this.makeRelease());
+    }
+
+    if (this.acquireTimeoutMs <= 0) {
+      return Promise.reject(
+        new ResourceLimitError(
+          RESOURCE_LIMIT_ERROR_CODES.CONCURRENCY_EXCEEDED,
+          `Concurrency limit of ${this.maxConcurrent} reached`
+        )
+      );
+    }
+
+    return new Promise<() => void>((resolve, reject) => {
+      const waiter: Waiter = { resolve, reject, timer: null };
+      waiter.timer = setTimeout(() => {
+        const idx = this.waiters.indexOf(waiter);
+        if (idx !== -1) this.waiters.splice(idx, 1);
+        reject(
+          new ResourceLimitError(
+            RESOURCE_LIMIT_ERROR_CODES.CONCURRENCY_EXCEEDED,
+            `Timed out after ${this.acquireTimeoutMs}ms waiting for a slot`
+          )
+        );
+      }, this.acquireTimeoutMs);
+      // Do not keep the event loop alive purely for a queue timer.
+      if (typeof waiter.timer === "object" && waiter.timer && "unref" in waiter.timer) {
+        (waiter.timer as { unref?: () => void }).unref?.();
+      }
+      this.waiters.push(waiter);
+    });
+  }
+
+  /** Run `fn` under a slot, releasing it regardless of outcome. */
+  async run<T>(fn: () => Promise<T> | T): Promise<T> {
+    const release = await this.acquire();
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  private makeRelease(): () => void {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.active -= 1;
+      this.drain();
+    };
+  }
+
+  private drain(): void {
+    while (this.active < this.maxConcurrent && this.waiters.length > 0) {
+      const waiter = this.waiters.shift()!;
+      if (waiter.timer) clearTimeout(waiter.timer);
+      this.active += 1;
+      waiter.resolve(this.makeRelease());
+    }
+  }
+}
+
+// ── Per-request timeout helper ────────────────────────────────────────────────
+
+export interface TimeoutOptions {
+  /** Deadline in milliseconds. Must be > 0. */
+  timeoutMs: number;
+  /** Injectable clock (ms). Defaults to `Date.now`. */
+  now?: () => number;
+  /** Optional message override for the thrown error. */
+  message?: string;
+}
+
+/**
+ * Race `fn` against a deadline. On expiry, rejects with a
+ * `ResourceLimitError` carrying `RESOURCE_TIMEOUT` (HTTP 504).
+ *
+ * The timer is always cleared so no stray handles leak. The injected clock is
+ * used only for the error's reported elapsed time, keeping tests deterministic.
+ */
+export async function withTimeout<T>(
+  fn: (signal: AbortSignal) => Promise<T> | T,
+  options: TimeoutOptions
+): Promise<T> {
+  if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
+    throw new RangeError("timeoutMs must be a finite number > 0");
+  }
+  const now = options.now ?? Date.now;
+  const startedAt = now();
+  const controller = new AbortController();
+
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      const elapsed = now() - startedAt;
+      reject(
+        new ResourceLimitError(
+          RESOURCE_LIMIT_ERROR_CODES.TIMEOUT,
+          options.message ??
+            `Request exceeded ${options.timeoutMs}ms deadline (elapsed ${elapsed}ms)`
+        )
+      );
+    }, options.timeoutMs);
+    if (typeof timer === "object" && timer && "unref" in timer) {
+      (timer as { unref?: () => void }).unref?.();
+    }
+  });
+
+  try {
+    return await Promise.race([Promise.resolve(fn(controller.signal)), timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 // ── Response header helpers ───────────────────────────────────────────────────
 
 /**
