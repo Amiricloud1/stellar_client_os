@@ -75,16 +75,25 @@ export function WalletModal() {
   } = useWallet();
 
   const [activeSelection, setActiveSelection] = React.useState<WalletId | null>(null);
+  const [connectError, setConnectError] = React.useState<string | null>(null);
 
   // Auto-close when connected
   React.useEffect(() => {
     if (isConnected && isModalOpen) closeModal();
   }, [isConnected, isModalOpen, closeModal]);
 
-  // Reset selection when modal opens
+  // Reset selection and error state when modal opens
   React.useEffect(() => {
-    if (isModalOpen) setActiveSelection(null);
+    if (isModalOpen) {
+      setActiveSelection(null);
+      setConnectError(null);
+    }
   }, [isModalOpen]);
+
+  // Clear any stale error once a new wallet is selected
+  React.useEffect(() => {
+    setConnectError(null);
+  }, [activeSelection]);
 
   const handleConnectClick = async () => {
     if (activeSelection) {
@@ -95,7 +104,17 @@ export function WalletModal() {
       }
 
       if (activeSelection && !isConnecting) {
-        await connect(activeSelection);
+        try {
+          await connect(activeSelection);
+        } catch (error) {
+          // Rejected / failed connects must keep the modal open and surface a
+          // deterministic, testable error state instead of failing silently.
+          setConnectError(
+            error instanceof Error && error.message
+              ? error.message
+              : "Wallet connection was rejected. Please try again.",
+          );
+        }
       }
     }
   };
@@ -125,8 +144,11 @@ export function WalletModal() {
     <Dialog open={isModalOpen} onOpenChange={(open) => !open && closeModal()}>
       <DialogContent
         onCloseAutoFocus={handleCloseAutoFocus}
-        className="w-full max-w-sm sm:max-w-md p-1 overflow-hidden border-white/10 bg-[#0F1621] rounded-3xl shadow-2xl mx-4 sm:mx-auto"
+        data-testid="wallet-modal-dialog"
+        className="w-[calc(100vw-2rem)] max-w-sm sm:max-w-md max-h-[90dvh] overflow-y-auto p-1 overflow-x-hidden border-white/10 bg-[#0F1621] rounded-3xl shadow-2xl mx-auto"
         aria-modal="true"
+        data-testid="wallet-modal"
+        data-state={isConnecting ? "connecting" : connectError ? "error" : "idle"}
       >
         {/* Glossy overlay */}
         <div className="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent pointer-events-none rounded-3xl" />
@@ -207,6 +229,17 @@ export function WalletModal() {
             })}
           </div>
 
+          {/* Connect error (rejected connect boundary case) */}
+          {connectError && (
+            <p
+              role="alert"
+              data-testid="wallet-connect-error"
+              className="mb-4 text-sm text-red-400"
+            >
+              {connectError}
+            </p>
+          )}
+
           {/* Connect button */}
           <button
             type="button"
@@ -214,6 +247,7 @@ export function WalletModal() {
             disabled={!activeSelection || isConnecting}
             aria-disabled={!activeSelection || isConnecting}
             data-testid="connect-now-button"
+            data-state={isConnecting ? "connecting" : "idle"}
             className={`relative w-full py-3.5 sm:py-4 rounded-2xl font-bold text-sm tracking-widest uppercase transition-all duration-200 flex items-center justify-center gap-3 overflow-hidden
               focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F1621]
               ${activeSelection && !isConnecting

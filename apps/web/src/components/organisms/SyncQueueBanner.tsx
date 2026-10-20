@@ -177,14 +177,14 @@ export function SyncQueueBanner({
       data-testid="sync-queue-banner"
       data-variant={variant}
       className={cn(
-        "sticky top-0 z-50 flex min-h-11 items-center justify-between gap-2 border-b px-4 py-2 text-sm",
+        "sticky top-0 z-50 flex w-full max-w-full flex-wrap sm:flex-nowrap min-h-11 items-center justify-between gap-2 overflow-x-hidden border-b px-3 sm:px-4 py-2 text-sm",
         "transition-colors duration-300",
         config.banner,
         className
       )}
     >
       {/* Left: icon + message */}
-      <div className="flex min-w-0 items-center gap-2">
+      <div className="flex min-w-0 flex-1 items-center gap-2">
         <Icon
           aria-hidden="true"
           className={cn(
@@ -206,7 +206,7 @@ export function SyncQueueBanner({
               disabled={isRetrying || isSyncing}
               aria-label="Retry syncing pending uploads"
               className={cn(
-                "flex items-center gap-1 rounded-sm px-2 py-0.5 text-xs font-medium",
+                "flex min-h-8 items-center gap-1 rounded-sm px-2.5 py-1 text-xs font-medium",
                 "transition-all duration-150",
                 "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50",
                 "disabled:cursor-not-allowed disabled:opacity-50",
@@ -230,7 +230,7 @@ export function SyncQueueBanner({
             onClick={onOpenDrawer}
             aria-label="View pending sync items"
             className={cn(
-              "rounded-sm px-2 py-0.5 text-xs font-medium underline-offset-2",
+              "min-h-8 rounded-sm px-2.5 py-1 text-xs font-medium underline-offset-2",
               "hover:underline focus-visible:outline-none focus-visible:ring-2",
               "focus-visible:ring-white/50 transition-all duration-150"
             )}
@@ -246,7 +246,7 @@ export function SyncQueueBanner({
             onClick={() => setShowSuccess(false)}
             aria-label="Dismiss sync success notification"
             className={cn(
-              "rounded-sm p-0.5 opacity-70 hover:opacity-100",
+              "min-h-8 min-w-8 inline-flex items-center justify-center rounded-sm p-1 opacity-70 hover:opacity-100",
               "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50",
               "transition-all duration-150"
             )}

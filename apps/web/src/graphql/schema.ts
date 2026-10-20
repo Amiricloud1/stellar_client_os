@@ -4,7 +4,20 @@
  * Exposes aggregate payment stream metrics queryable by region, category,
  * and asset (token). All monetary amounts are returned as strings to avoid
  * JavaScript BigInt serialisation issues.
+ *
+ * Query safety (issue #60): the schema is served with depth-limit and
+ * complexity-limit validation rules plus a per-request execution timeout.
+ * See `./limits` for the exported rules, budgets, and timeout helper.
  */
+
+import type { GraphQLSchema } from 'graphql';
+import {
+  DEFAULT_QUERY_LIMITS,
+  createDepthLimitRule,
+  createComplexityLimitRule,
+  withExecutionTimeout,
+  type QueryLimits,
+} from './limits';
 
 export const typeDefs = /* GraphQL */`
   """Supported Stellar network."""
@@ -610,3 +623,39 @@ export const typeDefs = /* GraphQL */`
     cloneCampaign(id: ID!, network: Network): CloneResult
   }
 `;
+
+/**
+ * Build the validation rule set that enforces the depth and complexity
+ * budgets for a request. Exported so the GraphQL server setup can pass the
+ * result as `validationRules` to the execution engine.
+ *
+ * @param limits Optional budget overrides (defaults to DEFAULT_QUERY_LIMITS).
+ */
+export function createQueryValidationRules(limits: Partial<QueryLimits> = {}) {
+  const resolved: QueryLimits = { ...DEFAULT_QUERY_LIMITS, ...limits };
+  return [createDepthLimitRule(resolved), createComplexityLimitRule(resolved)];
+}
+
+/**
+ * Wrap a GraphQL schema so every resolver execution is bounded by the
+ * configured timeout. Abusive or runaway queries are rejected with a clear
+ * error instead of holding server resources indefinitely.
+ *
+ * @param schema The schema to guard.
+ * @param limits Optional budget overrides (defaults to DEFAULT_QUERY_LIMITS).
+ */
+export function applyQueryLimits(
+  schema: GraphQLSchema,
+  limits: Partial<QueryLimits> = {},
+): GraphQLSchema {
+  const resolved: QueryLimits = { ...DEFAULT_QUERY_LIMITS, ...limits };
+  return withExecutionTimeout(schema, resolved);
+}
+
+export {
+  DEFAULT_QUERY_LIMITS,
+  createDepthLimitRule,
+  createComplexityLimitRule,
+  withExecutionTimeout,
+};
+export type { QueryLimits };

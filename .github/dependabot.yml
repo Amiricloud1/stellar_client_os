@@ -1,0 +1,45 @@
+version: 2
+updates:
+  # Automated pnpm dependency updates for workspace (root, apps, packages)
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      stellar-sdk:
+        patterns:
+          - "@stellar/*"
+      dev-dependencies:
+        dependency-type: "development"
+        patterns:
+          - "*"
+      prod-dependencies:
+        dependency-type: "production"
+        patterns:
+          - "*"
+
+  # Automated Cargo dependency updates for Soroban smart contracts
+  - package-ecosystem: "cargo"
+    directory: "/contracts"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps-cargo)"
+    groups:
+      soroban:
+        patterns:
+          - "soroban-sdk*"
+          - "soroban-spec*"
+      cargo-dependencies:
+        patterns:
+          - "*"
