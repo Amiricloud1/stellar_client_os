@@ -35,13 +35,15 @@
     "lint": "eslint src --ext .ts,.tsx",
     "format": "prettier --write \"src/**/*.{ts,tsx,json}\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,json}\"",
+    "check:bindings": "node scripts/check-bindings-drift.js",
     "generate": "node scripts/regenerate-types-from-wasm.js",
     "generate:wasm": "node scripts/regenerate-types-from-wasm.js",
     "generate:testnet": "node scripts/regenerate-types.js --network=testnet",
-    "generate:mainnet": "node scripts/regenerate-types.js --network=mainnet"
+    "generate:mainnet": "node scripts/regenerate-types.js --network=mainnet",
+    "test:consumers": "node scripts/smoke-test-consumers.js"
   },
   "dependencies": {
-    "@stellar/stellar-sdk": "^14.4.3"
+    "@stellar/stellar-sdk": "^17.2.1"
   },
   "devDependencies": {
     "typescript": "^5",
@@ -53,7 +55,7 @@
     "prettier": "^3.2.5"
   },
   "peerDependencies": {
-    "@stellar/stellar-sdk": "^14.4.3"
+    "@stellar/stellar-sdk": "^17.2.1"
   },
   "keywords": [
     "stellar",

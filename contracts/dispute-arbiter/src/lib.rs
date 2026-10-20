@@ -1,7 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, String, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
+    String, Vec,
 };
 
 /// Errors for the dispute arbiter consensus contract.
@@ -29,6 +30,12 @@ pub enum ArbiterError {
     NotEnoughArbiters = 9,
     /// The dispute ID counter has reached `u64::MAX`; no more disputes can be created.
     ContractFull = 10,
+    /// Duplicate evidence hash submitted for this dispute.
+    DuplicateEvidence = 11,
+    /// Evidence submission deadline has passed.
+    EvidenceDeadlineExpired = 12,
+    /// Submitter is neither the client nor freelancer of this dispute.
+    InvalidSubmitter = 13,
 }
 
 /// The possible vote choices for an arbiter on a disputed milestone.
@@ -51,6 +58,16 @@ pub struct Vote {
     pub choice: VoteChoice,
     pub reason: String,
     pub timestamp: u64,
+}
+
+/// An evidence submission provided by client or freelancer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceSubmission {
+    pub submitter: Address,
+    pub evidence_hash: BytesN<32>,
+    pub uri: String,
+    pub submitted_at: u64,
 }
 
 /// Emitted when the dispute ID space is exhausted (`DisputeCount` reached
@@ -107,6 +124,8 @@ enum DataKey {
     Votes(u64),
     HasVoted(u64, Address),
     MinVotingPeriod,
+    Evidence(u64),
+    EvidenceHashExists(u64, BytesN<32>),
 }
 
 /// Default voting period: 7 days in seconds.
@@ -371,6 +390,82 @@ impl DisputeArbiterContract {
         bump_ttl(&env, &DataKey::Dispute(dispute_id));
 
         Ok(DisputeState::TimedOut)
+    }
+
+    /// Submit evidence for a disputed milestone. Only client or freelancer may submit.
+    /// Rejects duplicate evidence hashes and submissions past voting deadline.
+    pub fn submit_evidence(
+        env: Env,
+        dispute_id: u64,
+        submitter: Address,
+        evidence_hash: BytesN<32>,
+        uri: String,
+    ) -> Result<(), ArbiterError> {
+        submitter.require_auth();
+
+        let mut dispute: Dispute = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Dispute(dispute_id))
+            .ok_or(ArbiterError::DisputeNotFound)?;
+        bump_ttl(&env, &DataKey::Dispute(dispute_id));
+
+        // Finality: Cannot submit evidence on terminal disputes
+        if dispute.state != DisputeState::Voting && dispute.state != DisputeState::EvidenceRequested {
+            return Err(ArbiterError::AlreadyResolved);
+        }
+
+        // Deadline check
+        if env.ledger().timestamp() > dispute.voting_deadline {
+            return Err(ArbiterError::EvidenceDeadlineExpired);
+        }
+
+        // Submitter authority
+        if submitter != dispute.client && submitter != dispute.freelancer {
+            return Err(ArbiterError::InvalidSubmitter);
+        }
+
+        // Duplicate evidence rejection
+        let dup_key = DataKey::EvidenceHashExists(dispute_id, evidence_hash.clone());
+        if env.storage().persistent().has(&dup_key) {
+            return Err(ArbiterError::DuplicateEvidence);
+        }
+
+        let submission = EvidenceSubmission {
+            submitter: submitter.clone(),
+            evidence_hash: evidence_hash.clone(),
+            uri,
+            submitted_at: env.ledger().timestamp(),
+        };
+
+        let mut list: Vec<EvidenceSubmission> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Evidence(dispute_id))
+            .unwrap_or(Vec::new(&env));
+        list.push_back(submission);
+        env.storage().persistent().set(&DataKey::Evidence(dispute_id), &list);
+        bump_ttl(&env, &DataKey::Evidence(dispute_id));
+
+        env.storage().persistent().set(&dup_key, &true);
+        bump_ttl(&env, &dup_key);
+
+        // If evidence was previously requested, transition state back to voting
+        if dispute.state == DisputeState::EvidenceRequested {
+            dispute.state = DisputeState::Voting;
+            env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
+            bump_ttl(&env, &DataKey::Dispute(dispute_id));
+        }
+
+        Ok(())
+    }
+
+    /// Retrieve all evidence submitted for a dispute.
+    pub fn get_evidence(env: Env, dispute_id: u64) -> Vec<EvidenceSubmission> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Evidence(dispute_id))
+            .unwrap_or(Vec::new(&env))
     }
 
     /// Get the details of a dispute by its ID.
@@ -720,4 +815,147 @@ mod test {
         let result = client.try_create_dispute(&1, &1, &client_addr, &freelancer, &arbiters);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_evidence_submission_and_duplicate_rejection() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _admin) = setup(&env);
+        let client_addr = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+
+        let mut arbiters = Vec::new(&env);
+        for _ in 0..5 {
+            arbiters.push_back(Address::generate(&env));
+        }
+
+        let dispute_id = client.create_dispute(&1, &1, &client_addr, &freelancer, &arbiters);
+
+        let hash1 = BytesN::from_array(&env, &[1u8; 32]);
+        let uri1 = String::from_str(&env, "ipfs://evidence-1");
+
+        // Client submits evidence
+        client.submit_evidence(&dispute_id, &client_addr, &hash1, &uri1);
+
+        let evidence_list = client.get_evidence(&dispute_id);
+        assert_eq!(evidence_list.len(), 1);
+        assert_eq!(evidence_list.get(0).unwrap().submitter, client_addr);
+
+        // Submitting duplicate hash fails
+        let dup_result = client.try_submit_evidence(&dispute_id, &freelancer, &hash1, &uri1);
+        assert_eq!(dup_result, Err(Ok(ArbiterError::DuplicateEvidence)));
+
+        // Freelancer submits new unique evidence
+        let hash2 = BytesN::from_array(&env, &[2u8; 32]);
+        let uri2 = String::from_str(&env, "ipfs://evidence-2");
+        client.submit_evidence(&dispute_id, &freelancer, &hash2, &uri2);
+
+        let updated_list = client.get_evidence(&dispute_id);
+        assert_eq!(updated_list.len(), 2);
+    }
+
+    #[test]
+    fn test_unauthorized_evidence_submitter_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _admin) = setup(&env);
+        let client_addr = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        let mut arbiters = Vec::new(&env);
+        for _ in 0..5 {
+            arbiters.push_back(Address::generate(&env));
+        }
+
+        let dispute_id = client.create_dispute(&1, &1, &client_addr, &freelancer, &arbiters);
+
+        let hash = BytesN::from_array(&env, &[3u8; 32]);
+        let uri = String::from_str(&env, "ipfs://stranger-evidence");
+
+        let result = client.try_submit_evidence(&dispute_id, &stranger, &hash, &uri);
+        assert_eq!(result, Err(Ok(ArbiterError::InvalidSubmitter)));
+    }
+
+    #[test]
+    fn test_terminal_dispute_cannot_resolve_or_vote_twice() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _admin) = setup(&env);
+        let client_addr = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+
+        let mut arbiters = Vec::new(&env);
+        for _ in 0..5 {
+            arbiters.push_back(Address::generate(&env));
+        }
+
+        let dispute_id = client.create_dispute(&1, &1, &client_addr, &freelancer, &arbiters);
+
+        // 3 arbiters vote Approve -> resolves to Approved
+        let reason = String::from_str(&env, "Approved");
+        for i in 0..3 {
+            client.cast_vote(&dispute_id, &arbiters.get(i).unwrap(), &VoteChoice::Approve, &reason);
+        }
+
+        let dispute = client.get_dispute(&dispute_id);
+        assert_eq!(dispute.state, DisputeState::Approved);
+        assert!(dispute.resolved_at.is_some());
+
+        // 4th arbiter attempts to vote on terminal dispute -> AlreadyResolved
+        let vote_res = client.try_cast_vote(
+            &dispute_id,
+            &arbiters.get(3).unwrap(),
+            &VoteChoice::Reject,
+            &reason,
+        );
+        assert_eq!(vote_res, Err(Ok(ArbiterError::AlreadyResolved)));
+
+        // Attempting to force resolve timeout on terminal dispute -> AlreadyResolved
+        let resolve_res = client.try_force_resolve_timeout(&dispute_id);
+        assert_eq!(resolve_res, Err(Ok(ArbiterError::AlreadyResolved)));
+
+        // Attempting to submit evidence on terminal dispute -> AlreadyResolved
+        let hash = BytesN::from_array(&env, &[9u8; 32]);
+        let uri = String::from_str(&env, "ipfs://late-evidence");
+        let ev_res = client.try_submit_evidence(&dispute_id, &client_addr, &hash, &uri);
+        assert_eq!(ev_res, Err(Ok(ArbiterError::AlreadyResolved)));
+    }
+
+    #[test]
+    fn test_evidence_submission_resets_state_from_evidence_requested_to_voting() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _admin) = setup(&env);
+        let client_addr = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+
+        let mut arbiters = Vec::new(&env);
+        for _ in 0..5 {
+            arbiters.push_back(Address::generate(&env));
+        }
+
+        let dispute_id = client.create_dispute(&1, &1, &client_addr, &freelancer, &arbiters);
+
+        let reason = String::from_str(&env, "Need evidence");
+        for i in 0..3 {
+            client.cast_vote(&dispute_id, &arbiters.get(i).unwrap(), &VoteChoice::RequestEvidence, &reason);
+        }
+
+        let dispute = client.get_dispute(&dispute_id);
+        assert_eq!(dispute.state, DisputeState::EvidenceRequested);
+
+        // Submitting evidence returns dispute state to Voting
+        let hash = BytesN::from_array(&env, &[5u8; 32]);
+        let uri = String::from_str(&env, "ipfs://requested-evidence");
+        client.submit_evidence(&dispute_id, &client_addr, &hash, &uri);
+
+        let updated_dispute = client.get_dispute(&dispute_id);
+        assert_eq!(updated_dispute.state, DisputeState::Voting);
+    }
 }
+

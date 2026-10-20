@@ -1,0 +1,53 @@
+{
+  "version": "1.0.0",
+  "generatedAt": "2026-10-19T00:00:00Z",
+  "contracts": {
+    "payment-stream": [
+      { "code": 1, "name": "AlreadyInitialized", "message": "Contract has already been initialized", "retryable": false },
+      { "code": 2, "name": "NotInitialized", "message": "Contract has not been initialized", "retryable": false },
+      { "code": 3, "name": "Unauthorized", "message": "Caller does not have permission to perform this action", "retryable": false },
+      { "code": 4, "name": "InvalidAmount", "message": "Amount must be positive and within valid range", "retryable": false },
+      { "code": 5, "name": "InvalidTimeRange", "message": "End time must be after start time", "retryable": false },
+      { "code": 6, "name": "StreamNotFound", "message": "Stream ID does not exist", "retryable": false },
+      { "code": 7, "name": "StreamNotActive", "message": "Stream is not in active state", "retryable": false },
+      { "code": 8, "name": "StreamNotPaused", "message": "Stream is not in paused state", "retryable": false },
+      { "code": 9, "name": "StreamCannotBeCanceled", "message": "Stream cannot be canceled in its current state", "retryable": false },
+      { "code": 10, "name": "InsufficientWithdrawable", "message": "Insufficient withdrawable amount available", "retryable": true },
+      { "code": 11, "name": "TransferFailed", "message": "Token transfer operation failed", "retryable": true },
+      { "code": 12, "name": "FeeTooHigh", "message": "Protocol fee exceeds maximum allowed (5%)", "retryable": false },
+      { "code": 13, "name": "InvalidRecipient", "message": "Recipient address is invalid", "retryable": false },
+      { "code": 14, "name": "DepositExceedsTotal", "message": "Deposit amount exceeds stream total capacity", "retryable": false },
+      { "code": 15, "name": "ArithmeticOverflow", "message": "Numeric operation caused overflow", "retryable": false },
+      { "code": 16, "name": "InvalidDelegate", "message": "Delegate address is invalid", "retryable": false },
+      { "code": 17, "name": "ContractPaused", "message": "Protocol is globally paused by emergency breaker", "retryable": true },
+      { "code": 18, "name": "AlreadyPaused", "message": "Emergency pause is already active", "retryable": false },
+      { "code": 19, "name": "NotPaused", "message": "Contract is not currently paused", "retryable": false },
+      { "code": 20, "name": "InvalidSwapPath", "message": "Swap path is invalid for cross-asset deposit", "retryable": false },
+      { "code": 21, "name": "SlippageExceeded", "message": "DEX returned fewer tokens than minimum slippage limit", "retryable": true },
+      { "code": 22, "name": "SwapFailed", "message": "Internal failure while swapping for deposit", "retryable": true },
+      { "code": 23, "name": "InvalidCliff", "message": "Cliff period is not shorter than vesting duration", "retryable": false },
+      { "code": 24, "name": "BatchLimitExceeded", "message": "Batch contains more than maximum allowable items", "retryable": false },
+      { "code": 25, "name": "EmptyBatch", "message": "Batch contains no recipients or items", "retryable": false },
+      { "code": 26, "name": "DisputeInProgress", "message": "Operation rejected while dispute resolution is queued", "retryable": true }
+    ],
+    "distributor": [
+      { "code": 1, "name": "AlreadyInitialized", "message": "Distributor has already been initialized", "retryable": false },
+      { "code": 2, "name": "NotInitialized", "message": "Distributor has not been initialized", "retryable": false },
+      { "code": 3, "name": "Unauthorized", "message": "Caller unauthorized for distributor action", "retryable": false },
+      { "code": 4, "name": "EmptyDistribution", "message": "Distribution list cannot be empty", "retryable": false },
+      { "code": 5, "name": "BatchTooLarge", "message": "Distribution batch exceeds size limit", "retryable": false },
+      { "code": 6, "name": "DuplicateRecipient", "message": "Duplicate recipient specified in batch", "retryable": false },
+      { "code": 7, "name": "InvalidAmount", "message": "Amount must be strictly positive", "retryable": false },
+      { "code": 8, "name": "DistributionNotFound", "message": "Distribution ID not found", "retryable": false },
+      { "code": 9, "name": "AlreadyClaimed", "message": "Recipient has already claimed allocation", "retryable": false }
+    ],
+    "campaign-funding": [
+      { "code": 38, "name": "EscrowNotInitialized", "message": "Escrow has not been initialized", "retryable": false },
+      { "code": 39, "name": "EscrowAlreadyInitialized", "message": "Escrow has already been initialized", "retryable": false },
+      { "code": 40, "name": "EscrowNotVerified", "message": "Escrow has not passed tree verification", "retryable": false },
+      { "code": 41, "name": "EscrowAlreadyReleased", "message": "Escrow funds have already been released", "retryable": false },
+      { "code": 42, "name": "UnauthorizedVerifier", "message": "Caller is not an authorized verifier", "retryable": false },
+      { "code": 43, "name": "EscrowDisputed", "message": "Escrow is currently in disputed status", "retryable": true }
+    ]
+  }
+}

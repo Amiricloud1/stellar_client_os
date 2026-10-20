@@ -101,16 +101,5 @@ export {
   CONTRACT_ERRORS,
   type ParsedContractError,
 } from "./utils/errors.js";
-
-// Export pagination utilities
-export {
-  DEFAULT_PAGE_LIMIT,
-  MAX_PAGE_LIMIT,
-  normalizePaginationLimit,
-  paginateArray,
-  paginateQuery,
-  iteratePages,
-  type PaginationOptions,
-  type PaginatedResult,
-} from "./utils/pagination.js";
+export * from "./utils/error-catalog.js";
 
