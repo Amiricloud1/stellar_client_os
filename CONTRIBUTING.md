@@ -23,6 +23,21 @@ Start there; what follows is only the contributor workflow checklist.
    risk/security notes, validation evidence, migrations, and docs impact.
 5. Keep review fixes on the same branch as focused follow-up commits.
 
+## Contract wasm artifacts
+
+`pnpm build:contracts` derives the deployable contract set from the Cargo
+workspace members under `contracts/` rather than a hardcoded list. The build
+fails when a deployable workspace member is omitted from the artifact set or
+when its compiled `.wasm` artifact is missing, so adding a new contract crate
+to the workspace is enough to bring it into the deployment build.
+
+- When you add a contract crate, register it as a workspace member and make
+  sure it produces a wasm artifact; the build will flag it otherwise.
+- Non-deployable members (e.g. shared libraries) must be excluded explicitly
+  from the deployable set so the build does not expect a wasm for them.
+- Run `pnpm build:contracts` locally before opening a PR that touches
+  `contracts/`; CI runs the same check.
+
 ## What reviewers check
 
 - Scope: only the linked issue(s); no unrelated refactors or dependency churn.
