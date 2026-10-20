@@ -306,7 +306,7 @@ configureOfflineStorage(AsyncStorage);
 
 For sensitive data, wrap with `EncryptedKeyValueStorage` first (see #87 above).
 
-### 2. Connectivity
+## Testing & Verification
 
 ```ts
 import NetInfo from "@react-native-community/netinfo";

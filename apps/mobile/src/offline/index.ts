@@ -44,13 +44,19 @@ let services: OfflineServices | null = null;
 export function getOfflineServices(storage?: KeyValueStorage): OfflineServices {
   if (!services) {
     const resolved = storage ?? getOfflineStorage();
+    const wishlist = new OfflineWishlist(resolved);
+    // The cache is bounded (issue #94): it evicts the least-recently-used
+    // details above `maxDetailEntries`, but never a wishlisted campaign.
     const cache = new CampaignCache<CampaignSummary[], CampaignDetail>(
       resolved,
+      {
+        protectedIds: () => wishlist.list(),
+      },
     );
     services = {
       cache,
       repository: new CampaignRepository(cache),
-      wishlist: new OfflineWishlist(resolved),
+      wishlist,
       queue: new WishlistSyncQueue(resolved),
       actionQueue: new IdempotentActionQueue(resolved),
     };
