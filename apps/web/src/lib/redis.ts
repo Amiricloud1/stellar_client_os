@@ -11,6 +11,9 @@
  * | REDIS_URL              | redis://localhost:6379   | Full Redis connection string  |
  * | REDIS_CONNECT_TIMEOUT  | 2000                     | Connect timeout (ms)         |
  * | REDIS_COMMAND_TIMEOUT  | 500                      | Per-command timeout (ms)     |
+ *
+ * Idempotency (issue #58) also uses this client. See `idempotency.ts` for the
+ * store implementation and the `IDEMPOTENCY_*` environment variables.
  */
 
 import Redis from "ioredis";
@@ -64,4 +67,15 @@ export async function closeRedisClient(): Promise<void> {
     _client = null;
   }
   _attempted = false;
+}
+
+/**
+ * Returns the shared client only if it is currently usable (status "ready").
+ * Used by the idempotency store, which must fail closed rather than silently
+ * skipping reservation when Redis is down.
+ */
+export function getReadyRedisClient(): Redis | null {
+  const client = getRedisClient();
+  if (!client) return null;
+  return client.status === "ready" ? client : null;
 }

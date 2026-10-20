@@ -14,14 +14,21 @@ export type ErrorContext = {
   boundaryName?: string;
   componentStack?: string;
   digest?: string;
-  [key: string]: unknown;
+  requestId?: string;
 };
 
 function captureSentryError(error: Error, context: Record<string, unknown>): void {
   if (!process.env.NEXT_PUBLIC_SENTRY_DSN) return;
 
   Sentry.withScope((scope) => {
-    scope.setContext("fundable", context);
+    const requestId = context.requestId;
+    if (typeof requestId === 'string' && requestId.length > 0) {
+      // Tag the event so it can be correlated with the API response envelope
+      // and server logs that share the same request ID.
+      scope.setTag('request_id', requestId);
+      scope.setContext('request', { requestId });
+    }
+    scope.setContext('fundable', context);
     Sentry.captureException(error);
   });
 }
@@ -64,7 +71,8 @@ export function reportRuntimeError(error: Error, context: ErrorContext = {}): vo
     boundaryName: sanitizedContext.boundaryName,
     componentStack: sanitizedContext.componentStack,
     digest: sanitizedContext.digest,
-    path: rawPath ? sanitizeUrl(sanitizeErrorString(rawPath, sanitizeOpts), sanitizeOpts) : undefined,
+    requestId: sanitizedContext.requestId,
+    path: typeof window !== 'undefined' ? sanitizeErrorString(window.location.pathname) : undefined,
     timestamp: new Date().toISOString(),
   };
 
@@ -112,7 +120,8 @@ export function reportCaughtError(
     message: sanitizedError.message,
     stack: sanitizedError.stack,
     context: sanitizedContext,
-    path: rawPath ? sanitizeUrl(sanitizeErrorString(rawPath, sanitizeOpts), sanitizeOpts) : undefined,
+    requestId: sanitizedContext.requestId,
+    path: typeof window !== 'undefined' ? sanitizeErrorString(window.location.pathname) : undefined,
     timestamp: new Date().toISOString(),
   };
 

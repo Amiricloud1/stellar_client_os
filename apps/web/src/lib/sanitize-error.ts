@@ -388,224 +388,155 @@ export function sanitizeObject<T = unknown>(
 }
 
 /**
- * Sanitize an error object for safe telemetry reporting
+ * A single field-level validation error, safe to return to clients.
+ */
+export type FieldError = {
+  /** Dot-notation path of the offending field, e.g. `amount` or `recipient.address` */
+  field: string;
+  /** Machine-readable reason, e.g. `required`, `invalid_format` */
+  code: string;
+  /** Human-readable, already-sanitized explanation */
+  message: string;
+};
+
+/**
+ * The only shape ever returned to clients or logged externally.
+ * Stack traces, `cause` chains and arbitrary internal properties are dropped.
+ */
+export type SanitizedError = {
+  /** Stable machine-readable error code, e.g. `VALIDATION_ERROR` */
+  code: string;
+  /** Human-readable, already-sanitized message */
+  message: string;
+  /** Correlation ID shared with server logs */
+  requestId?: string;
+  /** Field-level validation errors, when applicable */
+  fieldErrors?: FieldError[];
+};
+
+/**
+ * Properties that are always preserved (after sanitization) when present.
+ */
+const PRESERVED_PROPERTIES = ['code', 'requestId'] as const;
+
+/**
+ * Properties that are never copied, even if present on the source error.
+ */
+const STRIPPED_PROPERTIES = new Set([
+  'message',
+  'name',
+  'stack',
+  'cause',
+  'requestId',
+  'code',
+  'fieldErrors',
+]);
+
+const DEFAULT_ERROR_CODE = 'INTERNAL_ERROR';
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Normalize any thrown value (Error, string, object, undefined, ...) into a
+ * `SanitizedError`. Never throws, never leaks stack traces or `cause` chains.
+ *
+ * @param error - The thrown value to sanitize
+ * @param options - Sanitization options
+ * @returns A plain, JSON-safe object suitable for API responses and logs
  */
 export function sanitizeError(
-  error: Error,
+  error: unknown,
   options: SanitizeOptions = {}
-): Error {
-  const safeError = new Error(sanitizeErrorString(error.message, options));
+): SanitizedError {
+  const result: SanitizedError = {
+    code: DEFAULT_ERROR_CODE,
+    message: 'An unexpected error occurred',
+  };
 
-  // Copy over safe properties
-  safeError.name = sanitizeErrorString(error.name, options);
-  safeError.stack = error.stack ? sanitizeErrorString(error.stack, options) : undefined;
+  if (error === null || error === undefined) {
+    return result;
+  }
 
-  // Copy any custom properties if they exist
-  const customProps = Object.getOwnPropertyNames(error).filter(
-    (prop) => prop !== "message" && prop !== "name" && prop !== "stack"
-  );
+  // Non-object throws (string, number, boolean, symbol, bigint)
+  if (typeof error !== 'object') {
+    if (typeof error === 'string' && error.length > 0) {
+      result.message = sanitizeErrorString(error, options);
+    }
+    return result;
+  }
 
-  const errorRecord = error as Error & Record<string, unknown>;
-  const safeErrorRecord = safeError as Error & Record<string, unknown>;
+  const record = error as Record<string, unknown>;
 
-  for (const prop of customProps) {
-    const placeholder = getFieldRedactionPlaceholder(prop);
-    const value = errorRecord[prop];
-    if (placeholder !== null && value !== undefined && value !== null) {
-      safeErrorRecord[prop] = placeholder;
-    } else if (typeof value === "string") {
-      safeErrorRecord[prop] = sanitizeErrorString(value, options);
-    } else if (value && typeof value === "object") {
-      safeErrorRecord[prop] = sanitizeObject(value, options);
-    } else {
-      safeErrorRecord[prop] = value;
+  // Message: prefer `message`, fall back to `error` (e.g. from JSON payloads)
+  const rawMessage =
+    typeof record.message === 'string'
+      ? record.message
+      : typeof record.error === 'string'
+        ? record.error
+        : undefined;
+  if (rawMessage) {
+    result.message = sanitizeErrorString(rawMessage, options);
+  }
+
+  // Preserved scalar properties
+  for (const prop of PRESERVED_PROPERTIES) {
+    const value = record[prop];
+    if (typeof value === 'string' && value.length > 0) {
+      result[prop] = sanitizeErrorString(value, options);
     }
   }
 
-  return safeError;
-}
-
-/**
- * Scrub a Sentry breadcrumb before it is attached to the scope or transmitted.
- */
-export function scrubSentryBreadcrumb<T extends Record<string, unknown>>(
-  breadcrumb: T,
-  options: SanitizeOptions = {}
-): T {
-  if (!breadcrumb || typeof breadcrumb !== "object") return breadcrumb;
-
-  const clone: Record<string, unknown> = { ...breadcrumb };
-
-  if (typeof clone.message === "string") {
-    clone.message = sanitizeErrorString(clone.message, options);
-  }
-
-  if (clone.data && typeof clone.data === "object") {
-    const dataClone = { ...(clone.data as Record<string, unknown>) };
-    if (typeof dataClone.url === "string") {
-      dataClone.url = sanitizeUrl(dataClone.url, options);
-    }
-    clone.data = sanitizeObject(dataClone, options);
-  }
-
-  return clone as T;
-}
-
-/**
- * Scrub a Sentry event (error or transaction) prior to transmission (`beforeSend` / `beforeSendTransaction`).
- * Removes tax IDs, wallet secrets, signed transactions, verification/insurance evidence,
- * and sensitive URL, header, cookie, and request body fields.
- */
-export function scrubSentryEvent<T extends Record<string, unknown>>(
-  event: T,
-  options: SanitizeOptions = {}
-): T {
-  if (!event || typeof event !== "object") return event;
-
-  const clone: Record<string, unknown> = { ...event };
-
-  if (typeof clone.message === "string") {
-    clone.message = sanitizeErrorString(clone.message, options);
-  }
-
-  if (typeof clone.transaction === "string") {
-    clone.transaction = sanitizeUrl(clone.transaction, options);
-  }
-
-  if (clone.logentry && typeof clone.logentry === "object") {
-    clone.logentry = sanitizeObject(clone.logentry, options);
-  }
-
-  // Scrub exception values and stack frames
-  if (clone.exception && typeof clone.exception === "object") {
-    const exceptionObj = { ...(clone.exception as Record<string, unknown>) };
-    if (Array.isArray(exceptionObj.values)) {
-      exceptionObj.values = exceptionObj.values.map((ex: unknown) => {
-        if (!ex || typeof ex !== "object") return ex;
-        const exRecord = { ...(ex as Record<string, unknown>) };
-        if (typeof exRecord.value === "string") {
-          exRecord.value = sanitizeErrorString(exRecord.value, options);
-        }
-        if (typeof exRecord.type === "string") {
-          exRecord.type = sanitizeErrorString(exRecord.type, options);
-        }
-        if (exRecord.stacktrace && typeof exRecord.stacktrace === "object") {
-          const st = { ...(exRecord.stacktrace as Record<string, unknown>) };
-          if (Array.isArray(st.frames)) {
-            st.frames = st.frames.map((frame: unknown) => {
-              if (!frame || typeof frame !== "object") return frame;
-              const frameRecord = { ...(frame as Record<string, unknown>) };
-              if (typeof frameRecord.filename === "string") {
-                frameRecord.filename = sanitizeUrl(frameRecord.filename, options);
-              }
-              if (typeof frameRecord.abs_path === "string") {
-                frameRecord.abs_path = sanitizeUrl(frameRecord.abs_path, options);
-              }
-              if (frameRecord.vars && typeof frameRecord.vars === "object") {
-                frameRecord.vars = sanitizeObject(frameRecord.vars, options);
-              }
-              return frameRecord;
-            });
-          }
-          exRecord.stacktrace = st;
-        }
-        return exRecord;
+  // Field errors: keep only well-formed entries, sanitize their messages
+  if (Array.isArray(record.fieldErrors)) {
+    const fieldErrors: FieldError[] = [];
+    for (const entry of record.fieldErrors) {
+      if (!isPlainObject(entry)) continue;
+      const field = entry.field;
+      const code = entry.code;
+      const message = entry.message;
+      if (typeof field !== 'string' || typeof code !== 'string') continue;
+      fieldErrors.push({
+        field: sanitizeErrorString(field, options),
+        code: sanitizeErrorString(code, options),
+        message:
+          typeof message === 'string'
+            ? sanitizeErrorString(message, options)
+            : '',
       });
     }
-    clone.exception = exceptionObj;
+    if (fieldErrors.length > 0) {
+      result.fieldErrors = fieldErrors;
+    }
   }
 
-  // Scrub request URL, query_string, headers, cookies, and body data
-  if (clone.request && typeof clone.request === "object") {
-    const req = { ...(clone.request as Record<string, unknown>) };
+  return result;
+}
 
-    if (typeof req.url === "string") {
-      req.url = sanitizeUrl(req.url, options);
-    }
+/**
+ * Build a `SanitizedError` from an arbitrary thrown value, guaranteeing that
+ * only `code`, `message`, `requestId` and `fieldErrors` are present.
+ *
+ * This is the function API handlers should use before serializing an error
+ * into a response body or an external log sink. It intentionally ignores
+ * `stack`, `cause` and every other property on the source error.
+ *
+ * @param error - The thrown value to sanitize
+ * @param options - Sanitization options
+ * @returns A plain, JSON-safe object
+ */
+export function toClientError(
+  error: unknown,
+  options: SanitizeOptions = {}
+): SanitizedError {
+  return sanitizeError(error, options);
+}
 
-    if (typeof req.query_string === "string") {
-      req.query_string = sanitizeUrl(
-        req.query_string.startsWith("?") ? req.query_string : `?${req.query_string}`,
-        options
-      ).replace(/^\?/, "");
-    } else if (req.query_string && typeof req.query_string === "object") {
-      req.query_string = sanitizeObject(req.query_string, options);
-    }
-
-    if (req.headers && typeof req.headers === "object") {
-      req.headers = sanitizeObject(req.headers, options);
-    }
-
-    if (req.cookies) {
-      req.cookies = "[REDACTED]";
-    }
-
-    if (typeof req.data === "string") {
-      const trimmed = req.data.trim();
-      if (
-        (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
-        (trimmed.startsWith("[") && trimmed.endsWith("]"))
-      ) {
-        try {
-          const parsed = JSON.parse(trimmed);
-          req.data = JSON.stringify(sanitizeObject(parsed, options));
-        } catch {
-          req.data = sanitizeErrorString(req.data, options);
-        }
-      } else {
-        req.data = sanitizeUrl(sanitizeErrorString(req.data, options), options);
-      }
-    } else if (req.data && typeof req.data === "object") {
-      req.data = sanitizeObject(req.data, options);
-    }
-
-    clone.request = req;
-  }
-
-  // Scrub breadcrumbs
-  if (Array.isArray(clone.breadcrumbs)) {
-    clone.breadcrumbs = clone.breadcrumbs.map((b: unknown) =>
-      b && typeof b === "object"
-        ? scrubSentryBreadcrumb(b as Record<string, unknown>, options)
-        : b
-    );
-  } else if (clone.breadcrumbs && typeof clone.breadcrumbs === "object") {
-    const bcObj = { ...(clone.breadcrumbs as Record<string, unknown>) };
-    if (Array.isArray(bcObj.values)) {
-      bcObj.values = bcObj.values.map((b: unknown) =>
-        b && typeof b === "object"
-          ? scrubSentryBreadcrumb(b as Record<string, unknown>, options)
-          : b
-      );
-    }
-    clone.breadcrumbs = bcObj;
-  }
-
-  // Scrub contexts, extra, tags, and user
-  if (clone.extra && typeof clone.extra === "object") {
-    clone.extra = sanitizeObject(clone.extra, options);
-  }
-
-  if (clone.contexts && typeof clone.contexts === "object") {
-    clone.contexts = sanitizeObject(clone.contexts, options);
-  }
-
-  if (clone.tags && typeof clone.tags === "object") {
-    clone.tags = sanitizeObject(clone.tags, options);
-  }
-
-  if (clone.user && typeof clone.user === "object") {
-    const userObj = { ...(clone.user as Record<string, unknown>) };
-    if (userObj.email) userObj.email = "[REDACTED]";
-    if (userObj.ip_address) userObj.ip_address = "[REDACTED]";
-    if (typeof userObj.id === "string") {
-      userObj.id = sanitizeErrorString(userObj.id, options);
-    }
-    if (typeof userObj.username === "string") {
-      userObj.username = sanitizeErrorString(userObj.username, options);
-    }
-    clone.user = sanitizeObject(userObj, options);
-  }
-
-  return clone as T;
+/**
+ * Determine whether a property name should be copied when sanitizing.
+ * Exposed for tests and for callers that need to mirror the allow-list.
+ */
+export function isStrippedProperty(prop: string): boolean {
+  return STRIPPED_PROPERTIES.has(prop);
 }
