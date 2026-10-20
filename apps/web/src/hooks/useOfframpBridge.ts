@@ -161,6 +161,7 @@ export function useOfframpBridge(): UseOfframpBridgeReturn {
 
     // Polling refs
     const payoutPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    const pollingStartedAtRef = useRef<number | null>(null);
     // Abort controller ref for component-level cleanup
     const abortRef = useRef<AbortController | null>(null);
     // Last attempted quote form, used to retry after a recoverable failure
@@ -429,6 +430,10 @@ export function useOfframpBridge(): UseOfframpBridgeReturn {
                 setErrorCategory("validation");
                 return;
             }
+            if (quote.expiresAt && new Date(quote.expiresAt).getTime() <= Date.now()) {
+                setError("Quote has expired. Please refresh your quote.");
+                return;
+            }
             if (isLoadingProviderMinimum) {
                 setError("Provider minimum is still loading. Please try again.");
                 setErrorAction("retry");
@@ -524,7 +529,19 @@ export function useOfframpBridge(): UseOfframpBridgeReturn {
     const startPayoutPolling = useCallback(() => {
         if (!offrampData?.reference) return;
         if (payoutPollRef.current) clearInterval(payoutPollRef.current);
+        pollingStartedAtRef.current = Date.now();
+
         payoutPollRef.current = setInterval(async () => {
+            if (
+                pollingStartedAtRef.current &&
+                Date.now() - pollingStartedAtRef.current >= SETTLEMENT_CONFIG.SETTLEMENT_POLL_TIMEOUT_MS
+            ) {
+                if (payoutPollRef.current) clearInterval(payoutPollRef.current);
+                setStep("failed");
+                setError("Settlement timed out. Automated background reconciliation is tracking your transaction.");
+                return;
+            }
+
             try {
                 const res = await offrampService.getQuoteStatus(offrampData.reference, address || undefined);
                 if (res.success && res.data) {
@@ -536,6 +553,14 @@ export function useOfframpBridge(): UseOfframpBridgeReturn {
                         if (payoutPollRef.current) clearInterval(payoutPollRef.current);
                         setStep("failed");
                         setError(res.data.providerMessage || "Payout failed");
+                    } else if (res.data.status === "expired") {
+                        if (payoutPollRef.current) clearInterval(payoutPollRef.current);
+                        setStep("failed");
+                        setError("Quote expired before settlement confirmation.");
+                    } else if (res.data.status === "timeout") {
+                        if (payoutPollRef.current) clearInterval(payoutPollRef.current);
+                        setStep("failed");
+                        setError("Settlement timed out with provider. Queued for reconciliation.");
                     }
                 }
             } catch {
@@ -560,6 +585,12 @@ export function useOfframpBridge(): UseOfframpBridgeReturn {
             return;
         }
 
+        if (offrampData.expiresAt && new Date(offrampData.expiresAt).getTime() <= Date.now()) {
+            setError("Offramp quote has expired. Please create a new transfer.");
+            setStep("failed");
+            return;
+        }
+
         setIsLoading(true);
         clearError();
         setStep("processing");
@@ -578,6 +609,7 @@ export function useOfframpBridge(): UseOfframpBridgeReturn {
 
     const reset = useCallback(() => {
         if (payoutPollRef.current) clearInterval(payoutPollRef.current);
+        pollingStartedAtRef.current = null;
         setStep("form");
         clearError();
         setIsLoading(false);
