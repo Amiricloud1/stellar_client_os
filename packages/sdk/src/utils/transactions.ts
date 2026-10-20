@@ -7,7 +7,13 @@
 
 import { AssembledTransaction } from "@stellar/stellar-sdk/contract";
 import { rpc } from "@stellar/stellar-sdk";
-import { parseContractError, FundableStellarError } from "./errors.js";
+import {
+  parseContractError,
+  FundableStellarError,
+  TransactionResubmissionError,
+} from "./errors.js";
+
+export { TransactionResubmissionError };
 
 /**
  * Terminal and lifecycle statuses for transaction waiting

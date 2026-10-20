@@ -191,3 +191,114 @@ export const updateCampaignSchema = z.object({
 
 export type UpdateCampaignFormData = z.infer<typeof updateCampaignSchema>
 
+/**
+ * Upload presign validation (issue #62).
+ *
+ * Presigned upload requests must be bound to an explicit content type, a byte
+ * size ceiling, a safe object-key prefix, and the owning campaign/milestone.
+ * These schemas are shared by the API route and the client so that tampered or
+ * unauthorized payloads are rejected before a signature is ever produced.
+ */
+
+/** MIME types that may be uploaded. Anything else is rejected outright. */
+export const UPLOAD_ALLOWED_MIME_TYPES = [
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+  "application/pdf",
+] as const
+
+export type UploadMimeType = (typeof UPLOAD_ALLOWED_MIME_TYPES)[number]
+
+/** Hard ceiling for a single upload, in bytes (10 MiB). */
+export const UPLOAD_MAX_BYTES = 10 * 1024 * 1024
+
+/** Minimum accepted declared size; zero-byte uploads are rejected. */
+export const UPLOAD_MIN_BYTES = 1
+
+/** Presign URLs may not be requested for longer than this (seconds). */
+export const UPLOAD_MAX_EXPIRY_SECONDS = 15 * 60
+
+/** Presign URLs must be valid for at least this long (seconds). */
+export const UPLOAD_MIN_EXPIRY_SECONDS = 30
+
+/**
+ * Object keys must live under a known, non-traversable prefix. The owning
+ * campaign id is appended by the server, never supplied verbatim by clients.
+ */
+export const UPLOAD_KEY_PREFIXES = ["campaigns", "milestones", "evidence"] as const
+
+export type UploadKeyPrefix = (typeof UPLOAD_KEY_PREFIXES)[number]
+
+/** Campaign and milestone identifiers are positive integers. */
+export const uploadOwnerIdSchema = z
+  .number({ invalid_type_error: "Owner id must be a number" })
+  .int("Owner id must be an integer")
+  .positive("Owner id must be positive")
+  .max(Number.MAX_SAFE_INTEGER, "Owner id is out of range")
+
+/** A single path segment: no slashes, dots-only names, or control characters. */
+const SAFE_KEY_SEGMENT_REGEX = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+
+export const uploadKeySegmentSchema = z
+  .string()
+  .min(1, "File name is required")
+  .max(128, "File name cannot exceed 128 characters")
+  .refine((segment) => SAFE_KEY_SEGMENT_REGEX.test(segment), "File name contains unsafe characters")
+  .refine((segment) => segment !== "." && segment !== "..", "File name cannot be a relative path")
+
+export const uploadPresignSchema = z
+  .object({
+    campaignId: uploadOwnerIdSchema,
+    milestoneId: uploadOwnerIdSchema.optional(),
+    prefix: z.enum(UPLOAD_KEY_PREFIXES),
+    fileName: uploadKeySegmentSchema,
+    contentType: z.enum(UPLOAD_ALLOWED_MIME_TYPES, {
+      errorMap: () => ({ message: "Unsupported content type" }),
+    }),
+    size: z
+      .number({ invalid_type_error: "Size must be a number" })
+      .int("Size must be an integer number of bytes")
+      .min(UPLOAD_MIN_BYTES, "File must not be empty")
+      .max(UPLOAD_MAX_BYTES, `File cannot exceed ${UPLOAD_MAX_BYTES} bytes`),
+    expiresIn: z
+      .number({ invalid_type_error: "Expiry must be a number of seconds" })
+      .int("Expiry must be an integer number of seconds")
+      .min(UPLOAD_MIN_EXPIRY_SECONDS, `Expiry must be at least ${UPLOAD_MIN_EXPIRY_SECONDS} seconds`)
+      .max(UPLOAD_MAX_EXPIRY_SECONDS, `Expiry cannot exceed ${UPLOAD_MAX_EXPIRY_SECONDS} seconds`)
+      .default(UPLOAD_MAX_EXPIRY_SECONDS),
+  })
+  .strict()
+
+export type UploadPresignInput = z.infer<typeof uploadPresignSchema>
+
+/**
+ * Server-side authorization envelope. `ownerAddress` is the authenticated
+ * caller and must match the campaign owner; it is never trusted from the body.
+ */
+export const uploadPresignAuthorizationSchema = z
+  .object({
+    ownerAddress: z
+      .string()
+      .min(1, "Owner address is required")
+      .refine((address) => StellarService.validateStellarAddress(address), "Invalid owner address"),
+  })
+  .strict()
+
+export type UploadPresignAuthorization = z.infer<typeof uploadPresignAuthorizationSchema>
+
+/**
+ * Build the canonical object key for a validated presign request. The campaign
+ * id is always injected by the server so a client cannot target another
+ * campaign's namespace.
+ */
+export function buildUploadObjectKey(
+  input: Pick<UploadPresignInput, "prefix" | "campaignId" | "milestoneId" | "fileName">,
+): string {
+  const parts: string[] = [input.prefix, String(input.campaignId)]
+  if (input.milestoneId !== undefined) parts.push(String(input.milestoneId))
+  parts.push(input.fileName)
+  return parts.join("/")
+}
+

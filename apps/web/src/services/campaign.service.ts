@@ -6,6 +6,10 @@ import { pushNotificationService } from "./push-notification.service";
 import { campaignImpactNftService } from "./campaign-impact-nft.service";
 import type { CampaignWebhookEvent } from "@/types/webhook";
 import type { CampaignLocalizedContent } from "@/lib/translation";
+import {
+  campaignMetricsCache,
+  type CampaignMetricsCache,
+} from "./campaign-metrics-cache.service";
 
 export type CampaignStatus = "DRAFT" | "PENDING_VERIFICATION" | "ACTIVE" | "PAUSED" | "COMPLETED" | "FAILED";
 
@@ -416,6 +420,7 @@ export class InMemoryCampaignDataSource implements CampaignDataSource {
     // Commit first: the map write is the durable boundary. Side effects below
     // only run once the record is committed.
     this.campaigns.set(campaign.id, saved);
+    invalidateCampaignMetrics(saved.id);
 
     if (existing && campaign.sponsorCount > 0) {
       if ((existing.treeCount ?? 0) < (campaign.treeCount ?? 0)) {
@@ -944,7 +949,7 @@ gpsLocations: input.gpsLocations,
   };
   campaign.statusHistory[0].campaignId = campaign.id;
   campaign.statusHistory[0].id = `${campaign.id}:${now}:0`;
-  return dataSource.saveCampaign(campaign);
+  return persistCampaign(dataSource, campaign);
 }
 
 export async function reviewCampaignNonprofitPartner(
@@ -1513,4 +1518,37 @@ export async function transferCarbonCreditCertificate(
     return updatedCertificate;
   }
   return null;
+}
+
+/**
+ * Apply an authoritative chain correction to a campaign's totals.
+ *
+ * Chain reorgs and reconciliation jobs can revise the on-chain raised amount,
+ * sponsor count, or tree count after the fact. Any such correction must
+ * invalidate the cached metrics so subsequent reads observe the corrected
+ * totals rather than a stale snapshot. Returns the updated campaign, or
+ * `null` when the campaign is unknown.
+ */
+export async function applyCampaignChainCorrection(
+  campaignId: string,
+  correction: {
+    raisedAmount?: string;
+    sponsorCount?: number;
+    treeCount?: number;
+    co2Sequestration?: string;
+  },
+  dataSource: CampaignDataSource = getCampaignDataSource(),
+  now = Date.now(),
+): Promise<CampaignRecord | null> {
+  const campaign = await getCampaign(campaignId, dataSource);
+  if (!campaign) return null;
+  const corrected: CampaignRecord = {
+    ...campaign,
+    raisedAmount: correction.raisedAmount ?? campaign.raisedAmount,
+    sponsorCount: correction.sponsorCount ?? campaign.sponsorCount,
+    treeCount: correction.treeCount ?? campaign.treeCount,
+    co2Sequestration: correction.co2Sequestration ?? campaign.co2Sequestration,
+    updatedAt: now,
+  };
+  return persistCampaign(dataSource, corrected);
 }
