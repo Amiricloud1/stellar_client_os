@@ -17,7 +17,7 @@
     "test:e2e:ci": "playwright test --reporter=line,html",
     "test:e2e:ui": "playwright test --ui",
     "storybook": "start-storybook -p 6006 -s public",
-    "build-storybook": "build-storybook -o storybook-static"
+    "build-storybook": "node ./scripts/build-storybook.mjs -o storybook-static"
   },
   "dependencies": {
     "@sentry/nextjs": "^10.71.0",

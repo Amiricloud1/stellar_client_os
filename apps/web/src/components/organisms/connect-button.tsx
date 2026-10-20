@@ -112,10 +112,10 @@ export function ConnectButton() {
           initial={{ opacity: 0, scale: 0.95 }}
           animate={{ opacity: 1, scale: 1 }}
           onClick={() => setDropdownOpen(!dropdownOpen)}
-          className="flex items-center gap-3 px-6 py-3 rounded-2xl bg-[#0F1621] border border-white/10 hover:border-white/30 transition-all group shadow-lg"
+          className="flex items-center gap-2 sm:gap-3 px-3 py-2 sm:px-6 sm:py-3 rounded-xl sm:rounded-2xl bg-[#0F1621] border border-white/10 hover:border-white/30 transition-all group shadow-lg whitespace-nowrap"
         >
           <div className="w-2 h-2 rounded-full bg-white shadow-[0_0_10px_rgba(255,255,255,0.5)]" />
-          <span className="text-white font-bold tracking-wide text-sm">
+          <span className="text-white font-bold tracking-wide text-xs sm:text-sm">
             {formatAddress(address)}
           </span>
           <div
@@ -133,7 +133,7 @@ export function ConnectButton() {
               animate={{ opacity: 1, y: 5, scale: 1 }}
               exit={{ opacity: 0, y: 10, scale: 0.95 }}
               transition={{ duration: 0.2, ease: "easeOut" }}
-              className="absolute top-full right-0 mt-3 w-48 bg-[#0F1621]/90 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl overflow-hidden z-50 p-2"
+              className="absolute top-full right-0 mt-3 w-48 max-w-[calc(100vw-1.5rem)] bg-[#0F1621]/90 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl overflow-hidden z-50 p-2"
               role="menu"
               aria-label="Wallet options"
             >
