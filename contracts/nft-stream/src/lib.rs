@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, token,
-    Address, Env, Symbol,
+    Address, Env, String, Symbol,
 };
 
 #[contracterror]
@@ -64,6 +64,7 @@ pub enum DataKey {
     StreamOwnershipRecord(u64),
     OwnershipToStream(u64),
     Admin,
+    StreamMetadata(u64),
 }
 
 #[contractevent(topics = ["stream_created"])]
@@ -345,17 +346,21 @@ impl PaymentStreamContract {
 
         let current_time = env.ledger().timestamp();
         let vested = Self::calculate_vested(&stream, current_time);
-        let refund_amount = stream.total_amount - vested;
+        let unwithdrawn_vested = vested.saturating_sub(stream.withdrawn_amount);
+        let refund_amount = stream
+            .total_amount
+            .saturating_sub(stream.withdrawn_amount + unwithdrawn_vested);
 
-        if vested > 0 {
+        if unwithdrawn_vested > 0 {
             let token_client = token::Client::new(&env, &stream.token);
             token_client.transfer(
                 &env.current_contract_address(),
                 &ownership_record.owner,
-                &vested,
+                &unwithdrawn_vested,
             );
         }
 
+        stream.withdrawn_amount += unwithdrawn_vested;
         stream.status = StreamStatus::Canceled;
         env.storage()
             .persistent()
@@ -380,6 +385,43 @@ impl PaymentStreamContract {
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Update mutable metadata URI for a stream.
+    ///
+    /// Only the current ownership token holder may update the stream's metadata.
+    pub fn set_metadata(
+        env: Env,
+        stream_id: u64,
+        metadata_uri: String,
+    ) -> Result<(), Error> {
+        let stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stream(stream_id))
+            .ok_or(Error::StreamNotFound)?;
+
+        let ownership_record: StreamOwnershipRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StreamOwnershipRecord(stream.ownership_id))
+            .ok_or(Error::OwnershipRecordNotFound)?;
+
+        ownership_record.owner.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::StreamMetadata(stream_id), &metadata_uri);
+
+        Ok(())
+    }
+
+    /// Return metadata URI of a stream, if set.
+    pub fn get_metadata(env: Env, stream_id: u64) -> Result<Option<String>, Error> {
+        if !env.storage().persistent().has(&DataKey::Stream(stream_id)) {
+            return Err(Error::StreamNotFound);
+        }
+        Ok(env.storage().persistent().get(&DataKey::StreamMetadata(stream_id)))
     }
 
     pub fn get_stream(env: Env, stream_id: u64) -> Result<Stream, Error> {
@@ -572,4 +614,78 @@ mod test {
         let result = client.try_create_stream(&sender, &recipient, &token, &1_000, &0, &100, &true);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_withdrawal_authority_after_transfer() {
+        let env = Env::default();
+        let (_contract_id, client, token, sender, recipient) = setup(&env);
+
+        let stream_id = client.create_stream(&sender, &recipient, &token, &1_000, &0, &100, &true);
+
+        // Advance ledger time to 50
+        env.ledger().set_timestamp(50);
+
+        let new_recipient = Address::generate(&env);
+        client.transfer_stream(&stream_id, &new_recipient);
+
+        // Verify ownership record updated
+        let ownership = client.get_ownership_record(&1);
+        assert_eq!(ownership.owner, new_recipient);
+
+        // New recipient claims the vested 500 tokens
+        let claimed = client.claim(&stream_id);
+        assert_eq!(claimed, 500);
+
+        let token_client = token::Client::new(&env, &token);
+        assert_eq!(token_client.balance(&new_recipient), 500);
+        assert_eq!(token_client.balance(&recipient), 0);
+    }
+
+    #[test]
+    fn test_metadata_mutability_by_owner() {
+        let env = Env::default();
+        let (_contract_id, client, token, sender, recipient) = setup(&env);
+
+        let stream_id = client.create_stream(&sender, &recipient, &token, &1_000, &0, &100, &true);
+
+        assert_eq!(client.get_metadata(&stream_id), None);
+
+        let uri = String::from_str(&env, "ipfs://bafybeicdn.../stream1.json");
+        client.set_metadata(&stream_id, &uri);
+
+        assert_eq!(client.get_metadata(&stream_id), Some(uri));
+    }
+
+    #[test]
+    fn test_cancel_stream_after_partial_claim_conserves_tokens() {
+        let env = Env::default();
+        let (_contract_id, client, token, sender, recipient) = setup(&env);
+
+        let stream_id = client.create_stream(&sender, &recipient, &token, &1_000, &0, &100, &true);
+
+        // At time 40, recipient claims 400
+        env.ledger().set_timestamp(40);
+        let claimed = client.claim(&stream_id);
+        assert_eq!(claimed, 400);
+
+        // At time 70, sender cancels stream.
+        // Total vested: 700. Already withdrawn: 400.
+        // Unwithdrawn vested to recipient: 300.
+        // Refund to sender: 300.
+        env.ledger().set_timestamp(70);
+        client.cancel_stream(&stream_id);
+
+        let token_client = token::Client::new(&env, &token);
+        assert_eq!(token_client.balance(&recipient), 700);
+        assert_eq!(token_client.balance(&sender), 300);
+
+        let stream = client.get_stream(&stream_id);
+        assert_eq!(stream.status, StreamStatus::Canceled);
+        assert_eq!(stream.withdrawn_amount, 700);
+
+        // Repeated cancel fails
+        let res = client.try_cancel_stream(&stream_id);
+        assert!(res.is_err());
+    }
 }
+
