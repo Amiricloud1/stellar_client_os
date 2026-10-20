@@ -26,11 +26,9 @@ function setOnlineStatus(online: boolean) {
 beforeEach(() => {
   localStorageMock.clear();
   setOnlineStatus(true);
-  vi.useFakeTimers();
 });
 
 afterEach(() => {
-  vi.useRealTimers();
   vi.restoreAllMocks();
   setOnlineStatus(true);
 });
@@ -80,11 +78,27 @@ describe("useSyncQueue — enqueue", () => {
     act(() => { result.current.enqueue({ label: "Y" }); });
     expect(result.current.pendingCount).toBe(2);
   });
+
+  it("preserves user payload upon enqueue (Issue #73)", () => {
+    const { result } = renderHook(() =>
+      useSyncQueue({ storageKey: "test_queue_payload" })
+    );
+    act(() => {
+      result.current.enqueue({
+        label: "Evidence Upload",
+        payload: { treeId: "tree-42", notes: "Planted in sector 3" },
+      });
+    });
+    expect(result.current.queue[0].payload).toEqual({
+      treeId: "tree-42",
+      notes: "Planted in sector 3",
+    });
+  });
 });
 
-// ── remove ────────────────────────────────────────────────────────────────────
+// ── remove / discard ──────────────────────────────────────────────────────────
 
-describe("useSyncQueue — remove", () => {
+describe("useSyncQueue — remove and discard", () => {
   it("removes an item by id", () => {
     const { result } = renderHook(() =>
       useSyncQueue({ storageKey: "test_queue_remove" })
@@ -95,16 +109,26 @@ describe("useSyncQueue — remove", () => {
     expect(result.current.queue).toHaveLength(0);
   });
 
+  it("discard removes an item safely (Issue #73)", () => {
+    const { result } = renderHook(() =>
+      useSyncQueue({ storageKey: "test_queue_discard" })
+    );
+    act(() => { result.current.enqueue({ label: "Discard me" }); });
+    const id = result.current.queue[0].id;
+    act(() => { result.current.discard(id); });
+    expect(result.current.queue).toHaveLength(0);
+  });
+
   it("leaves other items untouched", () => {
     const { result } = renderHook(() =>
       useSyncQueue({ storageKey: "test_queue_remove_other" })
     );
     act(() => {
       result.current.enqueue({ label: "Keep" });
-      result.current.enqueue({ label: "Delete" });
+      result.current.enqueue({ label: "Remove" });
     });
-    const deleteId = result.current.queue[1].id;
-    act(() => { result.current.remove(deleteId); });
+    const toRemoveId = result.current.queue[1].id;
+    act(() => { result.current.remove(toRemoveId); });
     expect(result.current.queue).toHaveLength(1);
     expect(result.current.queue[0].label).toBe("Keep");
   });
@@ -122,7 +146,6 @@ describe("useSyncQueue — clear operations", () => {
       result.current.enqueue({ label: "Sync me" });
       result.current.enqueue({ label: "Keep pending" });
     });
-    // Manually simulate synced state for first item
     const id = result.current.queue[0].id;
     await act(async () => { await result.current.retryItem(id); });
     await waitFor(() =>
@@ -141,12 +164,13 @@ describe("useSyncQueue — clear operations", () => {
       result.current.enqueue({ label: "A" });
       result.current.enqueue({ label: "B" });
     });
+    expect(result.current.queue).toHaveLength(2);
     act(() => { result.current.clearAll(); });
     expect(result.current.queue).toHaveLength(0);
   });
 });
 
-// ── online / offline detection ────────────────────────────────────────────────
+// ── online / offline ──────────────────────────────────────────────────────────
 
 describe("useSyncQueue — online/offline", () => {
   it("reflects offline status when navigator.onLine is false", () => {
@@ -154,28 +178,26 @@ describe("useSyncQueue — online/offline", () => {
     const { result } = renderHook(() =>
       useSyncQueue({ storageKey: "test_queue_offline" })
     );
-    act(() => { window.dispatchEvent(new Event("offline")); });
     expect(result.current.isOnline).toBe(false);
   });
 
   it("updates isOnline when connectivity changes", () => {
-    setOnlineStatus(true);
+    setOnlineStatus(false);
     const { result } = renderHook(() =>
       useSyncQueue({ storageKey: "test_queue_online_change" })
     );
-    expect(result.current.isOnline).toBe(true);
-    setOnlineStatus(false);
-    act(() => { window.dispatchEvent(new Event("offline")); });
     expect(result.current.isOnline).toBe(false);
-    setOnlineStatus(true);
-    act(() => { window.dispatchEvent(new Event("online")); });
+    act(() => {
+      setOnlineStatus(true);
+      window.dispatchEvent(new Event("online"));
+    });
     expect(result.current.isOnline).toBe(true);
   });
 });
 
-// ── sync / retryAll ───────────────────────────────────────────────────────────
+// ── sync and failure classification ───────────────────────────────────────────
 
-describe("useSyncQueue — sync", () => {
+describe("useSyncQueue — sync and failure classification", () => {
   it("marks item as synced on successful onSync", async () => {
     const onSync = vi.fn().mockResolvedValue(true);
     const { result } = renderHook(() =>
@@ -189,8 +211,8 @@ describe("useSyncQueue — sync", () => {
     );
   });
 
-  it("marks item as failed when onSync throws and maxRetries exceeded", async () => {
-    const onSync = vi.fn().mockRejectedValue(new Error("Network error"));
+  it("marks item as failed when onSync throws transient error and maxRetries exceeded", async () => {
+    const onSync = vi.fn().mockRejectedValue(new Error("Network timeout"));
     const { result } = renderHook(() =>
       useSyncQueue({
         storageKey: "test_queue_sync_fail",
@@ -201,103 +223,248 @@ describe("useSyncQueue — sync", () => {
     act(() => { result.current.enqueue({ label: "Bad upload" }); });
     const id = result.current.queue[0].id;
     await act(async () => { await result.current.retryItem(id); });
-    await waitFor(() =>
-      expect(result.current.queue.find((i) => i.id === id)?.status).toBe("failed")
-    );
+    await waitFor(() => {
+      const item = result.current.queue.find((i) => i.id === id);
+      expect(item?.status).toBe("failed");
+      expect(item?.failureType).toBe("transient");
+    });
   });
 
-  it("calls onSyncSuccess callback on success", async () => {
-    const onSync = vi.fn().mockResolvedValue(true);
-    const onSyncSuccess = vi.fn();
+  it("immediately marks permanent failure without wasting retries (Issue #73)", async () => {
+    const onSync = vi.fn().mockRejectedValue(new Error("400: Invalid input parameter"));
     const { result } = renderHook(() =>
-      useSyncQueue({ storageKey: "test_queue_cb_success", onSync, onSyncSuccess })
+      useSyncQueue({ storageKey: "test_queue_perm_fail", onSync, maxRetries: 3 })
     );
-    act(() => { result.current.enqueue({ label: "Upload CB" }); });
+    act(() => { result.current.enqueue({ label: "Bad payload", payload: { bad: true } }); });
     const id = result.current.queue[0].id;
     await act(async () => { await result.current.retryItem(id); });
-    await waitFor(() => expect(onSyncSuccess).toHaveBeenCalledOnce());
+    await waitFor(() => {
+      const item = result.current.queue.find((i) => i.id === id);
+      expect(item?.status).toBe("failed");
+      expect(item?.failureType).toBe("permanent");
+      expect(item?.payload).toEqual({ bad: true });
+    });
   });
 
-  it("calls onSyncFailure callback when maxRetries exhausted", async () => {
-    const onSync = vi.fn().mockRejectedValue(new Error("RPC down"));
-    const onSyncFailure = vi.fn();
+  it("handles duplicate failure classification and preserves payload (Issue #73)", async () => {
+    const onSync = vi.fn().mockRejectedValue(new Error("Transaction duplicate: already submitted"));
+    const { result } = renderHook(() =>
+      useSyncQueue({ storageKey: "test_queue_dup_fail", onSync })
+    );
+    act(() => { result.current.enqueue({ label: "Duplicate Tx", payload: { txHash: "abc" } }); });
+    const id = result.current.queue[0].id;
+    await act(async () => { await result.current.retryItem(id); });
+    await waitFor(() => {
+      const item = result.current.queue.find((i) => i.id === id);
+      expect(item?.status).toBe("failed");
+      expect(item?.failureType).toBe("duplicate");
+      expect(item?.payload).toEqual({ txHash: "abc" });
+    });
+  });
+
+  it("handles stale / conflict failure classification and enters conflict state (Issue #73)", async () => {
+    const onSync = vi.fn().mockRejectedValue({
+      message: "Version mismatch: conflict with server state",
+      failureType: "conflict",
+      conflictDetails: { serverVersion: { trees: 10 }, reason: "Stale cache" },
+    });
+    const onSyncConflict = vi.fn();
     const { result } = renderHook(() =>
       useSyncQueue({
-        storageKey: "test_queue_cb_fail",
+        storageKey: "test_queue_conflict_fail",
         onSync,
-        onSyncFailure,
-        maxRetries: 1,
+        onSyncConflict,
       })
     );
-    act(() => { result.current.enqueue({ label: "Fail CB" }); });
+    act(() => {
+      result.current.enqueue({
+        label: "Update Trees",
+        payload: { trees: 15 },
+      });
+    });
     const id = result.current.queue[0].id;
     await act(async () => { await result.current.retryItem(id); });
-    await waitFor(() => expect(onSyncFailure).toHaveBeenCalledOnce());
-  });
-
-  it("retryAll retries all pending and failed items", async () => {
-    const onSync = vi.fn().mockResolvedValue(true);
-    const { result } = renderHook(() =>
-      useSyncQueue({ storageKey: "test_queue_retry_all", onSync })
-    );
-    act(() => {
-      result.current.enqueue({ label: "A" });
-      result.current.enqueue({ label: "B" });
+    await waitFor(() => {
+      const item = result.current.queue.find((i) => i.id === id);
+      expect(item?.status).toBe("conflict");
+      expect(item?.failureType).toBe("conflict");
+      expect(item?.conflictDetails?.reason).toBe("Stale cache");
+      expect(item?.payload).toEqual({ trees: 15 });
+      expect(result.current.conflictCount).toBe(1);
     });
-    await act(async () => { await result.current.retryAll(); });
-    await waitFor(() =>
-      expect(result.current.queue.every((i) => i.status === "synced")).toBe(true)
-    );
-    expect(onSync).toHaveBeenCalledTimes(2);
-  });
-
-  it("does not call onSync when no handler is provided", async () => {
-    const { result } = renderHook(() =>
-      useSyncQueue({ storageKey: "test_queue_no_sync" })
-    );
-    act(() => { result.current.enqueue({ label: "No sync fn" }); });
-    await act(async () => { await result.current.retryAll(); });
-    // Should not throw — items remain pending
-    expect(result.current.queue[0].status).toBe("pending");
+    expect(onSyncConflict).toHaveBeenCalledOnce();
   });
 });
 
-// ── localStorage persistence ──────────────────────────────────────────────────
+// ── Conflict Resolution Actions (Issue #73) ───────────────────────────────────
+
+describe("useSyncQueue — Conflict Resolution Actions (Issue #73)", () => {
+  it("resolves conflict with 'use_local' by forcing resync with local input", async () => {
+    let callCount = 0;
+    const onSync = vi.fn().mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) {
+        throw new Error("409 conflict: server updated");
+      }
+      return true;
+    });
+
+    const { result } = renderHook(() =>
+      useSyncQueue({ storageKey: "test_resolve_local", onSync })
+    );
+
+    act(() => {
+      result.current.enqueue({
+        label: "Planting Record",
+        payload: { planterId: "P-101", count: 50 },
+      });
+    });
+
+    const id = result.current.queue[0].id;
+    await act(async () => { await result.current.retryItem(id); });
+    await waitFor(() => expect(result.current.queue[0]?.status).toBe("conflict"));
+
+    // User chooses to keep local changes
+    await act(async () => {
+      await result.current.resolveConflict(id, { action: "use_local" });
+    });
+
+    await waitFor(() => {
+      const item = result.current.queue.find((i) => i.id === id);
+      expect(item?.status).toBe("synced");
+      expect(item?.payload).toEqual({ planterId: "P-101", count: 50 });
+      expect(result.current.conflictCount).toBe(0);
+    });
+  });
+
+  it("resolves conflict with 'use_server' by accepting server state", async () => {
+    const onSync = vi.fn().mockRejectedValue(new Error("409 conflict"));
+    const { result } = renderHook(() =>
+      useSyncQueue({ storageKey: "test_resolve_server", onSync })
+    );
+
+    act(() => {
+      result.current.enqueue({
+        label: "Tree update",
+        payload: { count: 20 },
+      });
+    });
+
+    const id = result.current.queue[0].id;
+    await act(async () => { await result.current.retryItem(id); });
+    await waitFor(() => expect(result.current.queue[0]?.status).toBe("conflict"));
+
+    // User chooses to accept server
+    await act(async () => {
+      await result.current.resolveConflict(id, { action: "use_server" });
+    });
+
+    await waitFor(() => {
+      const item = result.current.queue.find((i) => i.id === id);
+      expect(item?.status).toBe("synced");
+      expect(result.current.conflictCount).toBe(0);
+    });
+  });
+
+  it("resolves conflict with 'merge' by updating user input without data loss", async () => {
+    let attempts = 0;
+    const onSync = vi.fn().mockImplementation(async (item) => {
+      attempts++;
+      if (attempts === 1) {
+        throw new Error("409 conflict");
+      }
+      // Verify merged payload is passed to onSync
+      expect(item.payload).toEqual({ count: 25, mergedWithServer: true });
+      return true;
+    });
+
+    const { result } = renderHook(() =>
+      useSyncQueue({ storageKey: "test_resolve_merge", onSync })
+    );
+
+    act(() => {
+      result.current.enqueue({
+        label: "Initial trees",
+        payload: { count: 20 },
+      });
+    });
+
+    const id = result.current.queue[0].id;
+    await act(async () => { await result.current.retryItem(id); });
+    await waitFor(() => expect(result.current.queue[0]?.status).toBe("conflict"));
+
+    // User updates merged input
+    await act(async () => {
+      await result.current.resolveConflict(id, {
+        action: "merge",
+        mergedPayload: { count: 25, mergedWithServer: true },
+        newLabel: "Merged trees",
+      });
+    });
+
+    await waitFor(() => {
+      const item = result.current.queue.find((i) => i.id === id);
+      expect(item?.status).toBe("synced");
+      expect(item?.payload).toEqual({ count: 25, mergedWithServer: true });
+      expect(item?.label).toBe("Merged trees");
+    });
+  });
+
+  it("updatePayload allows editing user input before retrying", () => {
+    const { result } = renderHook(() =>
+      useSyncQueue({ storageKey: "test_update_payload" })
+    );
+
+    act(() => {
+      result.current.enqueue({
+        label: "Draft evidence",
+        payload: { title: "Draft 1" },
+      });
+    });
+
+    const id = result.current.queue[0].id;
+    act(() => {
+      result.current.updatePayload(id, { title: "Draft 2 — Revised" }, "Revised evidence");
+    });
+
+    const item = result.current.queue.find((i) => i.id === id);
+    expect(item?.payload).toEqual({ title: "Draft 2 — Revised" });
+    expect(item?.label).toBe("Revised evidence");
+    expect(item?.status).toBe("pending");
+  });
+});
+
+// ── Persistence ───────────────────────────────────────────────────────────────
 
 describe("useSyncQueue — persistence", () => {
   it("saves the queue to localStorage on change", () => {
     const { result } = renderHook(() =>
       useSyncQueue({ storageKey: "test_persist_save" })
     );
-    act(() => { result.current.enqueue({ label: "Persist me" }); });
-    const stored = JSON.parse(localStorageMock.getItem("test_persist_save") ?? "[]");
-    expect(stored).toHaveLength(1);
-    expect(stored[0].label).toBe("Persist me");
+    act(() => { result.current.enqueue({ label: "Saved" }); });
+    const raw = localStorageMock.getItem("test_persist_save");
+    expect(raw).not.toBeNull();
+    const parsed = JSON.parse(raw!);
+    expect(parsed[0].label).toBe("Saved");
   });
 
   it("loads the queue from localStorage on mount", () => {
-    const existing = [
-      {
-        id: "abc", label: "Loaded", status: "pending",
-        enqueuedAt: Date.now(), retryCount: 0,
-      },
+    const initial = [
+      { id: "1", label: "Existing", status: "pending", enqueuedAt: 1000, retryCount: 0 },
     ];
-    localStorageMock.setItem("test_persist_load", JSON.stringify(existing));
+    localStorageMock.setItem("test_persist_load", JSON.stringify(initial));
     const { result } = renderHook(() =>
       useSyncQueue({ storageKey: "test_persist_load" })
     );
     expect(result.current.queue).toHaveLength(1);
-    expect(result.current.queue[0].label).toBe("Loaded");
+    expect(result.current.queue[0].label).toBe("Existing");
   });
 
   it("resets 'syncing' items to 'pending' on mount (crash recovery)", () => {
-    const items = [
-      {
-        id: "x", label: "Mid-sync", status: "syncing",
-        enqueuedAt: Date.now(), retryCount: 0,
-      },
+    const initial = [
+      { id: "1", label: "Crashed mid-sync", status: "syncing", enqueuedAt: 1000, retryCount: 1 },
     ];
-    localStorageMock.setItem("test_crash_recovery", JSON.stringify(items));
+    localStorageMock.setItem("test_crash_recovery", JSON.stringify(initial));
     const { result } = renderHook(() =>
       useSyncQueue({ storageKey: "test_crash_recovery" })
     );

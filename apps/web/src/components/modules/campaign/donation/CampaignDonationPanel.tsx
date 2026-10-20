@@ -196,8 +196,9 @@ export function CampaignDonationPanel({
               type="button"
               data-testid={`donation-preset-${preset}`}
               aria-pressed={amount === preset}
+              aria-label={`Select ${preset} ${token}`}
               onClick={() => setAmount(preset)}
-              className={`rounded-lg border px-3 py-1.5 text-sm transition ${
+              className={`min-h-[36px] min-w-[36px] rounded-lg border px-3 py-1.5 text-sm transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 ${
                 amount === preset
                   ? "border-emerald-400 bg-emerald-400/10 text-emerald-200"
                   : "border-white/10 text-zinc-300 hover:border-white/30"
@@ -221,6 +222,10 @@ export function CampaignDonationPanel({
             min="1"
             step="1"
             placeholder="0"
+            required
+            aria-required="true"
+            aria-invalid={Boolean(error)}
+            aria-describedby={error ? "donation-error" : undefined}
             value={amount}
             onChange={(event) => setAmount(event.target.value)}
             className="mt-2 w-full"
@@ -233,6 +238,7 @@ export function CampaignDonationPanel({
           <select
             id="donation-token"
             data-testid="donation-token"
+            aria-label="Select donation token currency"
             value={token}
             onChange={(event) => setToken(event.target.value as DonationToken)}
             className="mt-2 h-10 w-full sm:w-auto rounded-md border border-white/10 bg-black/30 px-3 text-sm text-zinc-100"
@@ -258,25 +264,29 @@ export function CampaignDonationPanel({
           value={message}
           onChange={(event) => setMessage(event.target.value)}
           placeholder="Add a note of encouragement…"
-          className="mt-2 w-full rounded-md border border-white/10 bg-black/30 p-3 text-sm text-zinc-100"
+          className="mt-2 w-full rounded-md border border-white/10 bg-black/30 p-3 text-sm text-zinc-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
         />
         <p className="mt-1 text-right text-xs text-zinc-500">
           {message.length}/{MAX_DONATION_MESSAGE_LENGTH}
         </p>
       </div>
 
-      <label className="mt-2 inline-flex items-center gap-2 text-sm text-zinc-300">
+      <div className="mt-2 inline-flex items-center gap-2">
         <input
           type="checkbox"
+          id="donation-anonymous"
           data-testid="donation-anonymous"
           checked={anonymous}
           onChange={(event) => setAnonymous(event.target.checked)}
+          className="h-4 w-4 rounded border-white/10 bg-black/30 text-emerald-500 focus-visible:ring-2 focus-visible:ring-emerald-400"
         />
-        Donate anonymously
-      </label>
+        <label htmlFor="donation-anonymous" className="cursor-pointer text-sm text-zinc-300">
+          Donate anonymously
+        </label>
+      </div>
 
       {error && (
-        <p role="alert" data-testid="donation-error" className="mt-5 text-sm text-red-300">
+        <p role="alert" id="donation-error" data-testid="donation-error" className="mt-5 text-sm text-red-300">
           {error}
         </p>
       )}
@@ -284,6 +294,7 @@ export function CampaignDonationPanel({
       <Button
         type="button"
         data-testid="donation-submit"
+        aria-label={submitting ? "Recording donation" : `Submit donation of ${amount ? `${amount} ${token}` : "selected amount"}`}
         disabled={submitting}
         onClick={submit}
         className="mt-6 w-full sm:w-auto"
