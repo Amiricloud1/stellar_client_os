@@ -923,4 +923,99 @@ pub enum Error {
         let id = client.create_campaign(&creator, &token, &10_000, &5_000, &2_000);
         client.get_campaign_cost_per_tree(&id, &0);
     }
+
+    // ---------------------------------------------------------------------------
+    // Arithmetic audit regression tests (Issue #20)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_checked_math_audit_overflow_boundaries() {
+        use crate::checked_math::CheckedMath;
+
+        // Addition overflow
+        assert_eq!(
+            CheckedMath::add(i128::MAX, 1),
+            Err(Error::ArithmeticOverflow)
+        );
+        assert_eq!(
+            CheckedMath::add(i128::MAX, i128::MAX),
+            Err(Error::ArithmeticOverflow)
+        );
+
+        // Subtraction underflow (preventing negative balances)
+        assert_eq!(
+            CheckedMath::sub(100, 200),
+            Err(Error::ArithmeticOverflow)
+        );
+        assert_eq!(
+            CheckedMath::sub(0, 1),
+            Err(Error::ArithmeticOverflow)
+        );
+
+        // Multiplication overflow
+        assert_eq!(
+            CheckedMath::mul(i128::MAX / 2 + 1, 2),
+            Err(Error::ArithmeticOverflow)
+        );
+
+        // Division by zero
+        assert_eq!(
+            CheckedMath::div(100, 0),
+            Err(Error::InvalidAmount)
+        );
+
+        // Basis points precision & overflow boundaries
+        assert_eq!(CheckedMath::mul_bps(0, 500), Ok(0));
+        assert_eq!(CheckedMath::mul_bps(10_000, 250), Ok(250)); // 2.5%
+        assert_eq!(
+            CheckedMath::mul_bps(i128::MAX, 10_000),
+            Err(Error::ArithmeticOverflow)
+        );
+
+        // Positive amount validation
+        assert_eq!(CheckedMath::validate_positive_amount(1), Ok(()));
+        assert_eq!(
+            CheckedMath::validate_positive_amount(0),
+            Err(Error::InvalidAmount)
+        );
+        assert_eq!(
+            CheckedMath::validate_positive_amount(-100),
+            Err(Error::InvalidAmount)
+        );
+    }
+
+    #[test]
+    fn test_campaign_funding_arithmetic_audit_rounding_and_units() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, token_admin_client) = create_token(&env, &token_admin);
+        let creator = Address::generate(&env);
+        let sponsor = Address::generate(&env);
+
+        token_admin_client.mint(&sponsor, &100_000);
+        let id = client.create_campaign(&creator, &token_addr, &10_000, &5_000, &2_000);
+
+        // Rounding down integer trees
+        // 1 tree = 100 base cost (1x pricing initially)
+        // 99 contributed => 0 trees
+        let zero_trees = client.calculate_trees_for_contribution(&id, &99, &100);
+        assert_eq!(zero_trees, 0);
+
+        // 199 contributed => 1 tree
+        let one_tree = client.calculate_trees_for_contribution(&id, &199, &100);
+        assert_eq!(one_tree, 1);
+
+        // 50% funded boundary -> 1.1x pricing (cost becomes 110)
+        client.contribute(&sponsor, &id, &5_000);
+        let cost_at_50 = client.get_campaign_cost_per_tree(&id, &100);
+        assert_eq!(cost_at_50, 110);
+        // 220 contributed => exactly 2 trees
+        assert_eq!(client.calculate_trees_for_contribution(&id, &220, &100), 2);
+        // 229 contributed => still 2 trees (truncation/floor)
+        assert_eq!(client.calculate_trees_for_contribution(&id, &229, &100), 2);
+    }
 }
+
