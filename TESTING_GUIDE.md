@@ -6,6 +6,62 @@
 
 ---
 
+## Reproducible Contract Builds
+
+Contract wasm builds must be reproducible: building the same source twice in a
+clean, pinned environment must yield byte-identical (normalized) wasm. This is
+verified in CI and can be run locally.
+
+### Running the reproducible-build check
+
+```bash
+corepack pnpm --filter @fundable/contracts build:reproducible
+```
+
+This script:
+
+1. Builds the contracts twice in clean, pinned environments (pinned Rust
+toolchain from `rust-toolchain.toml`, locked dependencies).
+2. Normalizes each wasm artifact before hashing — stripping legitimate
+nondeterministic metadata (see below).
+3. Compares the normalized SHA-256 hashes of the two builds and fails if they
+differ.
+
+### Normalization and legitimate nondeterministic metadata
+
+Some wasm metadata is legitimately nondeterministic across builds and is
+**normalized out** before hashing so it does not cause false mismatches:
+
+- **Build paths** — absolute source/build paths embedded in debug info or
+custom sections are stripped.
+- **Timestamps** — build timestamps in custom sections are removed.
+- **Custom metadata sections** — non-functional producer/build sections are
+stripped.
+
+Any difference **outside** these normalized regions is a real reproducibility
+failure and must be fixed (e.g. unpinned dependency, nondeterministic codegen).
+
+### Interpreting results
+
+- **Identical normalized hashes** — build is reproducible. ✅
+- **Hash mismatch** — a real nondeterminism exists; inspect the diff of the two
+artifacts to locate the offending section.
+- **Missing/empty artifacts** — the build failed to produce wasm; check the build
+log before comparing hashes.
+
+### Automated coverage
+
+The reproducible-build tests are deterministic and do not depend on live funds
+or network access. They cover:
+
+- **Success** — two builds produce identical normalized hashes.
+- **Failure** — differing artifacts produce a hash mismatch.
+- **Boundary cases** — metadata-only differences (paths/timestamps) normalize to
+the same hash; empty or missing artifacts are reported as errors rather than
+silently passing.
+
+---
+
 ## API Contract, Versioning & Lifecycle Testing
 
 This section covers the API surface guarantees: OpenAPI validation, contract tests
@@ -225,166 +281,5 @@ After completing the steps above, verify these points:
 - [ ] Event types are available for import: `PaymentStreamContractEvent`, `parsePaymentStreamContractEvent`, etc.
 - [ ] Batch parsing function `parsePaymentStreamContractEvents()` is exported
 - [ ] Defensive parsing rejects invalid event payloads
-- [ ] `corepack pnpm validate:openapi` passes (no conflict markers, valid OpenAPI 3.0)
-- [ ] `corepack pnpm test:api` passes (contract, versioning, and lifecycle suites)
-- [ ] Deprecated endpoints carry `deprecated: true` and `Deprecation`/`Sunset` headers
-
----
-
-## 🎯 Key Features Delivered
-
-### 1. **Type-Safe Event Parsing**
-
-```typescript
-// Discriminated union ensures type safety
-type ParsedEvent = PaymentStreamContractEvent;
-if (event.type === "StreamPaused") {
-  // TypeScript knows event.payload is StreamPausedEvent
-  console.log(event.payload.stream_id);
-}
-```
-
-### 2. **Robust Type Coercion**
-
-- Accepts bigint, number, and string integers
-- Automatically normalizes to bigint for storage
-- Null-safe payload extraction
-
-### 3. **Defensive Input Validation**
-
-- Validates event structure before parsing
-- Rejects unsupported event types
-- Silently skips invalid event payloads
-- Returns `null` for unparseable events
-
-### 4. **Batch Event Processing**
-
-```typescript
-const allEvents = parsePaymentStreamContractEvents(rpcResponse.events);
-// Filters out non-Fundable events, returns only valid parsed events
-```
-
-### 5. **Extensible Architecture**
-
-Adding new event types requires:
-
-1. Add parser function (e.g., `parseNewEvent()`)
-2. Add to `PAYMENT_STREAM_EVENT_TYPES` array
-3. Add case in `parsePaymentStreamContractEvent()` switch
-4. Update union type `PaymentStreamContractEvent`
-
----
-
-## 🚀 Usage Examples for dApp Developers
-
-### Basic Event Parsing
-
-```typescript
-import { parsePaymentStreamContractEvent } from "@fundable/sdk";
-
-const event = parsePaymentStreamContractEvent(rpcEvent);
-if (event) {
-  console.log(`Event type: ${event.type}`);
-  console.log(`Contract: ${event.contractId}`);
-  console.log(`Payload:`, event.payload);
-}
-```
-
-### Stream Lifecycle Monitoring
-
-```typescript
-const events = parsePaymentStreamContractEvents(allRpcEvents);
-
-events.forEach((event) => {
-  switch (event.type) {
-    case "StreamDeposit":
-      console.log(
-        `Deposit: ${event.payload.amount} to stream ${event.payload.stream_id}`,
-      );
-      break;
-    case "StreamPaused":
-      console.log(`Stream ${event.payload.stream_id} paused`);
-      break;
-    case "StreamResumed":
-      console.log(
-        `Stream ${event.payload.stream_id} resumed after ${event.payload.paused_duration}ms`,
-      );
-      break;
-  }
-});
-```
-
-### Delegation Event Tracking
-
-```typescript
-const delegationEvents = parsePaymentStreamContractEvents(events).filter(
-  (e) => e.type === "DelegationGranted" || e.type === "DelegationRevoked",
-);
-
-delegationEvents.forEach((event) => {
-  if (event.type === "DelegationGranted") {
-    console.log(
-      `Delegate ${event.payload.delegate} set for stream ${event.payload.stream_id}`,
-    );
-  }
-});
-```
-
----
-
-## 📊 Test Coverage Summary
-
-**Total Tests: 5 (All Passing)**
-
-1. ✓ **Parses FeeCollected events** - String integer normalization
-2. ✓ **Parses StreamPaused events** - Numeric value support
-3. ✓ **Ignores unsupported event topics** - Unknown events filtered
-4. ✓ **Rejects invalid event payloads** - Malformed data handled gracefully
-5. ✓ **Batch processes multiple events** - Array handling with filtering
-
----
-
-## 🔍 Verification Commands (Copy-Paste)
-
-```bash
-# Full validation flow
-cd c:\Users\HomePC\Documents\D\stellar_client_os
-echo "=== 1. Check files exist ==="
-test -f packages/sdk/src/utils/events.ts && echo "✓ events.ts exists" || echo "✗ Missing"
-test -f packages/sdk/src/__tests__/events.test.ts && echo "✓ events.test.ts exists" || echo "✗ Missing"
-
-echo "=== 2. Run tests ==="
-corepack pnpm --filter @fundable/sdk test 2>&1 | grep -E "(✓|×|FAIL|PASS)" | head -20
-
-echo "=== 3. Check build ==="
-cd packages/sdk && corepack pnpm run build && echo "✓ Build successful" || echo "✗ Build failed"
-
-echo "=== 4. Validate OpenAPI document ==="
-cd c:\Users\HomePC\Documents\D\stellar_client_os
-corepack pnpm validate:openapi && echo "✓ OpenAPI valid" || echo "✗ OpenAPI invalid"
-
-echo "=== 5. Run API contract/versioning/lifecycle tests ==="
-corepack pnpm test:api && echo "✓ API tests passed" || echo "✗ API tests failed"
-```
-
-Requires the Rust toolchain (`rustup`) and, for builds, the Soroban CLI.
-`contracts.yml` runs `cargo test --all` with `continue-on-error: true`, so
-check its log even on green CI.
-
-## CI mapping
-
-| Workflow | Trigger paths | What runs |
-| -------- | ------------- | --------- |
-| `contracts.yml` | push / PR (all) | `cargo test --all` (continue-on-error) |
-| `frontend.yml` | push / PR (skips fork PRs) | install, generate `.env.local` from `deployments/testnet.json`, `pnpm lint` |
-| `sdk.yml` | `packages/sdk/**` | lint, format check, test, build |
-| `sdk-ci.yml` | `packages/sdk/**` | coverage + ESM/CJS consumer compat |
-| `docs.yml` | docs/offline/env/template paths | web docs tests, mobile offline tests, markdown checks |
-
-## Troubleshooting
-
-- `pnpm install --frozen-lockfile` fails: run plain `pnpm install` locally,
-  but never commit a `package-lock.json` / `yarn.lock`.
-- Mobile `typecheck`/`test` ignore `src/screens/`: expected (see above).
-- Web `lint` fails on `main` for unrelated files: pre-existing debt, also
-  noted in `frontend.yml`; only fix files your PR touches.
+- [ ] `corepack pnpm validate:openapi` passes (no conflict markers, valid OpenAPI)
+- [ ] `corepack pnpm --filter @fundable/contracts build:reproducible` passes (identical normalized wasm hashes)

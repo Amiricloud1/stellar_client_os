@@ -38,3 +38,122 @@ jobs:
         working-directory: contracts
         run: cargo test --all
         continue-on-error: true
+
+  reproducible-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.84.0"
+          targets: wasm32-unknown-unknown
+
+      - name: Install Stellar cli
+        uses: stellar/stellar-cli@v23.0.1
+
+      - name: Build contracts (pass 1)
+        working-directory: contracts
+        run: |
+          set -euo pipefail
+          rm -rf target/wasm32-unknown-unknown/release
+          stellar contract build
+          mkdir -p /tmp/build-pass-1
+          find target/wasm32-unknown-unknown/release -maxdepth 1 -name '*.wasm' -exec cp {} /tmp/build-pass-1/ \;
+
+      - name: Build contracts (pass 2, clean)
+        working-directory: contracts
+        run: |
+          set -euo pipefail
+          cargo clean
+          stellar contract build
+          mkdir -p /tmp/build-pass-2
+          find target/wasm32-unknown-unknown/release -maxdepth 1 -name '*.wasm' -exec cp {} /tmp/build-pass-2/ \;
+
+      - name: Compare normalized wasm hashes
+        run: |
+          set -euo pipefail
+          # Normalize wasm before hashing so legitimate nondeterministic metadata
+          # (embedded build paths, timestamps, producer strings) does not cause
+          # false mismatches. The custom section "contractmetav0" and the
+          # "producers" custom section are stripped; the remaining bytes must be
+          # byte-identical across clean builds.
+          normalize() {
+            local src="$1"
+            local dst="$2"
+            if command -v wasm-strip >/dev/null 2>&1; then
+              wasm-strip "$src" -o "$dst"
+            else
+              # Fallback: strip custom sections via a small python helper.
+              python3 - "$src" "$dst" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, 'rb') as f:
+    data = f.read()
+assert data[:4] == b'\0asm', 'not a wasm module'
+out = bytearray(data[:8])
+i = 8
+while i < len(data):
+    sec_id = data[i]
+    i += 1
+    # read LEB128 section size
+    size = 0
+    shift = 0
+    while True:
+        b = data[i]
+        i += 1
+        size |= (b & 0x7f) << shift
+        shift += 7
+        if not (b & 0x80):
+            break
+    body = data[i:i+size]
+    i += size
+    # section id 0 is a custom section; drop it
+    if sec_id == 0:
+        continue
+    out.append(sec_id)
+    n = size
+    while True:
+        b = n & 0x7f
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            break
+    out.extend(body)
+with open(dst, 'wb') as f:
+    f.write(out)
+PY
+            fi
+          }
+
+          status=0
+          for wasm in /tmp/build-pass-1/*.wasm; do
+            name=$(basename "$wasm")
+            if [ ! -f "/tmp/build-pass-2/$name" ]; then
+              echo "::error::Missing artifact $name in second build pass"
+              status=1
+              continue
+            fi
+            normalize "$wasm" "/tmp/norm-1-$name"
+            normalize "/tmp/build-pass-2/$name" "/tmp/norm-2-$name"
+            h1=$(sha256sum "/tmp/norm-1-$name" | awk '{print $1}')
+            h2=$(sha256sum "/tmp/norm-2-$name" | awk '{print $1}')
+            if [ "$h1" != "$h2" ]; then
+              echo "::error::Non-reproducible build for $name ($h1 != $h2)"
+              status=1
+            else
+              echo "Reproducible: $name -> $h1"
+            fi
+          done
+
+          if [ -z "$(ls -A /tmp/build-pass-1/*.wasm 2>/dev/null)" ]; then
+            echo "::error::No wasm artifacts produced by first build pass"
+            status=1
+          fi
+
+          exit $status

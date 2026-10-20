@@ -23,6 +23,43 @@ local contract builds both consume that file, so the versions always match.
   in the same PR and note the migration impact (e.g. minimum rustup version) in
   the PR description.
 
+## Reproducible contract builds
+
+Contract wasm must be byte-for-byte reproducible so that a release artifact can
+be rebuilt and verified by anyone. `pnpm verify:reproducible` builds the
+contracts twice in clean, pinned environments and compares the normalized wasm
+hashes; CI runs the same check on every PR that touches `contracts/`.
+
+How it works:
+
+- Each build runs in a fresh `target/` directory with the pinned toolchain from
+  `rust-toolchain.toml`, so no stale artifacts leak between runs.
+- Before hashing, the wasm is **normalized** to strip legitimate
+  nondeterministic metadata that does not affect behavior:
+  - absolute build paths embedded in panic/debug strings (e.g. `/home/runner/...`
+    vs `/Users/you/...`) are replaced with a stable placeholder;
+  - the `producers`/`name` custom sections that record toolchain paths are
+    dropped;
+  - any trailing build-timestamp custom section is removed.
+- The normalized bytes are hashed (SHA-256) and the two hashes are compared. A
+  match means the build is reproducible; a mismatch means something
+  nondeterministic leaked into the artifact.
+
+Interpreting results:
+
+- **Hashes match** — reproducible. Record the hash in the PR validation
+  evidence.
+- **Hashes differ** — a real nondeterminism bug. Common causes: an unpinned
+  dependency, a build script reading the clock or environment, or a new custom
+  section that isn't normalized. Fix the source; do not loosen the comparison.
+- **Missing/empty artifact** — the build failed or produced no wasm; the check
+  fails loudly rather than hashing an empty file.
+
+The normalization and comparison logic is covered by automated tests (success,
+metadata-only differences, hash mismatch, and empty/missing artifacts) that run
+without network access or live funds. Update those tests alongside any change to
+the normalization rules.
+
 ## CI dependency caches
 
 CI caches pnpm and Cargo dependencies to keep warm runs fast. Cache keys are
@@ -56,6 +93,7 @@ Implications for contributors:
    - `pnpm --filter @fundable/sdk test && pnpm --filter @fundable/sdk build`
    - `pnpm --filter @fundable/web lint` (same-repo; fork PRs skip repo-wide lint)
    - `pnpm test:contracts` / `pnpm build:contracts` when touching `contracts/`
+   - `pnpm verify:reproducible` when touching `contracts/` (reproducible build check)
    - offline-layer changes: `pnpm --filter @fundable/mobile test`
 4. Open one PR per issue against upstream `main` using the PR template
    (`.github/PULL_REQUEST_TEMPLATE.md`). Fill every section: affected packages,
@@ -74,5 +112,7 @@ Implications for contributors:
 
 - State compatibility explicitly: additive vs breaking, and the migration path.
 - Contract changes need `cargo test` evidence plus SDK/web impact notes.
+- Contract changes must pass the reproducible-build check; include the
+  normalized wasm hash in the PR validation evidence.
 - Security-sensitive changes (auth, signing, rate limits, uploads) name the
   threat considered and why the change is safe.

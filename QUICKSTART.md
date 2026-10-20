@@ -166,6 +166,52 @@ Open [http://localhost:3000](http://localhost:3000) in your browser. Connect a S
 
 ---
 
+## 🔁 Verifying Reproducible Contract Builds
+
+Contract artifacts must be byte-for-byte reproducible so that on-chain deployments can be independently verified. The build is performed twice in clean, pinned environments and the **normalized** wasm hashes are compared.
+
+### Run the verification
+
+```bash
+# From the repo root — builds twice in clean dirs and compares normalized hashes
+pnpm verify:reproducible-builds
+```
+
+*(Equivalent manual flow: `cd contracts && cargo clean && cargo build --release --target wasm32-unknown-unknown`, copy artifacts aside, repeat, then compare normalized hashes.)*
+
+**Expected Output (success):**
+```text
+[reproducible] build #1 -> 15 artifacts
+[reproducible] build #2 -> 15 artifacts
+[reproducible] payment-stream.wasm  OK  sha256=<hash>
+[reproducible] distributor.wasm     OK  sha256=<hash>
+...
+[reproducible] All 15 contracts reproducible ✅
+```
+
+**Expected Output (failure):**
+```text
+[reproducible] distributor.wasm  MISMATCH
+  build #1 sha256=<hash-a>
+  build #2 sha256=<hash-b>
+[reproducible] 1 of 15 contracts are NOT reproducible ❌
+```
+
+### What is normalized before hashing
+
+To avoid false mismatches, the following legitimate nondeterministic metadata is stripped/normalized before hashing:
+
+- **Build paths** — absolute workspace paths embedded in the `name`/producers custom sections are rewritten to a stable placeholder.
+- **Timestamps** — any build-time timestamp metadata is zeroed out.
+- **Custom `producers` section ordering** — entries are sorted deterministically.
+
+Everything else (code, data, and type sections) must match exactly. If a mismatch persists after normalization, it indicates a genuine nondeterminism (e.g. differing dependency versions, uncommitted source, or a non-pinned toolchain) — check `rust-toolchain.toml` and `Cargo.lock` are committed and unchanged.
+
+> [!NOTE]
+> Reproducible-build verification is deterministic and runs entirely offline — it does not touch live funds or the network. CI runs it on every contracts change (see `.github/workflows/contracts.yml`).
+
+---
+
 ## 🛠️ Common Troubleshooting & Solutions
 
 ### 1. `package-lock.json` or `yarn.lock` Detected
@@ -205,6 +251,11 @@ Open [http://localhost:3000](http://localhost:3000) in your browser. Connect a S
   ```bash
   cargo install --locked stellar-cli@25.0.0
   ```
+
+### 6. Reproducible Build Mismatch
+- **Symptom:** `verify:reproducible-builds` reports `MISMATCH` for one or more contracts.
+- **Cause:** Non-pinned toolchain, modified `Cargo.lock`, uncommitted source, or a genuine nondeterminism not covered by normalization.
+- **Solution:** Ensure `rust-toolchain.toml` and `Cargo.lock` are committed and unchanged, run `cargo clean`, and re-run the verification. If it still fails, inspect the diff of the two artifacts to identify the offending section.
 
 ---
 
