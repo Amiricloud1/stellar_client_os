@@ -278,3 +278,58 @@ fn test_verify_trees_batch_is_atomic_on_mid_batch_failure() {
     assert_eq!(result, Err(Ok(AuditError::TreeAlreadyVerified)));
     assert!(client.get_tree_verification(&400).is_none());
 }
+
+#[test]
+fn test_get_audit_trail_paginated_empty() {
+    let env = Env::default();
+    let client = setup_tree_env(&env);
+    let (entries, next_cursor) = client.get_audit_trail_paginated(&999, &None, &10);
+    assert_eq!(entries.len(), 0);
+    assert_eq!(next_cursor, None);
+}
+
+#[test]
+fn test_get_audit_trail_paginated_boundaries_and_cursors() {
+    let env = Env::default();
+    let client = setup_tree_env(&env);
+    let submitter = Address::generate(&env);
+    let verifier = Address::generate(&env);
+    let campaign_id = 42u64;
+
+    // Log 5 distinct activities
+    client.log_submitted_for_review(&campaign_id, &submitter, &String::from_str(&env, "Submit"));
+    client.log_verifier_comments(&campaign_id, &verifier, &String::from_str(&env, "Comment 1"));
+    client.log_photo_uploaded(&campaign_id, &submitter, &String::from_str(&env, "hash1"));
+    client.log_verifier_comments(&campaign_id, &verifier, &String::from_str(&env, "Comment 2"));
+    client.log_approved(&campaign_id, &verifier, &String::from_str(&env, "Approved"));
+
+    // Page 1: limit 2, start from None -> items with id 1, 2
+    let (page1, cursor1) = client.get_audit_trail_paginated(&campaign_id, &None, &2);
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page1.get(0).unwrap().id, 1);
+    assert_eq!(page1.get(1).unwrap().id, 2);
+    assert_eq!(cursor1, Some(2));
+
+    // Page 2: limit 2, start from cursor1 -> items with id 3, 4
+    let (page2, cursor2) = client.get_audit_trail_paginated(&campaign_id, &cursor1, &2);
+    assert_eq!(page2.len(), 2);
+    assert_eq!(page2.get(0).unwrap().id, 3);
+    assert_eq!(page2.get(1).unwrap().id, 4);
+    assert_eq!(cursor2, Some(4));
+
+    // Page 3: limit 2, start from cursor2 -> item with id 5
+    let (page3, cursor3) = client.get_audit_trail_paginated(&campaign_id, &cursor2, &2);
+    assert_eq!(page3.len(), 1);
+    assert_eq!(page3.get(0).unwrap().id, 5);
+    assert_eq!(cursor3, None); // End of log
+
+    // Repeated cursor query returns same page deterministically
+    let (page2_repeated, cursor2_repeated) = client.get_audit_trail_paginated(&campaign_id, &cursor1, &2);
+    assert_eq!(page2, page2_repeated);
+    assert_eq!(cursor2, cursor2_repeated);
+
+    // Invalid cursor beyond last id returns empty list
+    let (page_empty, cursor_empty) = client.get_audit_trail_paginated(&campaign_id, &Some(100), &2);
+    assert_eq!(page_empty.len(), 0);
+    assert_eq!(cursor_empty, None);
+}

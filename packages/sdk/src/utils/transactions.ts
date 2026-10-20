@@ -7,7 +7,38 @@
 
 import { AssembledTransaction } from "@stellar/stellar-sdk/contract";
 import { rpc } from "@stellar/stellar-sdk";
-import { parseContractError, FundableStellarError } from "./errors.js";
+import {
+  parseContractError,
+  FundableStellarError,
+  TransactionResubmissionError,
+} from "./errors.js";
+
+export { TransactionResubmissionError };
+
+/**
+ * Terminal and lifecycle statuses for transaction waiting
+ */
+export type TransactionWaitStatus =
+  | "SUCCESS"
+  | "FAILED"
+  | "PENDING"
+  | "NOT_FOUND"
+  | "EXPIRED"
+  | "TIMEOUT"
+  | "ABORTED";
+
+/**
+ * Enum representation of TransactionWaitStatus
+ */
+export const TransactionWaitStatusEnum = {
+  SUCCESS: "SUCCESS" as const,
+  FAILED: "FAILED" as const,
+  PENDING: "PENDING" as const,
+  NOT_FOUND: "NOT_FOUND" as const,
+  EXPIRED: "EXPIRED" as const,
+  TIMEOUT: "TIMEOUT" as const,
+  ABORTED: "ABORTED" as const,
+};
 
 /**
  * Configuration options for waiting on a transaction
@@ -26,23 +57,78 @@ export interface WaitForTransactionOptions {
   pollInterval?: number;
 
   /**
-   * Callback function invoked on each poll attempt
+   * Optional AbortSignal to cancel waiting.
+   */
+  signal?: AbortSignal;
+
+  /**
+   * Whether to throw an error on non-success outcomes (FAILED, TIMEOUT, EXPIRED, ABORTED).
+   * When false, resolves with a typed TransactionWaitResult containing the status and error details.
+   * Default: true
+   */
+  throwOnFailure?: boolean;
+
+  /**
+   * Callback function invoked on each poll attempt.
    * @param attempt - Current attempt number (1-indexed)
    * @param elapsedMs - Elapsed time in milliseconds
    */
   onPoll?: (attempt: number, elapsedMs: number) => void;
+
+  /**
+   * Optional callback function invoked when transaction status transitions.
+   * @param status - Transaction wait status
+   */
+  onStatusChange?: (status: TransactionWaitStatus) => void;
 }
 
 /**
- * Result of a successful transaction wait
+ * Result of a transaction wait operation
  */
 export interface TransactionWaitResult<T = unknown> {
   /** Transaction hash */
   hash: string;
-  /** Ledger sequence number where transaction was included */
-  ledger: number;
+  /** Ledger sequence number where transaction was included (if confirmed) */
+  ledger?: number;
   /** Contract invocation result (if applicable) */
   result?: T;
+  /** Status of the transaction wait operation */
+  status: TransactionWaitStatus;
+  /** Error message or details if non-successful */
+  error?: string;
+  /** Raw resultXdr or response details if available */
+  resultXdr?: string;
+}
+
+/**
+ * Helper to sleep with AbortSignal cancellation support
+ */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      const err = new Error(signal.reason ? String(signal.reason) : "Transaction wait aborted");
+      err.name = "AbortError";
+      return reject(err);
+    }
+
+    const timer = setTimeout(() => {
+      if (signal) {
+        signal.removeEventListener("abort", onAbort);
+      }
+      resolve();
+    }, ms);
+
+    function onAbort() {
+      clearTimeout(timer);
+      const err = new Error(signal?.reason ? String(signal.reason) : "Transaction wait aborted");
+      err.name = "AbortError";
+      reject(err);
+    }
+
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
 }
 
 /**
@@ -50,26 +136,14 @@ export interface TransactionWaitResult<T = unknown> {
  *
  * This is a convenience method that simplifies the developer experience by
  * automatically polling for transaction confirmation after signing and sending.
+ * Supports status tracking, AbortSignal cancellation, and typed results.
  *
  * @typeParam T - The result type of the contract invocation
  * @param tx - The AssembledTransaction to wait for
  * @param rpcUrl - The Soroban RPC URL to use for polling
  * @param options - Configuration options
  * @returns Promise resolving to transaction confirmation details
- * @throws {Error} If timeout is exceeded or transaction fails
- *
- * @example
- * ```typescript
- * import { PaymentStreamClient, waitForTransaction } from '@fundable/sdk';
- *
- * const client = new PaymentStreamClient(options);
- * const tx = await client.createStream(params);
- * await tx.signAndSend({ signTransaction: signer });
- *
- * const result = await waitForTransaction(tx, rpcUrl);
- * console.log('Stream created:', result.result); // Stream ID
- * console.log('Ledger:', result.ledger);
- * ```
+ * @throws {FundableStellarError | Error} If timeout is exceeded, aborted, or transaction fails (when throwOnFailure is true)
  */
 export async function waitForTransaction<T = unknown>(
   tx: AssembledTransaction<T>,
@@ -79,94 +153,213 @@ export async function waitForTransaction<T = unknown>(
   const {
     timeout = 60000,
     pollInterval = 1000,
+    signal,
+    throwOnFailure = true,
     onPoll,
+    onStatusChange,
   } = options;
 
   // Ensure the transaction has been sent
-  const txHash = tx.signed?.hash().toString("hex");
+  const txHash = tx?.signed?.hash ? tx.signed.hash().toString("hex") : undefined;
   if (!txHash) {
-    throw new Error(
+    throw new TransactionError(
+      "wallet",
       "Transaction has not been signed and sent. " +
-      "Call signAndSend() first before waiting for confirmation.",
+        "Call signAndSend() first before waiting for confirmation.",
+      { retryable: true },
     );
   }
 
+  // Check cancellation before initiating polling
+  if (signal?.aborted) {
+    const errorMsg = signal.reason ? String(signal.reason) : "Transaction wait aborted";
+    if (!throwOnFailure) {
+      return {
+        hash: txHash,
+        status: "ABORTED",
+        error: errorMsg,
+      };
+    }
+    const abortErr = new Error(errorMsg);
+    abortErr.name = "AbortError";
+    throw abortErr;
+  }
+
+  const safePollInterval = Math.max(10, pollInterval);
   const server = new rpc.Server(rpcUrl);
   const startTime = Date.now();
   let attempt = 0;
+  let lastReportedStatus: TransactionWaitStatus | null = null;
+
+  const notifyStatus = (status: TransactionWaitStatus) => {
+    if (status !== lastReportedStatus) {
+      lastReportedStatus = status;
+      if (onStatusChange) {
+        try {
+          onStatusChange(status);
+        } catch (cbErr) {
+          const parsedError = parseContractError(
+            `Error in onStatusChange callback: ${cbErr instanceof Error ? cbErr.message : String(cbErr)}`,
+            "Transaction status callback",
+          );
+          throw new FundableStellarError(parsedError);
+        }
+      }
+    }
+  };
 
   while (Date.now() - startTime <= timeout) {
     attempt++;
     const elapsedMs = Date.now() - startTime;
 
+    if (signal?.aborted) {
+      notifyStatus("ABORTED");
+      const errorMsg = signal.reason ? String(signal.reason) : "Transaction wait aborted";
+      if (!throwOnFailure) {
+        return {
+          hash: txHash,
+          status: "ABORTED",
+          error: errorMsg,
+        };
+      }
+      const abortErr = new Error(errorMsg);
+      abortErr.name = "AbortError";
+      throw abortErr;
+    }
+
     try {
-      // Invoke callback if provided
+      // Invoke onPoll callback if provided
       if (onPoll) {
-        onPoll(attempt, elapsedMs);
+        try {
+          onPoll(attempt, elapsedMs);
+        } catch (cbErr) {
+          const parsedError = parseContractError(
+            `Error in onPoll callback: ${cbErr instanceof Error ? cbErr.message : String(cbErr)}`,
+            "Transaction polling callback",
+          );
+          throw new FundableStellarError(parsedError);
+        }
       }
 
       // Poll for transaction status
       const response = await server.getTransaction(txHash);
+      const respStatus = response?.status as string | undefined;
 
-      if (response.status === rpc.Api.GetTransactionStatus.SUCCESS) {
+      if (respStatus === rpc.Api.GetTransactionStatus.SUCCESS) {
+        notifyStatus("SUCCESS");
         return {
           hash: txHash,
           ledger: response.ledger,
           result: tx.result,
+          status: "SUCCESS",
         };
       }
 
-      if (response.status === rpc.Api.GetTransactionStatus.FAILED) {
-        // Parse the failed transaction result for better error messages
-        const error = parseContractError(
+      if (respStatus === rpc.Api.GetTransactionStatus.FAILED) {
+        notifyStatus("FAILED");
+        const parsedError = parseContractError(
           {
             resultXdr: response.resultXdr,
             message: `Transaction failed on ledger ${response.ledger}`,
           },
-          "Transaction confirmation"
+          "Transaction confirmation",
         );
-        
-        throw new FundableStellarError(error);
-      }
 
-      // Status is PENDING, continue polling
-      await new Promise(resolve => setTimeout(resolve, pollInterval));
-    } catch (rpcError) {
-      // Handle RPC errors
-      if (rpcError instanceof Error) {
-        if (rpcError instanceof FundableStellarError) {
-          throw rpcError;
+        if (!throwOnFailure) {
+          return {
+            hash: txHash,
+            ledger: response.ledger,
+            status: "FAILED",
+            error: parsedError.message,
+            resultXdr: response.resultXdr ? String(response.resultXdr) : undefined,
+          };
         }
 
-        // If it's our custom error, re-throw
+        throw new FundableStellarError(parsedError);
+      }
+
+      if (respStatus === "EXPIRED") {
+        notifyStatus("EXPIRED");
+        const errorMsg = `Transaction expired: ${txHash}`;
+        if (!throwOnFailure) {
+          return {
+            hash: txHash,
+            status: "EXPIRED",
+            error: errorMsg,
+          };
+        }
+        const parsedError = parseContractError(errorMsg, "Transaction confirmation");
+        throw new FundableStellarError(parsedError);
+      }
+
+      if (respStatus === (rpc.Api.GetTransactionStatus as any).NOT_FOUND || respStatus === "NOT_FOUND") {
+        notifyStatus("NOT_FOUND");
+      } else {
+        notifyStatus("PENDING");
+      }
+
+      // Status is PENDING or NOT_FOUND, sleep until next poll interval
+      await sleep(safePollInterval, signal);
+    } catch (rpcError) {
+      if (rpcError instanceof Error && rpcError.name === "AbortError") {
+        notifyStatus("ABORTED");
+        if (!throwOnFailure) {
+          return {
+            hash: txHash,
+            status: "ABORTED",
+            error: rpcError.message,
+          };
+        }
+        throw rpcError;
+      }
+
+      // Re-throw library errors directly
+      if (rpcError instanceof FundableStellarError) {
+        throw rpcError;
+      }
+
+      if (rpcError instanceof Error) {
+        // If it's a re-thrown error, keep it
         if (
           rpcError.message.includes("Transaction confirmation timeout") ||
-          rpcError.message.includes("Transaction failed on ledger")
+          rpcError.message.includes("Transaction failed on ledger") ||
+          rpcError.message.includes("Transaction expired")
         ) {
           throw rpcError;
         }
 
-        // If it's a "not found" error, transaction may not be submitted yet
-        if (rpcError.message.includes("not found")) {
-          // Continue polling
-          await new Promise(resolve => setTimeout(resolve, pollInterval));
+        // If it's a "not found" error, transaction may not be indexed yet
+        if (rpcError.message.toLowerCase().includes("not found")) {
+          notifyStatus("NOT_FOUND");
+          await sleep(safePollInterval, signal);
           continue;
         }
       }
 
-      // For other RPC errors, re-throw with better context
+      // For other RPC errors, re-throw with context
       const parsedError = parseContractError(
         `Error polling transaction status: ${rpcError instanceof Error ? rpcError.message : String(rpcError)}`,
-        "Transaction polling"
+        "Transaction polling",
       );
-      throw new FundableStellarError(parsedError);
+      throw new TransactionError("rpc", parsedError.message, {
+        hash: txHash,
+        retryable: true,
+        cause: rpcError,
+      });
     }
   }
 
-  const timeoutError = parseContractError(
-    `Transaction confirmation timeout after ${timeout}ms. Hash: ${txHash}`,
-    "Transaction confirmation"
-  );
+  notifyStatus("TIMEOUT");
+  const timeoutMsg = `Transaction confirmation timeout after ${timeout}ms. Hash: ${txHash}`;
+  if (!throwOnFailure) {
+    return {
+      hash: txHash,
+      status: "TIMEOUT",
+      error: timeoutMsg,
+    };
+  }
+
+  const timeoutError = parseContractError(timeoutMsg, "Transaction confirmation");
   throw new FundableStellarError(timeoutError);
 }
 
@@ -207,12 +400,19 @@ export async function signAndWait<T = unknown>(
   options: WaitForTransactionOptions = {},
 ): Promise<TransactionWaitResult<T>> {
   // Sign and send the transaction
-  await tx.signAndSend({
-    signTransaction: async (xdr: string) => ({
-      signedTxXdr: await signTransaction(xdr),
-    }),
-  });
+  try {
+    await tx.signAndSend({
+      signTransaction: async (xdr: string) => ({
+        signedTxXdr: await signTransaction(xdr),
+      }),
+    });
+  } catch (error) {
+    // Classify signing / submission failures (wallet, simulation, RPC) so the
+    // caller can map them to a safe recovery action.
+    throw classifyTransactionError(error);
+  }
 
   // Wait for confirmation
   return waitForTransaction(tx, rpcUrl, options);
 }
+

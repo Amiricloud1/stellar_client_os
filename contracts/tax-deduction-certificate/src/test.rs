@@ -239,3 +239,25 @@ fn test_inactive_partner_cannot_be_linked_or_issue() {
         Err(Ok(Error::CertificateNotFound))
     );
 }
+
+#[test]
+fn test_certificate_issuance_replay_safe_and_event_binding() {
+    let s = setup();
+    s.client.record_contribution(&s.recorder, &CAMPAIGN, &s.sponsor, &s.token, &1_000);
+
+    // Initial issuance
+    let cert_id = s.client.issue_certificate(&s.partner, &CAMPAIGN, &s.sponsor, &2026, &s.token);
+    assert_eq!(cert_id, 1);
+
+    // Replay attempt without new contribution must be rejected with AlreadyIssued
+    let replay_result = s.client.try_issue_certificate(&s.partner, &CAMPAIGN, &s.sponsor, &2026, &s.token);
+    assert_eq!(replay_result, Err(Ok(Error::AlreadyIssued)));
+
+    // Ensure certificate is strictly bound to its campaign, sponsor, tax year, and token
+    let cert = s.client.get_certificate(&cert_id);
+    assert_eq!(cert.campaign_id, CAMPAIGN);
+    assert_eq!(cert.sponsor, s.sponsor);
+    assert_eq!(cert.tax_year, 2026);
+    assert_eq!(cert.token, s.token);
+    assert_eq!(cert.amount, 1_000);
+}

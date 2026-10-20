@@ -15,8 +15,31 @@ import type {
     UserOfframpLimits,
 } from "@/types/offramp";
 import { SUPPORTED_OFFRAMP_TOKENS, getAccountNumberRules } from "@/types/offramp";
+import {
+    classifyWalletError,
+    type WalletErrorAction,
+    type WalletErrorCategory,
+} from "@/utils/walletErrorClassifier";
 
 const RATE_LIMIT_MESSAGE = "Rate limit exceeded. Please wait";
+
+/**
+ * Maps a classified wallet error to a user-facing message and the safe
+ * recovery action the UI should offer. Form values are never cleared here so
+ * the user can retry, switch networks, or reconnect without re-entering data.
+ */
+function resolveRecovery(error: unknown): {
+    message: string;
+    action: WalletErrorAction;
+    category: WalletErrorCategory;
+} {
+    const classified = classifyWalletError(error);
+    return {
+        message: classified.message,
+        action: classified.action,
+        category: classified.category,
+    };
+}
 
 function isRateLimitError(error: unknown): boolean {
     if (typeof error === "object" && error !== null) {
@@ -85,6 +108,11 @@ interface UseOfframpBridgeReturn {
     providerMinimumAmount: number;
     isLoadingProviderMinimum: boolean;
 
+    // Recovery
+    errorAction: WalletErrorAction | null;
+    errorCategory: WalletErrorCategory | null;
+    retry: () => Promise<void>;
+
     // Controls
     reset: () => void;
     goBack: () => void;
@@ -96,6 +124,8 @@ export function useOfframpBridge(): UseOfframpBridgeReturn {
     // Core state
     const [step, setStep] = useState<OfframpStep>("form");
     const [error, setError] = useState<string | null>(null);
+    const [errorAction, setErrorAction] = useState<WalletErrorAction | null>(null);
+    const [errorCategory, setErrorCategory] = useState<WalletErrorCategory | null>(null);
     const [isLoading, setIsLoading] = useState(false);
 
     // Form State
@@ -133,6 +163,21 @@ export function useOfframpBridge(): UseOfframpBridgeReturn {
     const payoutPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
     // Abort controller ref for component-level cleanup
     const abortRef = useRef<AbortController | null>(null);
+    // Last attempted quote form, used to retry after a recoverable failure
+    const lastQuoteFormRef = useRef<OfframpFormState | null>(null);
+
+    const clearError = useCallback(() => {
+        setError(null);
+        setErrorAction(null);
+        setErrorCategory(null);
+    }, []);
+
+    const applyError = useCallback((err: unknown, fallbackMessage?: string) => {
+        const recovery = resolveRecovery(err);
+        setError(fallbackMessage ?? recovery.message);
+        setErrorAction(recovery.action);
+        setErrorCategory(recovery.category);
+    }, []);
 
     // Cleanup polling and in-flight requests on unmount
     useEffect(() => {
@@ -374,20 +419,28 @@ export function useOfframpBridge(): UseOfframpBridgeReturn {
         async (form: OfframpFormState) => {
             if (!isConnected || !address) {
                 setError("Please connect your wallet first");
+                setErrorAction("reconnect");
+                setErrorCategory("wallet");
                 return;
             }
             if (!quote) {
                 setError("No valid quote available. Please check your input.");
+                setErrorAction("retry");
+                setErrorCategory("validation");
                 return;
             }
             if (isLoadingProviderMinimum) {
                 setError("Provider minimum is still loading. Please try again.");
+                setErrorAction("retry");
+                setErrorCategory("network");
                 return;
             }
 
             const amount = parseFloat(form.amount);
             if (amount < providerMinimumAmount) {
                 setError(`Amount must be at least ${providerMinimumAmount} ${form.token}`);
+                setErrorAction("edit");
+                setErrorCategory("validation");
                 return;
             }
 
@@ -398,18 +451,19 @@ export function useOfframpBridge(): UseOfframpBridgeReturn {
                     `Remaining: ${userLimits.remainingDaily.toLocaleString()} ${form.token} ` +
                     `(Daily limit: ${userLimits.dailyLimit.toLocaleString()} ${form.token})`
                 );
+                setErrorAction("edit");
+                setErrorCategory("validation");
                 return;
             }
 
             setIsLoading(true);
-            setError(null);
+            clearError();
+            lastQuoteFormRef.current = form;
 
             const controller = new AbortController();
             abortRef.current = controller;
 
             try {
-                const amount = parseFloat(form.amount);
-
                 const offrampRes = await offrampService.createOfframp(
                     {
                         providerId: quote.providerId,
@@ -428,7 +482,10 @@ export function useOfframpBridge(): UseOfframpBridgeReturn {
                 if (controller.signal.aborted) return;
 
                 if (!offrampRes.success || !offrampRes.data) {
-                    setError(offrampRes.error || "Failed to create offramp quote");
+                    // Preserve form values; surface a classified recovery action.
+                    applyError(
+                        offrampRes.error ?? new Error("Failed to create offramp quote")
+                    );
                     setIsLoading(false);
                     return;
                 }
@@ -437,7 +494,7 @@ export function useOfframpBridge(): UseOfframpBridgeReturn {
                 setStep("quote");
             } catch (e) {
                 if (controller.signal.aborted) return;
-                setError(e instanceof Error ? e.message : "Failed to process quote");
+                applyError(e);
             } finally {
                 if (!controller.signal.aborted) setIsLoading(false);
             }
@@ -449,8 +506,18 @@ export function useOfframpBridge(): UseOfframpBridgeReturn {
             userLimits,
             providerMinimumAmount,
             isLoadingProviderMinimum,
+            applyError,
+            clearError,
         ]
     );
+
+    // ---------- Recovery ----------
+
+    const retry = useCallback(async () => {
+        const form = lastQuoteFormRef.current ?? formState;
+        clearError();
+        await getQuote(form);
+    }, [formState, getQuote, clearError]);
 
     // ---------- Status Polling ----------
 
@@ -480,33 +547,41 @@ export function useOfframpBridge(): UseOfframpBridgeReturn {
     // ---------- Confirm & Process ----------
 
     const confirmAndBridge = useCallback(async () => {
-        if (!isConnected || !address || !offrampData) {
+        if (!isConnected || !address) {
+            setError("Please connect your wallet first");
+            setErrorAction("reconnect");
+            setErrorCategory("wallet");
+            return;
+        }
+        if (!offrampData) {
             setError("Missing required data");
+            setErrorAction("retry");
+            setErrorCategory("validation");
             return;
         }
 
         setIsLoading(true);
-        setError(null);
+        clearError();
         setStep("processing");
 
         try {
             startPayoutPolling();
         } catch (e) {
-            const msg = e instanceof Error ? e.message : "Processing failed";
             setStep("failed");
-            setError(msg);
+            applyError(e, e instanceof Error ? e.message : "Processing failed");
         } finally {
             setIsLoading(false);
         }
-    }, [isConnected, address, offrampData, startPayoutPolling]);
+    }, [isConnected, address, offrampData, startPayoutPolling, applyError, clearError]);
 
     // ---------- Controls ----------
 
     const reset = useCallback(() => {
         if (payoutPollRef.current) clearInterval(payoutPollRef.current);
         setStep("form");
-        setError(null);
+        clearError();
         setIsLoading(false);
+        lastQuoteFormRef.current = null;
         setFormState({
             token: "USDC",
             amount: "",
@@ -523,19 +598,22 @@ export function useOfframpBridge(): UseOfframpBridgeReturn {
         setIsLoadingQuote(false);
         setIsVerifyingAccount(false);
         setIsLoadingBanks(false);
-    }, []);
+    }, [clearError]);
 
     const goBack = useCallback(() => {
         if (step === "quote") {
             setStep("form");
             setOfframpData(null);
-            setError(null);
+            clearError();
         }
-    }, [step]);
+    }, [step, clearError]);
 
     return {
         step,
         error,
+        errorAction,
+        errorCategory,
+        retry,
         isLoading,
         banks,
         loadBanks: async () => { },

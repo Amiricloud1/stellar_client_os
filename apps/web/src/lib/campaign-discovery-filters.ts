@@ -1,8 +1,10 @@
 export const DISCOVERY_TREE_SPECIES = ["Oak", "Pine", "Mangrove"] as const;
 export const DISCOVERY_REGIONS = ["North America", "Africa", "Asia"] as const;
+export const DISCOVERY_ALL_OPTION = "All" as const;
 
 export type DiscoveryTreeSpecies = (typeof DISCOVERY_TREE_SPECIES)[number];
 export type DiscoveryRegion = (typeof DISCOVERY_REGIONS)[number];
+export type DiscoveryAllOption = typeof DISCOVERY_ALL_OPTION;
 
 export interface CampaignDiscoveryRecord {
   treeSpecies?: string;
@@ -12,9 +14,14 @@ export interface CampaignDiscoveryRecord {
 }
 
 export interface CampaignDiscoveryFilters {
-  treeSpecies: DiscoveryTreeSpecies | "All";
-  region: DiscoveryRegion | "All";
+  treeSpecies: DiscoveryTreeSpecies | DiscoveryAllOption;
+  region: DiscoveryRegion | DiscoveryAllOption;
 }
+
+export const DEFAULT_CAMPAIGN_DISCOVERY_FILTERS: CampaignDiscoveryFilters = {
+  treeSpecies: DISCOVERY_ALL_OPTION,
+  region: DISCOVERY_ALL_OPTION,
+};
 
 const REGION_LOCATION_TERMS: Record<DiscoveryRegion, string[]> = {
   "North America": [
@@ -42,6 +49,7 @@ const REGION_LOCATION_TERMS: Record<DiscoveryRegion, string[]> = {
 
 function regionFromCoordinates(latitude: number, longitude: number): DiscoveryRegion | undefined {
   if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return undefined;
+  if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return undefined;
   if (latitude >= 7 && latitude <= 84 && longitude >= -170 && longitude <= -50) return "North America";
   if (latitude >= -35 && latitude <= 37 && longitude >= -18 && longitude <= 52) return "Africa";
   if (latitude >= -10 && latitude <= 80 && longitude >= 25 && longitude <= 180) return "Asia";
@@ -59,27 +67,44 @@ export function getCampaignDiscoveryRegion(campaign: CampaignDiscoveryRecord): D
     if (region) return region;
   }
 
-  const location = campaign.location?.toLowerCase();
+  const location = campaign.location?.trim().toLowerCase();
   if (!location) return undefined;
   return DISCOVERY_REGIONS.find((region) =>
     REGION_LOCATION_TERMS[region].some((term) => location.includes(term)),
   );
 }
 
+function normalizeSpecies(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/\s+trees?$/, "")
+    .replace(/s$/, "");
+}
+
 function campaignHasSpecies(campaign: CampaignDiscoveryRecord, selected: DiscoveryTreeSpecies): boolean {
+  const normalizedSelected = normalizeSpecies(selected);
   return (campaign.treeSpecies ?? "")
     .split(/[,;/|]/)
-    .map((species) => species.trim().toLowerCase().replace(/\s+trees?$/, "").replace(/s$/, ""))
-    .includes(selected.toLowerCase().replace(/s$/, ""));
+    .map(normalizeSpecies)
+    .filter((species) => species.length > 0)
+    .includes(normalizedSelected);
+}
+
+export function campaignMatchesDiscoveryFilters(
+  campaign: CampaignDiscoveryRecord,
+  filters: CampaignDiscoveryFilters,
+): boolean {
+  const matchesSpecies =
+    filters.treeSpecies === DISCOVERY_ALL_OPTION || campaignHasSpecies(campaign, filters.treeSpecies);
+  const matchesRegion =
+    filters.region === DISCOVERY_ALL_OPTION || getCampaignDiscoveryRegion(campaign) === filters.region;
+  return matchesSpecies && matchesRegion;
 }
 
 export function filterCampaignsByDiscoveryOptions<T extends CampaignDiscoveryRecord>(
   campaigns: T[],
   filters: CampaignDiscoveryFilters,
 ): T[] {
-  return campaigns.filter((campaign) => {
-    const matchesSpecies = filters.treeSpecies === "All" || campaignHasSpecies(campaign, filters.treeSpecies);
-    const matchesRegion = filters.region === "All" || getCampaignDiscoveryRegion(campaign) === filters.region;
-    return matchesSpecies && matchesRegion;
-  });
+  return campaigns.filter((campaign) => campaignMatchesDiscoveryFilters(campaign, filters));
 }

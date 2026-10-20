@@ -195,6 +195,43 @@ interface DedupeState {
   delivered: string[];
 }
 
+/**
+ * Source-of-truth model
+ * ---------------------
+ * All webhook state is durable on disk and survives process restarts:
+ *
+ * - `subscriptionsPath`  -> `WebhookSubscription[]` (source of truth for who
+ *   receives which events). Mutated only by `createSubscription` /
+ *   `deleteSubscription`.
+ * - `deadLetterPath`     -> `WebhookDeliveryAttempt[]` (append-only log of
+ *   deliveries that exhausted all retries). This is the source of truth for
+ *   permanently failed deliveries; it is never rewritten except to append.
+ * - `deduplicationPath`  -> `DedupeState` (set of event identities that were
+ *   successfully delivered). This is the source of truth for idempotency and
+ *   is what prevents duplicate delivery after a restart.
+ *
+ * Transaction boundaries
+ * ----------------------
+ * Each file is written with `writeJsonAtomic` (write temp file + rename), so a
+ * single file mutation is atomic: readers observe either the previous or the
+ * new complete document, never a partial write. There is no cross-file
+ * transaction; the guarantees are per-file:
+ *
+ * 1. Subscription mutations: read -> mutate -> atomic write. Concurrent
+ *    mutations are serialized by the caller-facing API contract (one
+ *    operation at a time per service instance).
+ * 2. Idempotency: `reserveEvent` (in-flight reservation) and `completeEvent`
+ *    (persist delivered key) are serialized through `withDeduplicationLock`.
+ *    The delivered key is only persisted after a successful delivery, so a
+ *    crash mid-delivery leaves the event un-deduplicated and it may be
+ *    retried (at-least-once). A crash after persistence means the event is
+ *    never delivered again (effectively-once for stable identities).
+ * 3. Dead-letter append: read -> push -> atomic write. A failure to write the
+ *    DLQ is logged but does not fail the dispatch (best-effort durability of
+ *    the failure record).
+ */
+=======
+
 export class WebhookService {
   private readonly maxRetries: number;
   private readonly baseDelay: number;
@@ -249,12 +286,19 @@ export class WebhookService {
   }
 
   /**
-   * Load all subscriptions from the file-based database
+   * Load all subscriptions from the file-based database.
+   *
+   * This is the durable source of truth for subscriptions; it is re-read on
+   * every call so a fresh process observes state written by a previous one.
    */
   async getSubscriptions(): Promise<WebhookSubscription[]> {
     try {
       const data = await fs.readFile(this.subscriptionsPath, 'utf-8');
-      return JSON.parse(data) as WebhookSubscription[];
+      const parsed = JSON.parse(data) as unknown;
+      if (!Array.isArray(parsed)) {
+        throw new Error('Webhook subscriptions store is corrupt: expected an array');
+      }
+      return parsed as WebhookSubscription[];
     } catch (err: unknown) {
       if ((err as { code?: string }).code === 'ENOENT') {
         return [];
@@ -346,6 +390,21 @@ export class WebhookService {
     this.deduplicationLoaded = true;
   }
 
+  /**
+   * Force a reload of the persisted idempotency state from disk.
+   *
+   * Useful after an external writer (or a previous process) updated the
+   * deduplication store. Serialized through the deduplication lock so it
+   * cannot interleave with an in-flight reservation.
+   */
+  async reloadDeduplicationState(): Promise<void> {
+    await this.withDeduplicationLock(async () => {
+      this.deduplicationLoaded = false;
+      this.deliveredEventKeys.clear();
+      await this.loadDeduplicationState();
+    });
+  }
+
   private async persistDeduplicationState(): Promise<void> {
     const state: DedupeState = {
       delivered: Array.from(this.deliveredEventKeys),
@@ -384,14 +443,25 @@ export class WebhookService {
   // ============================================
 
   /**
-   * Append a failed delivery attempt to the dead-letter log
+   * Append a failed delivery attempt to the dead-letter log.
+   *
+   * Transaction boundary: read -> push -> atomic write. The DLQ is the durable
+   * source of truth for permanently failed deliveries and is append-only.
+   * Write failures are logged but swallowed so a DLQ outage cannot crash the
+   * dispatcher; callers that need strict durability should inspect
+   * `getDeadLetters()` after `awaitPendingDeliveries()`.
    */
   async logToDeadLetter(attempt: WebhookDeliveryAttempt): Promise<void> {
     try {
       let deadLetters: WebhookDeliveryAttempt[] = [];
       try {
         const data = await fs.readFile(this.deadLetterPath, 'utf-8');
-        deadLetters = JSON.parse(data) as WebhookDeliveryAttempt[];
+        const parsed = JSON.parse(data) as unknown;
+        if (Array.isArray(parsed)) {
+          deadLetters = parsed as WebhookDeliveryAttempt[];
+        } else {
+          console.error('Dead-letter log is corrupt: expected an array; starting fresh');
+        }
       } catch (err: unknown) {
         if ((err as { code?: string }).code !== 'ENOENT') {
           console.error('Failed to read dead-letter log:', err);
@@ -406,12 +476,19 @@ export class WebhookService {
   }
 
   /**
-   * Read all dead-letter deliveries
+   * Read all dead-letter deliveries.
+   *
+   * Re-reads from disk so a fresh process observes failures recorded by a
+   * previous one.
    */
   async getDeadLetters(): Promise<WebhookDeliveryAttempt[]> {
     try {
       const data = await fs.readFile(this.deadLetterPath, 'utf-8');
-      return JSON.parse(data) as WebhookDeliveryAttempt[];
+      const parsed = JSON.parse(data) as unknown;
+      if (!Array.isArray(parsed)) {
+        throw new Error('Dead-letter log is corrupt: expected an array');
+      }
+      return parsed as WebhookDeliveryAttempt[];
     } catch (err: unknown) {
       if ((err as { code?: string }).code === 'ENOENT') {
         return [];
@@ -435,7 +512,13 @@ export class WebhookService {
   }
 
   /**
-   * Dispatch an event to all interested subscribers
+   * Dispatch an event to all interested subscribers.
+   *
+   * Idempotency semantics: for each matching subscription, a stable source
+   * identity (see `getEventIdempotencyKey`) is reserved before delivery and
+   * persisted only after a successful delivery. This yields at-least-once
+   * delivery for events without a stable identity and effectively-once
+   * delivery for events with one, including across process restarts.
    */
   async dispatchEvent(event: string, eventData: Record<string, unknown>): Promise<void> {
     const subscriptions = await this.getSubscriptions();

@@ -13,6 +13,31 @@ export interface CampaignProgressMetrics {
   ttlSeconds: number;
 }
 
+/**
+ * Reasons a campaign progress cache entry may be invalidated.
+ *
+ * - `mutation`: an authoritative write (donation, sponsorship, tree planting)
+ *   changed the campaign totals.
+ * - `chain-correction`: an on-chain reorg/correction changed previously
+ *   confirmed totals, so any cached snapshot is untrustworthy.
+ * - `manual`: an operator or admin explicitly requested a refresh.
+ */
+export type CampaignProgressInvalidationReason =
+  | "mutation"
+  | "chain-correction"
+  | "manual";
+
+export interface CampaignProgressInvalidationResult {
+  campaignId: string;
+  reason: CampaignProgressInvalidationReason;
+  /** Whether an entry was actually present and removed. */
+  invalidated: boolean;
+  /** Cache key that was targeted, for logging/observability. */
+  key: string;
+  /** Clock time (ms since epoch) at which invalidation occurred. */
+  invalidatedAt: number;
+}
+
 interface CacheEntry {
   data: CampaignProgressMetrics;
   expiresAt: number;
@@ -43,9 +68,30 @@ export const DEFAULT_CAMPAIGN_PROGRESS_TTL_SECONDS = 300;
  */
 export const CAMPAIGN_PROGRESS_CACHE_KEY_PREFIX = "campaign:progress";
 
+/**
+ * Freshness budget (seconds) for campaign progress metrics.
+ *
+ * Authoritative totals (raised amount, tree count, sponsor count) must not
+ * remain stale beyond this window even if no mutation event is observed.
+ * This is the documented upper bound; per-call TTLs may be shorter but never
+ * longer than this budget.
+ */
+export const CAMPAIGN_PROGRESS_FRESHNESS_BUDGET_SECONDS = DEFAULT_CAMPAIGN_PROGRESS_TTL_SECONDS;
+
 /** Build the isolated cache key for a campaign's progress metrics. */
 export function buildCampaignProgressCacheKey(campaignId: string): string {
   return `${CAMPAIGN_PROGRESS_CACHE_KEY_PREFIX}:${campaignId}`;
+}
+
+/**
+ * Clamp a requested TTL to the freshness budget so authoritative totals can
+ * never be cached longer than the documented window.
+ */
+function clampToFreshnessBudget(ttlSeconds: number): number {
+  if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
+    return DEFAULT_CAMPAIGN_PROGRESS_TTL_SECONDS;
+  }
+  return Math.min(Math.floor(ttlSeconds), CAMPAIGN_PROGRESS_FRESHNESS_BUDGET_SECONDS);
 }
 
 function resolveDefaultTtl(explicit?: number): number {
@@ -108,12 +154,13 @@ export class CampaignProgressCacheService {
   ): CampaignProgressMetrics {
     const key = buildCampaignProgressCacheKey(campaignId);
     const now = this.now();
-    const expiresAt = now + ttlSeconds * 1000;
+    const effectiveTtl = clampToFreshnessBudget(ttlSeconds);
+    const expiresAt = now + effectiveTtl * 1000;
     const entryData: CampaignProgressMetrics = {
       ...metrics,
       cachedAt: now,
       expiresAt,
-      ttlSeconds,
+      ttlSeconds: effectiveTtl,
     };
 
     this.cache.set(key, {
@@ -131,6 +178,8 @@ export class CampaignProgressCacheService {
   ): Promise<{ metrics: CampaignProgressMetrics; cacheHit: boolean }> {
     if (!forceRefresh) {
       const cached = this.get(campaignId);
+      // `get` already enforces the freshness budget: expired entries are
+      // evicted and reported as misses, so stale totals are never served.
       if (cached) {
         return { metrics: cached, cacheHit: true };
       }
@@ -166,6 +215,41 @@ export class CampaignProgressCacheService {
 
   invalidate(campaignId: string): boolean {
     return this.cache.delete(buildCampaignProgressCacheKey(campaignId));
+  }
+
+  /**
+   * Invalidate a campaign's cached progress metrics in response to an
+   * authoritative change.
+   *
+   * Call this on every mutation (donation, sponsorship, tree planting) and on
+   * chain corrections/reorgs so the next read re-fetches authoritative totals
+   * instead of serving a stale snapshot. Returns structured metadata suitable
+   * for logging/observability.
+   */
+  invalidateForReason(
+    campaignId: string,
+    reason: CampaignProgressInvalidationReason
+  ): CampaignProgressInvalidationResult {
+    const key = buildCampaignProgressCacheKey(campaignId);
+    const invalidated = this.cache.delete(key);
+    return {
+      campaignId,
+      reason,
+      invalidated,
+      key,
+      invalidatedAt: this.now(),
+    };
+  }
+
+  /**
+   * Invalidate multiple campaigns at once (e.g. a chain correction affecting a
+   * batch of campaigns). Returns one result per campaign id.
+   */
+  invalidateMany(
+    campaignIds: readonly string[],
+    reason: CampaignProgressInvalidationReason
+  ): CampaignProgressInvalidationResult[] {
+    return campaignIds.map((campaignId) => this.invalidateForReason(campaignId, reason));
   }
 
   clear(): void {
