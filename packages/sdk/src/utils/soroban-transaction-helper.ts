@@ -27,6 +27,38 @@ export interface ResourceUsage {
 }
 
 /**
+ * Classification of a Soroban simulation or contract failure.
+ *
+ * These categories are intentionally coarse so that the unified wallet
+ * recovery layer can map them to safe user actions (retry, switch network,
+ * reconnect, or surface the contract error) without re-parsing raw RPC
+ * payloads.
+ *
+ * - `simulation_error`: the RPC returned a simulation error result.
+ * - `contract_error`: the simulation succeeded at the RPC level but the
+ *   contract invocation trapped (e.g. `HostError` / `invokeHostFunction`).
+ * - `network_error`: transient transport/RPC failure (retryable).
+ * - `unknown`: anything we could not classify.
+ */
+export type SorobanFailureKind =
+  | 'simulation_error'
+  | 'contract_error'
+  | 'network_error'
+  | 'unknown';
+
+/**
+ * Structured failure descriptor exposed for the unified recovery layer.
+ */
+export interface SorobanFailure {
+  /** Coarse failure category. */
+  kind: SorobanFailureKind;
+  /** Human-readable message safe to surface to operators/logs. */
+  message: string;
+  /** Whether retrying the same request may succeed. */
+  retryable: boolean;
+}
+
+/**
  * Fee and resource estimate for a Soroban transaction.
  */
 export interface TransactionEstimate {
@@ -40,6 +72,8 @@ export interface TransactionEstimate {
   success: boolean;
   /** Error message if simulation failed. */
   error?: string;
+  /** Structured failure descriptor when `success` is false. */
+  failure?: SorobanFailure;
 }
 
 /**
@@ -101,6 +135,94 @@ const DEFAULT_OPTIONS: Required<EstimationOptions> = {
 };
 
 /**
+ * Patterns that indicate a contract-level trap surfaced by simulation.
+ * These are matched case-insensitively against the simulation error string.
+ */
+const CONTRACT_ERROR_PATTERNS = [
+  'hosterror',
+  'invokehostfunction',
+  'contract error',
+  'wasm trap',
+  'unreachable',
+  'vm error',
+];
+
+/**
+ * Patterns that indicate a transient network/RPC failure (retryable).
+ */
+const NETWORK_ERROR_PATTERNS = [
+  'timeout',
+  'timed out',
+  'econnreset',
+  'econnrefused',
+  'enotfound',
+  'network',
+  'fetch failed',
+  'socket hang up',
+  '503',
+  '502',
+  '504',
+  '429',
+];
+
+/**
+ * Classify a raw simulation error string into a structured failure.
+ *
+ * @param error - Raw error message from the RPC simulation result.
+ * @returns Structured failure descriptor.
+ */
+export function classifySimulationError(error: string): SorobanFailure {
+  const normalized = (error ?? '').toLowerCase();
+
+  if (CONTRACT_ERROR_PATTERNS.some((pattern) => normalized.includes(pattern))) {
+    return {
+      kind: 'contract_error',
+      message: error,
+      retryable: false,
+    };
+  }
+
+  if (NETWORK_ERROR_PATTERNS.some((pattern) => normalized.includes(pattern))) {
+    return {
+      kind: 'network_error',
+      message: error,
+      retryable: true,
+    };
+  }
+
+  return {
+    kind: 'simulation_error',
+    message: error,
+    retryable: false,
+  };
+}
+
+/**
+ * Classify a thrown error (transport/RPC failure) into a structured failure.
+ *
+ * @param error - The thrown error.
+ * @returns Structured failure descriptor.
+ */
+export function classifyThrownError(error: unknown): SorobanFailure {
+  const message = error instanceof Error ? error.message : String(error ?? 'Unknown error');
+  const normalized = message.toLowerCase();
+
+  if (NETWORK_ERROR_PATTERNS.some((pattern) => normalized.includes(pattern))) {
+    return {
+      kind: 'network_error',
+      message,
+      retryable: true,
+    };
+  }
+
+  return {
+    kind: 'unknown',
+    message,
+    retryable: false,
+  };
+}
+
+/**
  * Simulate a Soroban transaction and return fee/resource estimates.
  *
  * This function simulates the transaction on the network to determine the
@@ -134,6 +256,7 @@ export async function estimateTransactionFee(
       const simulation = await rpc.simulateTransaction(transaction);
 
       if (Api.isSimulationError(simulation)) {
+        const failure = classifySimulationError(simulation.error);
         return {
           recommendedFee: opts.baseFee,
           minResourceFee: '0',
@@ -146,6 +269,7 @@ export async function estimateTransactionFee(
           },
           success: false,
           error: simulation.error,
+          failure,
         };
       }
 
@@ -175,6 +299,14 @@ export async function estimateTransactionFee(
     }
   }
 
+  const failure = lastError
+    ? classifyThrownError(lastError)
+    : {
+        kind: 'unknown' as const,
+        message: 'Simulation failed after retries',
+        retryable: true,
+      };
+
   return {
     recommendedFee: opts.baseFee,
     minResourceFee: '0',
@@ -186,7 +318,8 @@ export async function estimateTransactionFee(
       writeEntries: 0,
     },
     success: false,
-    error: lastError?.message ?? 'Simulation failed after retries',
+    error: failure.message,
+    failure,
   };
 }
 

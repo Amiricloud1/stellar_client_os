@@ -6,10 +6,14 @@ This document outlines the rate limiting policy, tier-based pricing structure, a
 
 ## 1. Overview
 
-To ensure fair usage, high availability, and platform stability across the Stellar ecosystem, Fundable enforces a **sliding-window rate limiter** backed by Redis sorted sets.
+To ensure fair usage, high availability, and platform stability across the Stellar ecosystem, Fundable enforces a **distributed sliding-window rate limiter** backed by shared Redis atomic sequence counters (`INCR`) and sorted sets (`ZSET`).
 
-- **Sliding-Window Guarantees:** Unlike naive fixed-window limiters which allow bursts of up to 2× the rate limit at boundary transitions, Fundable calculates rolling request frequencies atomically via Lua scripts.
-- **Graceful Degradation:** In the unlikely event of cache unavailability, the API degrades gracefully without blocking mission-critical transactions.
+- **Shared Atomic Counters Across App Instances:** Every rate-limit check executes a single Redis Lua script (`SLIDING_WINDOW_SCRIPT`) that prunes expired entries, increments a shared monotonic sequence counter (`<key>:seq`) across all app instances, and only admits requests when `count < limit` so blocked DoS bursts never extend the lockout window or collide on member keys.
+- **Route-Class Fail-Safe Outage Policies (Issue #100):** Rather than blindly failing open on sensitive endpoints when Redis is unreachable, routes are classified by sensitivity:
+  - `public-read`: **Fail-open** (`200 OK`, `X-RateLimit-Degraded: true`) so public read traffic remains available.
+  - `standard-write`: **Fallback-memory** (`SharedAtomicCounterStore`) enforcing bounded per-instance sliding-window quotas during cache outages.
+  - `sensitive-mutation`, `financial-submission`, `admin-privileged`: **Fail-closed** (`HTTP 503 Service Unavailable`, `code: "RATE_LIMIT_BACKEND_UNAVAILABLE"`, `Retry-After`) so attackers cannot bypass distributed rate limits on financial, tax, or privileged routes during a Redis outage.
+- **Compatibility & Migration Implications:** Existing callers of `new RateLimiter(redis, options)` without an explicit `routeClass` or `failurePolicy` continue to default to `fail-open` for backward compatibility. Sensitive routes opt into `routeClass` (`"financial-submission"`, `"sensitive-mutation"`, `"admin-privileged"`) or `createRouteClassLimiter(routeClass)`.
 
 ---
 

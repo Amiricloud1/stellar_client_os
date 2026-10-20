@@ -89,6 +89,19 @@ export {
   type CongestionLevel as GasEstimatorCongestionLevel,
 } from "./utils/GasEstimator.js";
 export * from "./utils/rpcConnectionOptions.js";
+export {
+  TransactionResubmissionManager,
+  TransactionResubmissionError,
+  isTransactionResubmissionError,
+  DEFAULT_RESUBMISSION_OPTIONS,
+  type TransactionResubmissionOptions,
+  type TransactionResubmissionResult,
+  type TransactionResubmissionStatus,
+  type TransactionStatusLookup,
+  type TransactionStatusLookupResult,
+  type TransactionStatusLookupOutcome,
+  type TransactionResubmissionErrorCode,
+} from "./utils/transactionResubmission.js";
 
 // Export tax reporting utilities (issue #792)
 export * from "./tax.js";
@@ -101,3 +114,5 @@ export {
   CONTRACT_ERRORS,
   type ParsedContractError,
 } from "./utils/errors.js";
+export * from "./utils/error-catalog.js";
+
