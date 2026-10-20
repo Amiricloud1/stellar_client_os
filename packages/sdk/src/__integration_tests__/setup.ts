@@ -25,6 +25,12 @@ import {
   Operation,
   Asset,
   BASE_FEE,
+  xdr,
+  Contract,
+  nativeToScVal,
+  Address,
+  Account,
+  SorobanDataBuilder,
 } from '@stellar/stellar-sdk';
 
 // ---------------------------------------------------------------------------
@@ -239,4 +245,134 @@ export function keypairSigner(kp: Keypair) {
     tx.sign(kp);
     return { signedTxXdr: tx.toXDR() };
   };
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic fixtures (no live funds required)
+// ---------------------------------------------------------------------------
+
+/**
+ * A fixed, well-known secret key used to derive deterministic test accounts.
+ * This key is public knowledge and MUST never be used on any network that
+ * holds real value. It exists purely so integration tests are reproducible.
+ */
+export const DETERMINISTIC_TEST_SECRET =
+  'SDETERMINISTICINTEGRATIONTESTKEY000000000000000000000000000';
+
+/**
+ * Derive a deterministic Keypair from a numeric index. Useful for building
+ * stable fixtures without touching friendbot or live funds.
+ */
+export function deterministicKeypair(index = 0): Keypair {
+  // Derive a stable 32-byte seed from the index so each call is reproducible.
+  const seed = Buffer.alloc(32);
+  seed.writeUInt32BE(index >>> 0, 0);
+  seed.write('soroban-lifecycle-test', 4, 'utf8');
+  return Keypair.fromRawEd25519Seed(seed);
+}
+
+/**
+ * Build a deterministic, unsigned Soroban invocation transaction envelope
+ * suitable for exercising simulation/signing/submission flows offline.
+ */
+export function buildDeterministicInvocationTx(options: {
+  source: Keypair;
+  contractId: string;
+  method: string;
+  args?: xdr.ScVal[];
+  fee?: string;
+  sequence?: string;
+}): ReturnType<typeof TransactionBuilder.prototype.build> {
+  const {
+    source,
+    contractId,
+    method,
+    args = [],
+    fee = BASE_FEE,
+    sequence = '0',
+  } = options;
+
+  const account = new Account(source.publicKey(), sequence);
+  const contract = new Contract(contractId);
+
+  return new TransactionBuilder(account, {
+    fee,
+    networkPassphrase: LOCAL_NETWORK_PASSPHRASE,
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(30)
+    .build();
+}
+
+/**
+ * Build a deterministic contract event XDR for decoding tests. Produces a
+ * `contract` event with the given topics and value, wrapped in the
+ * `DiagnosticEvent`-free `TransactionEvent` shape returned by RPC.
+ */
+export function buildContractEventXdr(options: {
+  contractId: string;
+  topics: xdr.ScVal[];
+  value: xdr.ScVal;
+  ledger?: number;
+  txHash?: string;
+}): xdr.DiagnosticEvent {
+  const {
+    contractId,
+    topics,
+    value,
+    ledger = 1,
+    txHash = '00'.repeat(32),
+  } = options;
+
+  const contractEventBody = new xdr.ContractEventV0({
+    topics,
+    data: value,
+  });
+
+  const contractEvent = new xdr.ContractEvent({
+    ext: new xdr.ExtensionPoint(0),
+    contractId: Address.fromString(contractId).toScAddress(),
+    type: xdr.ContractEventType.contract(),
+    body: xdr.ContractEventBody.v0(contractEventBody),
+  });
+
+  const txEvent = new xdr.TransactionEvent({
+    ext: new xdr.ExtensionPoint(0),
+    stage: xdr.TransactionEventStage.afterAllTxs(),
+    event: contractEvent,
+  });
+
+  return new xdr.DiagnosticEvent({
+    inSuccessfulContractCall: true,
+    event: txEvent,
+  });
+}
+
+/**
+ * Convenience: build a topic ScVal from a symbol string.
+ */
+export function symbolTopic(symbol: string): xdr.ScVal {
+  return nativeToScVal(symbol, { type: 'symbol' });
+}
+
+/**
+ * Convenience: build a u32/u64/i128 value ScVal.
+ */
+export function u64Value(value: bigint): xdr.ScVal {
+  return nativeToScVal(value, { type: 'u64' });
+}
+
+/**
+ * Attach a deterministic Soroban transaction data footprint to a transaction
+ * so it can be simulated without prior ledger state.
+ */
+export function withDeterministicFootprint(
+  tx: ReturnType<typeof TransactionBuilder.prototype.build>,
+  contractId: string,
+): ReturnType<typeof TransactionBuilder.prototype.build> {
+  const data = new SorobanDataBuilder()
+    .setReadOnly([new Contract(contractId).address().toScAddress()])
+    .build();
+  tx.setSorobanData(data);
+  return tx;
 }

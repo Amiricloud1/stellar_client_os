@@ -35,9 +35,9 @@ export interface WebhookSubscription {
 }
 
 export interface WebhookPayload {
-  id: string; // Unique delivery attempt UUID
+  id: string; // Unique delivery ID (stable across retries of the same event)
   event: string; // Event name (e.g., 'stream.status_updated')
-  timestamp: number; // Epoch timestamp of delivery
+  timestamp: number; // Epoch timestamp (seconds) of delivery, included in signature
   payload: Record<string, unknown>; // Event details
 }
 
@@ -51,12 +51,14 @@ export interface WebhookPayload {
  *   the attempt; re-recording the same `id` MUST be a no-op.
  */
 export interface WebhookDeliveryAttempt {
-  id: string; // Unique delivery ID
+  id: string; // Unique delivery ID (stable across retries)
   subscriptionId: string;
   event: string;
   url: string;
   payload: Record<string, unknown>;
   timestamp: string; // ISO string
+  signatureVersion: WebhookSignatureVersion;
+  signatureTimestamp: number; // Epoch seconds used in the signature
   statusCode: number | null;
   success: boolean;
   errorMessage: string | null;

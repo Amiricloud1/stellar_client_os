@@ -254,25 +254,48 @@ export async function createStream(params: {
     startTime: number;
     endTime: number;
     signTransaction?: WalletSigner;
+    idempotencyKey?: string | null;
 }): Promise<string> {
-    const client = createPaymentStreamClient(params.sender);
-    const tx = await client.createStream({
-        sender: params.sender,
-        recipient: params.recipient,
-        token: params.token,
-        total_amount: params.amount,
-        initial_amount: 0n,
-        start_time: BigInt(params.startTime),
-        end_time: BigInt(params.endTime),
-    });
+    const run = async (): Promise<string> => {
+        const client = createPaymentStreamClient(params.sender);
+        const tx = await client.createStream({
+            sender: params.sender,
+            recipient: params.recipient,
+            token: params.token,
+            total_amount: params.amount,
+            initial_amount: 0n,
+            start_time: BigInt(params.startTime),
+            end_time: BigInt(params.endTime),
+        });
 
-    await signAndSendTx(tx, params.signTransaction);
+        await signAndSendTx(tx, params.signTransaction);
 
-    const streamId = extractBigInt(tx.result) ?? extractStreamIdFromTxEvents(tx);
-    if (streamId === undefined) {
-        throw new Error('Contract did not return a valid stream id');
-    }
-    return serializeStreamId(streamId);
+        const streamId = extractBigInt(tx.result) ?? extractStreamIdFromTxEvents(tx);
+        if (streamId === undefined) {
+            throw new Error('Contract did not return a valid stream id');
+        }
+        return serializeStreamId(streamId);
+    };
+
+    if (!params.idempotencyKey) return run();
+
+    const { result } = await withIdempotency(
+        {
+            key: params.idempotencyKey,
+            actor: params.sender,
+            operation: 'createStream',
+            payload: {
+                sender: params.sender,
+                recipient: params.recipient,
+                token: params.token,
+                amount: params.amount.toString(),
+                startTime: params.startTime,
+                endTime: params.endTime,
+            },
+        },
+        run
+    );
+    return result;
 }
 
 export async function withdraw(params: {
@@ -280,6 +303,7 @@ export async function withdraw(params: {
     amount: bigint;
     sender?: string;
     signTransaction?: WalletSigner;
+    idempotencyKey?: string | null;
 }): Promise<string> {
     let sender = params.sender;
     if (!sender) {
@@ -291,10 +315,25 @@ export async function withdraw(params: {
         throw new Error('Unable to resolve sender address for withdrawal');
     }
 
-    const client = createPaymentStreamClient(sender);
-    const tx = await client.withdraw(BigInt(params.streamId), params.amount);
-    const hash = await signAndSendTx(tx, params.signTransaction);
-    return hash;
+    const actor = sender;
+    const run = async (): Promise<string> => {
+        const client = createPaymentStreamClient(actor);
+        const tx = await client.withdraw(BigInt(params.streamId), params.amount);
+        return signAndSendTx(tx, params.signTransaction);
+    };
+
+    if (!params.idempotencyKey) return run();
+
+    const { result } = await withIdempotency(
+        {
+            key: params.idempotencyKey,
+            actor,
+            operation: 'withdraw',
+            payload: { streamId: params.streamId, amount: params.amount.toString() },
+        },
+        run
+    );
+    return result;
 }
 
 export async function distribute(params: {
@@ -378,11 +417,26 @@ export async function depositToStream(params: {
     amount: bigint;
     sender: string;
     signTransaction?: WalletSigner;
+    idempotencyKey?: string | null;
 }): Promise<string> {
-    const client = createPaymentStreamClient(params.sender);
-    const tx = await client.deposit(BigInt(params.streamId), params.amount);
-    const hash = await signAndSendTx(tx, params.signTransaction);
-    return hash;
+    const run = async (): Promise<string> => {
+        const client = createPaymentStreamClient(params.sender);
+        const tx = await client.deposit(BigInt(params.streamId), params.amount);
+        return signAndSendTx(tx, params.signTransaction);
+    };
+
+    if (!params.idempotencyKey) return run();
+
+    const { result } = await withIdempotency(
+        {
+            key: params.idempotencyKey,
+            actor: params.sender,
+            operation: 'depositToStream',
+            payload: { streamId: params.streamId, amount: params.amount.toString() },
+        },
+        run
+    );
+    return result;
 }
 
 export async function getWithdrawableAmount(params: {
@@ -410,11 +464,26 @@ export async function submitFailureProof(params: {
     address: string;
     evidence: string;
     signTransaction?: WalletSigner;
+    idempotencyKey?: string | null;
 }): Promise<string> {
-    const client = createPaymentStreamClient(params.address);
-    const tx = await client.submitFailureProof(BigInt(params.streamId), params.evidence);
-    const hash = await signAndSendTx(tx, params.signTransaction);
-    return hash;
+    const run = async (): Promise<string> => {
+        const client = createPaymentStreamClient(params.address);
+        const tx = await client.submitFailureProof(BigInt(params.streamId), params.evidence);
+        return signAndSendTx(tx, params.signTransaction);
+    };
+
+    if (!params.idempotencyKey) return run();
+
+    const { result } = await withIdempotency(
+        {
+            key: params.idempotencyKey,
+            actor: params.address,
+            operation: 'submitFailureProof',
+            payload: { streamId: params.streamId, evidence: params.evidence },
+        },
+        run
+    );
+    return result;
 }
 
 /**
