@@ -29,10 +29,8 @@ export default defineConfig({
   ],
 
   webServer: {
-    // Start the app with a seeded, deterministic fixture environment so E2E
-    // runs never depend on live funds or external services.
-    command: 'npm run dev',
-    url: BASE_URL,
+    command: 'pnpm run dev',
+    url: 'http://localhost:3000',
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
     env: {

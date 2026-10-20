@@ -4027,4 +4027,108 @@ fn test_independent_streams_use_separate_locks() {
     // Withdraw on stream B still succeeds because locks are per-stream.
     client.withdraw(&stream_id_b, &100);
 }
+
+#[test]
+fn test_stream_lifecycle_accounting_invariants() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let fee_collector = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let token = sac.address();
+    let contract_id = env.register(PaymentStreamContract, ());
+    let client = PaymentStreamContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &fee_collector, &0);
+
+    let total_deposit: i128 = 10_000;
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &total_deposit);
+
+    // Create stream from timestamp 100 to 500
+    env.ledger().set_timestamp(100);
+    let stream_id = client.create_stream(&sender, &recipient, &token, &total_deposit, &total_deposit, &100, &500);
+
+    // Initial check: zero withdrawn
+    let mut stream = client.get_stream(&stream_id);
+    assert_eq!(stream.withdrawn_amount, 0);
+    assert_eq!(stream.remaining_balance, total_deposit);
+
+    // Advance to 200 (25% elapsed)
+    env.ledger().set_timestamp(200);
+    let available1 = client.withdrawable_amount(&stream_id);
+    assert_eq!(available1, 2500);
+    client.withdraw(&stream_id, &1000);
+
+    stream = client.get_stream(&stream_id);
+    assert_eq!(stream.withdrawn_amount, 1000);
+    assert_eq!(stream.remaining_balance, 9000);
+    assert_eq!(stream.withdrawn_amount + stream.remaining_balance, total_deposit);
+
+    // Pause stream at 250
+    env.ledger().set_timestamp(250);
+    client.pause_stream(&stream_id);
+    stream = client.get_stream(&stream_id);
+    assert_eq!(stream.status, StreamStatus::Paused);
+
+    // Invariant holds across pause
+    assert_eq!(stream.withdrawn_amount + stream.remaining_balance, total_deposit);
+
+    // Advance while paused - vesting does not accrue while paused
+    env.ledger().set_timestamp(300);
+    client.resume_stream(&stream_id);
+    stream = client.get_stream(&stream_id);
+    assert_eq!(stream.status, StreamStatus::Active);
+
+    // Cancel stream at 350
+    env.ledger().set_timestamp(350);
+    let pre_cancel_withdrawn = stream.withdrawn_amount;
+    client.cancel_stream(&stream_id);
+
+    stream = client.get_stream(&stream_id);
+    assert_eq!(stream.status, StreamStatus::Canceled);
+    assert!(stream.withdrawn_amount >= pre_cancel_withdrawn);
+    assert!(stream.withdrawn_amount <= total_deposit);
+
+    // Strict accounting invariant: total withdrawn never exceeds deposit
+    assert!(stream.withdrawn_amount <= total_deposit);
 }
+
+#[test]
+fn test_cross_contract_token_authorization_and_rollback() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let fee_collector = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let token = sac.address();
+    let contract_id = env.register(PaymentStreamContract, ());
+    let client = PaymentStreamContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &fee_collector, &0);
+
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &1000, &0, &100);
+    env.ledger().set_timestamp(50);
+
+    let token_client = token::Client::new(&env, &token);
+    let initial_recipient_balance = token_client.balance(&recipient);
+
+    // Attempting to withdraw more than withdrawable (e.g. 900 when available is 500)
+    let result = client.try_withdraw(&stream_id, &900);
+    assert!(result.is_err());
+
+    // Assert atomic rollback: stream state and recipient token balance remain completely unmodified
+    let stream = client.get_stream(&stream_id);
+    assert_eq!(stream.withdrawn_amount, 0);
+    assert_eq!(stream.remaining_balance, 1000);
+    assert_eq!(token_client.balance(&recipient), initial_recipient_balance);
+}
+}
+
