@@ -33,6 +33,7 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { checkHorizon, resolveHorizonUrl } from "@/lib/horizon-health";
+import { evaluateLiveness, evaluateReadiness } from "@/lib/dependency-health";
 
 // Route handlers are cached by default; health probes must always run.
 export const dynamic = "force-dynamic";
@@ -41,7 +42,7 @@ export const dynamic = "force-dynamic";
 const NO_STORE_HEADERS: Record<string, string> = { "Cache-Control": "no-store" };
 
 interface CheckResult {
-  status: "ok" | "down";
+  status: "ok" | "degraded" | "down";
   [key: string]: unknown;
 }
 
@@ -57,14 +58,43 @@ function okResponse(checks: Record<string, CheckResult>): NextResponse {
 }
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
+  const checkParam = req.nextUrl.searchParams.get("check");
+  const probeParam = req.nextUrl.searchParams.get("probe");
+  const strict =
+    req.nextUrl.searchParams.get("strict") === "true" ||
+    req.nextUrl.searchParams.get("strict") === "1";
+  const timeoutParam = req.nextUrl.searchParams.get("timeoutMs");
+  const timeoutMs = timeoutParam ? Number(timeoutParam) : undefined;
+
   // Liveness-only probe: the app process is serving requests.
-  if (req.nextUrl.searchParams.get("check") === "app") {
-    return okResponse({ app: { status: "ok" } });
+  if (checkParam === "app" || probeParam === "liveness") {
+    const liveness = evaluateLiveness();
+    return okResponse(liveness.checks as Record<string, CheckResult>);
   }
 
-  // Readiness probe: verify Horizon connectivity.
+  // Full multi-dependency readiness probe (Horizon + Soroban RPC + Redis + Storage)
+  if (checkParam === "all" || probeParam === "readiness") {
+    const readiness = await evaluateReadiness({
+      strict,
+      timeoutMs,
+      horizonProbe: (u, o) => checkHorizon(u, o),
+    });
+    return NextResponse.json(
+      {
+        status: readiness.status,
+        probe: readiness.probe,
+        checks: readiness.checks,
+        timestamp: readiness.timestamp,
+      },
+      { status: readiness.httpStatus, headers: NO_STORE_HEADERS }
+    );
+  }
+
+  // Default Horizon readiness probe (backward-compatible with issue #634 callers).
   const url = resolveHorizonUrl();
-  const horizon = await checkHorizon(url);
+  const horizon = timeoutMs
+    ? await checkHorizon(url, { timeoutMs })
+    : await checkHorizon(url);
 
   const horizonCheck: CheckResult = {
     status: horizon.reachable ? "ok" : "down",
@@ -87,3 +117,4 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     { status: 503, headers: NO_STORE_HEADERS }
   );
 }
+

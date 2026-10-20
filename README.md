@@ -59,7 +59,8 @@ pnpm dev
 
 The web app starts at http://localhost:3000. Connect a wallet (e.g. Freighter) to interact with the contracts on testnet.
 
-> Need more detail? See [docs/getting-started.md](docs/getting-started.md) and [scripts/README.md](scripts/README.md).
+> For the unified setup guide, step-by-step outputs, and troubleshooting, see [QUICKSTART.md](QUICKSTART.md) and [docs/getting-started.md](docs/getting-started.md).  
+> For the 15-contract inventory and trust boundaries, see [docs/architecture.md](docs/architecture.md).
 
 Stellar client and smart contracts for the Fundable Protocol – a decentralized payment platform enabling seamless Web3 payments, streaming, and subscriptions on the Stellar blockchain.
 

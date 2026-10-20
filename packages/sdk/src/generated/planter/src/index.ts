@@ -1,5 +1,5 @@
-/* eslint-disable */
 import { Buffer } from "buffer";
+import { Address } from "@stellar/stellar-sdk";
 import {
   AssembledTransaction,
   Client as ContractClient,
@@ -44,42 +44,48 @@ export interface ReferralInfo {
 
 export interface Client {
   initialize(
-    args: { admin: string; reward_token: string; reward_amount: i128 },
-    options?: MethodOptions
+    { admin, reward_token, reward_amount }: { admin: string; reward_token: string; reward_amount: i128 },
+    options?: MethodOptions,
   ): Promise<AssembledTransaction<null>>;
+
   register_planter(
-    args: { planter: string; referrer?: string },
-    options?: MethodOptions
+    { planter, referrer }: { planter: string; referrer?: string },
+    options?: MethodOptions,
   ): Promise<AssembledTransaction<null>>;
+
   complete_job(
-    args: { planter: string },
-    options?: MethodOptions
+    { planter }: { planter: string },
+    options?: MethodOptions,
   ): Promise<AssembledTransaction<null>>;
+
   claim_referral_reward(
-    args: { referrer: string; referred_planter: string },
-    options?: MethodOptions
+    { referrer, referred_planter }: { referrer: string; referred_planter: string },
+    options?: MethodOptions,
   ): Promise<AssembledTransaction<null>>;
+
   get_planter(
-    args: { planter: string },
-    options?: MethodOptions
+    { planter }: { planter: string },
+    options?: MethodOptions,
   ): Promise<AssembledTransaction<PlanterInfo>>;
+
   get_referral_info(
-    args: { referrer: string },
-    options?: MethodOptions
+    { referrer }: { referrer: string },
+    options?: MethodOptions,
   ): Promise<AssembledTransaction<ReferralInfo>>;
-  get_reward_amount(
-    options?: MethodOptions
-  ): Promise<AssembledTransaction<i128>>;
+
+  get_reward_amount(options?: MethodOptions): Promise<AssembledTransaction<bigint>>;
+
   set_reward_amount(
-    args: { new_amount: i128 },
-    options?: MethodOptions
+    { new_amount }: { new_amount: i128 },
+    options?: MethodOptions,
   ): Promise<AssembledTransaction<null>>;
 }
 
-export class Client {
-  readonly options: ContractClientOptions;
-
+export class Client extends ContractClient {
   constructor(options: ContractClientOptions) {
-    this.options = options;
+    super(
+      new ContractSpec(["AAAAAAAAAAAAAAAKaW5pdGlhbGl6ZQAAAAADAAAAAAAAAAVhZG1pbgAAAAARAAAAAAAAAAxyZXdhcmRfdG9rZW4AAAAAEQAAAAAAAAANcmV3YXJkX2Ftb3VudAAAAAAKAAAAAA=="]),
+      options,
+    );
   }
 }

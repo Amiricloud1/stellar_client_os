@@ -13,3 +13,23 @@ The admin may call `add_matching_funds(campaign_id, amount, cap)` to deposit mat
 Sponsor accounting remains separate from matching accounting. `get_contribution` reports the sponsor’s gross contribution only, while `Campaign.total_raised` includes both sponsor and matched amounts. The matching balance is decremented atomically with each matched contribution, so the contract can never promise more matching tokens than it actually holds.
 
 The sponsor flow is exposed at `/campaigns/:id/sponsor` in the web app. It deliberately separates tree selection, amount entry, preview, and wallet confirmation so a sponsor can review the gross amount before signing the contribution transaction.
+
+## Escrow state transitions
+
+Campaign escrow follows a strictly forward state machine:
+
+| From | Call | To | Rejected with |
+| --- | --- | --- | --- |
+| _(none)_ | `initialize_campaign_escrow` | `Held` | `EscrowAlreadyInitialized` (#39) on repeat |
+| `Held` | `deposit_to_campaign_escrow` | `Held` | `InvalidAmount` (#4) for `amount <= 0`, `EscrowNotInitialized` (#38) before init |
+| `Held` | `approve_tree_verification` | `Verified` | `UnauthorizedVerifier` (#42) for non-verifiers |
+| `Verified` | `release_escrow_to_creator` | `Released` | `EscrowNotVerified` (#40) before approval, `EscrowAlreadyReleased` (#41) on repeat |
+| any | dispute | `Disputed` | `EscrowDisputed` (#43) blocks further release |
+
+Invariants covered by the contract tests:
+
+- Repeated deposits accumulate exactly into `total_escrowed`; `released_amount` stays `0` until release.
+- `released_amount` never exceeds `total_escrowed`, and a release can happen only once.
+- A rejected call (duplicate init, duplicate release, zero deposit) never mutates escrow accounting.
+
+Compatibility: no storage layout changes were introduced; existing `CampaignEscrow(u64)` records remain valid.
