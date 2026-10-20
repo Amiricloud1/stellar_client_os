@@ -1,0 +1,13 @@
+{
+  "eventVersion": 1,
+  "eventId": "campaign:cmp_12345:impact:1000_trees",
+  "eventType": "campaign.milestone_reached",
+  "subscriptionId": "sub_12345abcd",
+  "deliveredAt": "2026-07-29T13:00:00.000Z",
+  "payload": {
+    "campaignId": "cmp_12345",
+    "milestone": "1000_trees",
+    "treeCount": 1000,
+    "co2Sequestration": "12.5"
+  }
+}

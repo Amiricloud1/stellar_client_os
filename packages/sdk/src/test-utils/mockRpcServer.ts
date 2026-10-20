@@ -135,18 +135,57 @@ export interface MockFeeStats {
   };
 }
 
+/** A single raw contract event as returned by getEvents. */
+export interface MockContractEvent {
+  pagingToken: string;
+  topic: unknown[];
+  value: unknown;
+  contractId?: string;
+  id?: string;
+  ledger?: number;
+  type?: string;
+}
+
 /** Minimal shape of a getEvents response. */
 export interface MockGetEventsResponse {
-  events: Array<{
-    pagingToken: string;
-    topic: unknown[];
-    value: unknown;
-    contractId?: string;
-    id?: string;
-    ledger?: number;
-    type?: string;
-  }>;
+  events: MockContractEvent[];
   latestLedger: number;
+  /** Cursor to pass to the next getEvents call (present on real RPC responses). */
+  cursor?: string;
+}
+
+/** Arguments accepted by the mocked getEvents method. */
+export interface MockGetEventsArgs {
+  startLedger?: number;
+  cursor?: string;
+  filters?: unknown[];
+  limit?: number;
+}
+
+/**
+ * Deterministic lifecycle configuration for a single transaction.
+ *
+ * Controls how many polls return PENDING / NOT_FOUND before the transaction
+ * settles into a terminal SUCCESS or FAILED state. All values are fixed so
+ * tests never depend on wall-clock timing or live network state.
+ */
+export interface MockLifecycleConfig {
+  /** Number of initial polls that return PENDING (default: 0). */
+  pendingPolls?: number;
+  /** Number of initial polls that return NOT_FOUND (default: 0). */
+  notFoundPolls?: number;
+  /** Terminal status after pending/not-found polls are exhausted (default: SUCCESS). */
+  terminalStatus?: 'SUCCESS' | 'FAILED';
+  /** Ledger recorded on the terminal response (default: 12345). */
+  ledger?: number;
+  /** Hash returned by sendTransaction (default: DEFAULT_SEND_TX_RESPONSE.hash). */
+  hash?: string;
+  /** Status returned by sendTransaction (default: PENDING). */
+  sendStatus?: MockSendTransactionResponse['status'];
+  /** Error XDR surfaced when sendStatus is ERROR. */
+  errorXdr?: string;
+  /** When true, getTransaction always returns PENDING (confirmation timeout). */
+  neverConfirms?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +252,102 @@ export const DEFAULT_FEE_STATS: MockFeeStats = {
   },
 };
 
+/** Default lifecycle config used by `scenarios.lifecycle()`. */
+export const DEFAULT_LIFECYCLE_CONFIG: Required<
+  Omit<MockLifecycleConfig, 'neverConfirms'>
+> & { neverConfirms: boolean } = {
+  pendingPolls: 0,
+  notFoundPolls: 0,
+  terminalStatus: 'SUCCESS',
+  ledger: 12345,
+  hash: DEFAULT_SEND_TX_RESPONSE.hash,
+  sendStatus: 'PENDING',
+  errorXdr: 'AAAAAAAAAGT////7AAAAAA==',
+  neverConfirms: false,
+};
+
+/**
+ * Builds a deterministic getTransaction responder from a lifecycle config.
+ *
+ * Each call consumes one "poll". The first `notFoundPolls` calls return
+ * NOT_FOUND, the next `pendingPolls` calls return PENDING, and every
+ * subsequent call returns the terminal SUCCESS/FAILED response. When
+ * `neverConfirms` is set, every call returns PENDING.
+ *
+ * The returned function is stateful; call `resetMockRpcServer()` (or create a
+ * fresh responder) between tests to reset the poll counter.
+ */
+export function createLifecycleGetTransaction(
+  config: MockLifecycleConfig = {},
+): (...args: [string]) => Promise<MockGetTransactionResponse> {
+  const cfg = { ...DEFAULT_LIFECYCLE_CONFIG, ...config };
+  let poll = 0;
+
+  return async (): Promise<MockGetTransactionResponse> => {
+    if (cfg.neverConfirms) {
+      return { status: 'PENDING' } satisfies MockGetTransactionPending;
+    }
+    if (poll < cfg.notFoundPolls) {
+      poll += 1;
+      return { status: 'NOT_FOUND' } satisfies MockGetTransactionPending;
+    }
+    if (poll < cfg.notFoundPolls + cfg.pendingPolls) {
+      poll += 1;
+      return { status: 'PENDING' } satisfies MockGetTransactionPending;
+    }
+    poll += 1;
+    if (cfg.terminalStatus === 'FAILED') {
+      return {
+        status: 'FAILED',
+        ledger: cfg.ledger,
+      } satisfies MockGetTransactionFailed;
+    }
+    return {
+      status: 'SUCCESS',
+      ledger: cfg.ledger,
+      feeCharged: '200',
+    } satisfies MockGetTransactionSuccess;
+  };
+}
+
+/**
+ * Builds a deterministic, cursor-aware getEvents responder from a fixed list
+ * of events. Supports both `startLedger` and `cursor` pagination so tests can
+ * exercise the same paging logic used against a real RPC server.
+ *
+ * @param events - Full ordered list of events to page through.
+ * @param pageSize - Maximum number of events returned per call (default: 100).
+ * @param latestLedger - Latest closed ledger reported on each response.
+ */
+export function createPaginatedGetEvents(
+  events: MockContractEvent[],
+  pageSize = 100,
+  latestLedger = 1000,
+): (...args: [MockGetEventsArgs]) => Promise<MockGetEventsResponse> {
+  return async (args: MockGetEventsArgs = {}): Promise<MockGetEventsResponse> => {
+    const limit = Math.max(1, Math.min(args.limit ?? pageSize, pageSize));
+
+    let startIndex = 0;
+    if (args.cursor !== undefined && args.cursor !== '') {
+      const cursorIndex = events.findIndex((e) => e.pagingToken === args.cursor);
+      startIndex = cursorIndex >= 0 ? cursorIndex + 1 : events.length;
+    } else if (args.startLedger !== undefined) {
+      const ledgerIndex = events.findIndex(
+        (e) => (e.ledger ?? 0) >= (args.startLedger as number),
+      );
+      startIndex = ledgerIndex >= 0 ? ledgerIndex : events.length;
+    }
+
+    const page = events.slice(startIndex, startIndex + limit);
+    const last = page[page.length - 1];
+    return {
+      events: page,
+      latestLedger,
+      cursor: last ? last.pagingToken : args.cursor,
+    };
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Core mock object
 // ---------------------------------------------------------------------------
@@ -251,7 +386,7 @@ const mock = {
   getFeeStats: vi.fn<() => Promise<MockFeeStats>>(),
 
   /** Fetch contract events with optional filters and pagination. */
-  getEvents: vi.fn<(...args: [unknown]) => Promise<MockGetEventsResponse>>(),
+  getEvents: vi.fn<(...args: [MockGetEventsArgs]) => Promise<MockGetEventsResponse>>(),
 
   // ── Scenario helpers ────────────────────────────────────────────────────
   /**
@@ -411,6 +546,115 @@ const mock = {
     getEventsError(message = 'getEvents RPC error'): void {
       mock.getEvents.mockRejectedValue(new Error(message));
     },
+
+    /**
+     * Wires up the complete deterministic transaction lifecycle:
+     * account load → simulation → submission → confirmation polling.
+     *
+     * The getTransaction responder is stateful and advances one poll per call
+     * according to `config` (pendingPolls / notFoundPolls / terminalStatus).
+     * Call `resetMockRpcServer()` between tests to reset the poll counter.
+     *
+     * @example
+     * // PENDING twice, then SUCCESS
+     * rpc.scenarios.lifecycle({ pendingPolls: 2 });
+     */
+    lifecycle(config: MockLifecycleConfig = {}): void {
+      const cfg = { ...DEFAULT_LIFECYCLE_CONFIG, ...config };
+
+      mock.getAccount.mockResolvedValue(DEFAULT_MOCK_ACCOUNT);
+      mock.simulateTransaction.mockResolvedValue(DEFAULT_SIMULATION_SUCCESS);
+      mock.getNetwork.mockResolvedValue(DEFAULT_NETWORK_INFO);
+      mock.getLatestLedger.mockResolvedValue(DEFAULT_LATEST_LEDGER);
+      mock.getFeeStats.mockResolvedValue(DEFAULT_FEE_STATS);
+      mock.getEvents.mockResolvedValue({ events: [], latestLedger: 100 });
+
+      if (cfg.sendStatus === 'ERROR') {
+        mock.sendTransaction.mockResolvedValue({
+          status: 'ERROR',
+          hash: '',
+          errorResult: { toXDR: () => cfg.errorXdr },
+        } satisfies MockSendTransactionResponse);
+      } else {
+        mock.sendTransaction.mockResolvedValue({
+          status: cfg.sendStatus,
+          hash: cfg.hash,
+        } satisfies MockSendTransactionResponse);
+      }
+
+      mock.getTransaction.mockImplementation(
+        createLifecycleGetTransaction(cfg),
+      );
+    },
+
+    /**
+     * Happy path: submission accepted and confirmed on the first poll.
+     */
+    successfulSubmitAndConfirm(opts?: { ledger?: number; hash?: string }): void {
+      mock.scenarios.lifecycle({
+        pendingPolls: 0,
+        notFoundPolls: 0,
+        terminalStatus: 'SUCCESS',
+        ledger: opts?.ledger ?? 12345,
+        hash: opts?.hash,
+      });
+    },
+
+    /**
+     * Submission is rejected by the RPC node (sendTransaction → ERROR).
+     * getTransaction is never expected to be called.
+     */
+    rejectedTransaction(errorXdr = 'AAAAAAAAAGT////7AAAAAA=='): void {
+      mock.scenarios.lifecycle({ sendStatus: 'ERROR', errorXdr });
+    },
+
+    /**
+     * Simulation fails with a host error response (not a thrown exception).
+     * Submission and confirmation are never expected to be reached.
+     */
+    failedSimulation(errorMessage = 'HostError: Value error'): void {
+      mock.scenarios.lifecycle();
+      mock.simulateTransaction.mockResolvedValue({
+        error: errorMessage,
+      } satisfies MockSimulationError);
+    },
+
+    /**
+     * Transaction is accepted but never confirms — getTransaction always
+     * returns PENDING. Exercises confirmation-timeout handling.
+     */
+    confirmationTimeout(opts?: { hash?: string }): void {
+      mock.scenarios.lifecycle({ neverConfirms: true, hash: opts?.hash });
+    },
+
+    /**
+     * Transaction is accepted, then reaches FAILED status on chain after the
+     * configured number of pending polls.
+     */
+    confirmedFailure(opts?: { pendingPolls?: number; ledger?: number }): void {
+      mock.scenarios.lifecycle({
+        pendingPolls: opts?.pendingPolls ?? 1,
+        terminalStatus: 'FAILED',
+        ledger: opts?.ledger ?? 12345,
+      });
+    },
+
+    /**
+     * getEvents returns a cursor-paginated view over a fixed event list.
+     * Pass the returned `cursor` back into the next call to page forward.
+     */
+    paginatedContractEvents(
+      events: MockContractEvent[],
+      opts?: { pageSize?: number; latestLedger?: number },
+    ): void {
+      mock.getEvents.mockImplementation(
+        createPaginatedGetEvents(
+          events,
+          opts?.pageSize ?? 100,
+          opts?.latestLedger ?? 1000,
+        ),
+      );
+    },
   },
 } as const;
 
@@ -452,6 +696,24 @@ export function resetMockRpcServer(): void {
       }
     }
   });
+}
+
+/**
+ * Resets all mocks and installs the default happy-path lifecycle scenario.
+ *
+ * Use this in `beforeEach` when a test file exercises the full
+ * simulate → sign → submit → confirm flow and wants a clean, deterministic
+ * starting point without repeating setup in every test.
+ *
+ * ```ts
+ * beforeEach(() => resetMockRpcServerWithLifecycle());
+ * ```
+ */
+export function resetMockRpcServerWithLifecycle(
+  config: MockLifecycleConfig = {},
+): void {
+  resetMockRpcServer();
+  mock.scenarios.lifecycle(config);
 }
 
 // ---------------------------------------------------------------------------

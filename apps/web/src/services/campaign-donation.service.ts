@@ -21,6 +21,11 @@ import {
   normalizeDonationAmount,
   validateDonationAmount,
 } from "@/types/campaign-donation";
+import {
+  IdempotencyConflictError,
+  IdempotencyStore,
+  getDefaultIdempotencyStore,
+} from "@/services/idempotency";
 
 /**
  * One-time charitable campaign donations (issue #1001).
@@ -41,7 +46,8 @@ export type DonationErrorCode =
   | "INVALID_AMOUNT"
   | "INVALID_TOKEN"
   | "INVALID_DONOR"
-  | "MESSAGE_TOO_LONG";
+  | "MESSAGE_TOO_LONG"
+  | "IDEMPOTENCY_CONFLICT";
 
 export interface CreateDonationInput {
   campaignId: string;
@@ -69,13 +75,20 @@ export type DonationResult =
 /** Campaign states that still accept new donations. */
 export const DONATION_ACCEPTING_STATUSES: readonly CampaignStatus[] = ["ACTIVE"];
 
+/** Idempotency scope for donation mutations: one namespace per campaign. */
+const DONATION_IDEMPOTENCY_SCOPE = "campaign-donation";
+
+/** How long a completed donation result is retained for replay (24h). */
+export const DONATION_IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60;
+
 export class CampaignDonationService {
   private donations = new Map<string, CampaignDonation[]>();
   private receipts = new Map<string, DonationReceipt>();
-  private idempotency = new Map<string, string>();
 
-  private idempotencyKey(campaignId: string, key: string): string {
-    return `${campaignId.trim()}::${key.trim()}`;
+  constructor(private readonly idempotencyStore: IdempotencyStore = getDefaultIdempotencyStore()) {}
+
+  private idempotencyScope(campaignId: string): string {
+    return `${DONATION_IDEMPOTENCY_SCOPE}:${campaignId.trim()}`;
   }
 
   private campaignDonations(campaignId: string): CampaignDonation[] {
@@ -132,14 +145,48 @@ export class CampaignDonationService {
     }
 
     // Retries (double-clicks, network replays) resolve to the original record.
+    // The idempotency key is scoped per campaign and the request payload is
+    // fingerprinted so reusing a key with a different payload is rejected.
     const idempotencyKey = input.idempotencyKey?.trim();
-    if (idempotencyKey) {
-      const existingId = this.idempotency.get(this.idempotencyKey(campaignId, idempotencyKey));
-      if (existingId) {
-        const existing = this.campaignDonations(campaignId).find((entry) => entry.id === existingId);
-        const receipt = this.receipts.get(existingId);
-        if (existing && receipt) {
-          return { ok: true, donation: existing, receipt, campaign, milestones: [] };
+    const scope = this.idempotencyScope(campaignId);
+    const fingerprint = idempotencyKey
+      ? JSON.stringify({
+          campaignId,
+          donorAddress,
+          amount,
+          token,
+          message: input.message?.trim() || null,
+          anonymous: Boolean(input.anonymous),
+        })
+      : undefined;
+
+    if (idempotencyKey && fingerprint) {
+      let reservation;
+      try {
+        reservation = await this.idempotencyStore.reserve(scope, idempotencyKey, fingerprint);
+      } catch (error) {
+        if (error instanceof IdempotencyConflictError) {
+          return {
+            ok: false,
+            error: "This idempotency key was already used with a different request payload.",
+            code: "IDEMPOTENCY_CONFLICT",
+          };
+        }
+        throw error;
+      }
+
+      if (reservation.status === "completed") {
+        const cached = reservation.result as
+          | { donation: CampaignDonation; receipt: DonationReceipt; campaign: CampaignRecord; milestones: number[] }
+          | undefined;
+        if (cached) {
+          return {
+            ok: true,
+            donation: cached.donation,
+            receipt: cached.receipt,
+            campaign: cached.campaign,
+            milestones: [],
+          };
         }
       }
     }
@@ -149,6 +196,9 @@ export class CampaignDonationService {
     // other contribution. Donations are whole tokens, matching the ledger.
     const recorded = await recordCampaignContribution(campaignId, amount, dataSource);
     if (!recorded) {
+      if (idempotencyKey) {
+        await this.idempotencyStore.release(scope, idempotencyKey);
+      }
       return { ok: false, error: "Campaign not found.", code: "INVALID_CAMPAIGN" };
     }
 
@@ -188,17 +238,25 @@ export class CampaignDonationService {
     list.push(donation);
     this.donations.set(campaignId, list);
     this.receipts.set(donation.id, receipt);
-    if (idempotencyKey) {
-      this.idempotency.set(this.idempotencyKey(campaignId, idempotencyKey), donation.id);
-    }
 
-    return {
-      ok: true,
+    const result = {
       donation,
       receipt,
       campaign: recorded.campaign,
       milestones: recorded.milestones,
     };
+
+    if (idempotencyKey) {
+      await this.idempotencyStore.complete(
+        scope,
+        idempotencyKey,
+        fingerprint as string,
+        result,
+        DONATION_IDEMPOTENCY_TTL_SECONDS,
+      );
+    }
+
+    return { ok: true, ...result };
   }
 
   /** Every donation recorded for a campaign, oldest first. */
@@ -236,10 +294,10 @@ export class CampaignDonationService {
   }
 
   /** Test helper — wipes every in-memory collection. */
-  reset(): void {
+  async reset(): Promise<void> {
     this.donations.clear();
     this.receipts.clear();
-    this.idempotency.clear();
+    await this.idempotencyStore.clearScope(DONATION_IDEMPOTENCY_SCOPE);
   }
 }
 

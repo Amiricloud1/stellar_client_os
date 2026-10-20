@@ -1,0 +1,12 @@
+{
+  "eventVersion": 1,
+  "eventId": "stream:str_98765",
+  "eventType": "stream.status_updated",
+  "subscriptionId": "sub_12345abcd",
+  "deliveredAt": "2026-07-29T13:00:00.000Z",
+  "payload": {
+    "streamId": "str_98765",
+    "status": "Active",
+    "updatedAt": "2026-07-29T13:00:00.000Z"
+  }
+}

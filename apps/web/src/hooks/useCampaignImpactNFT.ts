@@ -1,5 +1,10 @@
 import { useState, useEffect, useCallback } from 'react';
 import { CampaignCompletionNFT, SponsorPersonalImpactNFT } from '@/types/impact-nft';
+import {
+  classifyWalletError,
+  type WalletErrorAction,
+  type WalletErrorInfo,
+} from '@/lib/wallet/errorClassifier';
 
 export interface UseCampaignImpactNFTReturn {
   completionNFT: CampaignCompletionNFT | null;
@@ -8,10 +13,26 @@ export interface UseCampaignImpactNFTReturn {
   isMintingCompletion: boolean;
   isMintingPersonal: boolean;
   error: string | null;
+  /** Structured classification of the last failure, if any. */
+  errorInfo: WalletErrorInfo | null;
+  /** Suggested safe recovery action for the last failure. */
+  errorAction: WalletErrorAction | null;
+  /** Form values preserved across failures so retries can reuse them. */
+  formValues: { sponsorAddress: string | null };
   mintCompletionNFT: () => Promise<CampaignCompletionNFT | null>;
   mintPersonalImpactNFT: (addressOverride?: string) => Promise<SponsorPersonalImpactNFT | null>;
   refetch: () => Promise<void>;
+  /** Retry the last failed operation using preserved form values. */
+  retry: () => Promise<void>;
+  /** Clear the current error state without discarding form values. */
+  clearError: () => void;
 }
+
+type LastOperation =
+  | { kind: 'fetch' }
+  | { kind: 'mintCompletion' }
+  | { kind: 'mintPersonal'; address: string };
+=======
 
 export function useCampaignImpactNFT(
   campaignId: string,
@@ -23,11 +44,33 @@ export function useCampaignImpactNFT(
   const [isMintingCompletion, setIsMintingCompletion] = useState<boolean>(false);
   const [isMintingPersonal, setIsMintingPersonal] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+  const [errorInfo, setErrorInfo] = useState<WalletErrorInfo | null>(null);
+  const [formValues, setFormValues] = useState<{ sponsorAddress: string | null }>({
+    sponsorAddress: sponsorAddress ?? null,
+  });
+  const [lastOperation, setLastOperation] = useState<LastOperation | null>(null);
+
+  const applyError = useCallback((err: unknown, fallbackMessage: string) => {
+    const info = classifyWalletError(err, fallbackMessage);
+    setError(info.message);
+    setErrorInfo(info);
+    return info;
+  }, []);
+
+  const clearError = useCallback(() => {
+    setError(null);
+    setErrorInfo(null);
+  }, []);
+
+  useEffect(() => {
+    setFormValues((prev) => ({ ...prev, sponsorAddress: sponsorAddress ?? prev.sponsorAddress }));
+  }, [sponsorAddress]);
 
   const fetchNFTs = useCallback(async () => {
     if (!campaignId) return;
+    setLastOperation({ kind: 'fetch' });
     setIsLoading(true);
-    setError(null);
+    clearError();
 
     try {
       // 1. Fetch Completion NFT
@@ -54,20 +97,21 @@ export function useCampaignImpactNFT(
           }
         }
       }
-    } catch (err: any) {
-      setError(err.message || 'Error fetching impact NFTs');
+    } catch (err: unknown) {
+      applyError(err, 'Error fetching impact NFTs');
     } finally {
       setIsLoading(false);
     }
-  }, [campaignId, sponsorAddress]);
+  }, [campaignId, sponsorAddress, applyError, clearError]);
 
   useEffect(() => {
     void fetchNFTs();
   }, [fetchNFTs]);
 
   const mintCompletionNFT = async (): Promise<CampaignCompletionNFT | null> => {
+    setLastOperation({ kind: 'mintCompletion' });
     setIsMintingCompletion(true);
-    setError(null);
+    clearError();
 
     try {
       const res = await fetch(`/api/campaigns/${campaignId}/completion-nft`, {
@@ -82,8 +126,8 @@ export function useCampaignImpactNFT(
 
       setCompletionNFT(data.nft);
       return data.nft;
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      applyError(err, 'Failed to mint campaign completion NFT');
       return null;
     } finally {
       setIsMintingCompletion(false);
@@ -91,14 +135,19 @@ export function useCampaignImpactNFT(
   };
 
   const mintPersonalImpactNFT = async (addressOverride?: string): Promise<SponsorPersonalImpactNFT | null> => {
-    const targetAddress = addressOverride || sponsorAddress;
+    const targetAddress = addressOverride || formValues.sponsorAddress || sponsorAddress;
     if (!targetAddress) {
-      setError('Sponsor address is required to mint personal impact NFT');
+      applyError(
+        { code: 'MISSING_SPONSOR_ADDRESS' },
+        'Sponsor address is required to mint personal impact NFT'
+      );
       return null;
     }
 
+    setFormValues((prev) => ({ ...prev, sponsorAddress: targetAddress }));
+    setLastOperation({ kind: 'mintPersonal', address: targetAddress });
     setIsMintingPersonal(true);
-    setError(null);
+    clearError();
 
     try {
       const res = await fetch(`/api/campaigns/${campaignId}/personal-impact-nft`, {
@@ -114,13 +163,33 @@ export function useCampaignImpactNFT(
 
       setPersonalImpactNFT(data.nft);
       return data.nft;
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      applyError(err, 'Failed to mint personal impact NFT');
       return null;
     } finally {
       setIsMintingPersonal(false);
     }
   };
+
+  const retry = useCallback(async (): Promise<void> => {
+    if (!lastOperation) {
+      await fetchNFTs();
+      return;
+    }
+
+    switch (lastOperation.kind) {
+      case 'mintCompletion':
+        await mintCompletionNFT();
+        break;
+      case 'mintPersonal':
+        await mintPersonalImpactNFT(lastOperation.address);
+        break;
+      case 'fetch':
+      default:
+        await fetchNFTs();
+        break;
+    }
+  }, [lastOperation, fetchNFTs, mintCompletionNFT, mintPersonalImpactNFT]);
 
   return {
     completionNFT,
@@ -129,8 +198,13 @@ export function useCampaignImpactNFT(
     isMintingCompletion,
     isMintingPersonal,
     error,
+    errorInfo,
+    errorAction: errorInfo?.action ?? null,
+    formValues,
     mintCompletionNFT,
     mintPersonalImpactNFT,
     refetch: fetchNFTs,
+    retry,
+    clearError,
   };
 }

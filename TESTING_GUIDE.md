@@ -6,6 +6,86 @@
 
 ---
 
+## API Contract, Versioning & Lifecycle Testing
+
+This section covers the API surface guarantees: OpenAPI validation, contract tests
+generated from the OpenAPI document, the versioning/deprecation policy, and the
+end-to-end campaign lifecycle tests. **All of these tests are deterministic and
+independent of live funds** — they use controlled storage/RPC stubs and fixtures,
+never real accounts or network calls.
+
+### Running OpenAPI validation
+
+The OpenAPI document (`packages/api/openapi.yaml`) is validated in CI. Run it locally with:
+
+```bash
+corepack pnpm validate:openapi
+```
+
+This checks that the document:
+
+- Parses as valid YAML with no merge conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`)
+- Contains no duplicate or misplaced path entries
+- Conforms to OpenAPI 3.0 (required fields, `info`, `paths`, schema shapes)
+
+A failure here means the spec is malformed — fix the document, do not skip the check.
+
+### Running API contract, versioning & lifecycle tests
+
+```bash
+corepack pnpm test:api
+```
+
+This runs three suites:
+
+1. **Contract tests** — compare the documented request/response schemas, status
+   codes, auth requirements, and pagination parameters against representative
+   live route handlers. A mismatch between the OpenAPI document and a handler
+   fails the suite.
+2. **Versioning tests** — assert that breaking changes carry a version bump and
+   that deprecated operations are annotated correctly.
+3. **Lifecycle tests** — drive a full campaign workflow (creation → funding →
+   verification → milestone approval → reporting) against controlled
+   storage/RPC, including authorization checks for each step.
+
+### API versioning and sunset policy
+
+- **Version bump rules**: additive, backward-compatible changes (new optional
+  fields, new endpoints) are non-breaking and do not require a version bump.
+  Removing/renaming fields, changing types, tightening validation, or changing
+  status codes are **breaking** and require a major version bump of the API
+  surface.
+- **Deprecation annotations**: deprecated operations/fields must be marked with
+  `deprecated: true` in the OpenAPI document and a description explaining the
+  replacement and removal timeline.
+- **Deprecation/Sunset headers**: deprecated endpoints respond with
+  `Deprecation` (the date deprecation was announced) and `Sunset` (the date the
+  endpoint will be removed) headers so clients can migrate before removal.
+- **Sunset window**: deprecated endpoints remain available for the documented
+  sunset window before removal; removal is treated as a breaking change.
+
+### Extending the contract tests
+
+To cover a new or changed route:
+
+1. Add/update the operation in `packages/api/openapi.yaml` (run
+   `pnpm validate:openapi` to confirm it is valid).
+2. Add a representative handler fixture under the API test fixtures.
+3. Add a contract test asserting the documented schema, status codes, auth, and
+   pagination match the handler. Use deterministic fixtures — never live funds.
+
+### Extending the lifecycle tests
+
+Lifecycle tests live alongside the API tests and use controlled storage/RPC
+stubs. To extend them:
+
+1. Add a step to the campaign workflow fixture (e.g., a new milestone state).
+2. Assert both the success path and the failure/authorization-denied path.
+3. Keep all state in-memory or in fixtures so runs are deterministic and do not
+   depend on live funds.
+
+---
+
 ## ✅ Step-by-Step Testing Process
 
 ### **STEP 1: Verify Files Were Created**
@@ -176,6 +256,9 @@ After completing the steps above, verify these points:
 - [ ] Event types are available for import: `PaymentStreamContractEvent`, `parsePaymentStreamContractEvent`, etc.
 - [ ] Batch parsing function `parsePaymentStreamContractEvents()` is exported
 - [ ] Defensive parsing rejects invalid event payloads
+- [ ] `corepack pnpm validate:openapi` passes (no conflict markers, valid OpenAPI 3.0)
+- [ ] `corepack pnpm test:api` passes (contract, versioning, and lifecycle suites)
+- [ ] Deprecated endpoints carry `deprecated: true` and `Deprecation`/`Sunset` headers
 
 ---
 
@@ -306,6 +389,13 @@ corepack pnpm --filter @fundable/sdk test 2>&1 | grep -E "(✓|×|FAIL|PASS)" | 
 
 echo "=== 3. Check build ==="
 cd packages/sdk && corepack pnpm run build && echo "✓ Build successful" || echo "✗ Build failed"
+
+echo "=== 4. Validate OpenAPI document ==="
+cd c:\Users\HomePC\Documents\D\stellar_client_os
+corepack pnpm validate:openapi && echo "✓ OpenAPI valid" || echo "✗ OpenAPI invalid"
+
+echo "=== 5. Run API contract/versioning/lifecycle tests ==="
+corepack pnpm test:api && echo "✓ API tests passed" || echo "✗ API tests failed"
 ```
 
 ---
