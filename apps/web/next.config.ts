@@ -1,5 +1,6 @@
 import { withSentryConfig } from "@sentry/nextjs";
 import type { NextConfig } from "next";
+import { buildNextConfigHeaders } from "./src/lib/security-headers";
 
 const nextConfig: NextConfig = {
   /* config options here */
@@ -8,42 +9,12 @@ const nextConfig: NextConfig = {
   },
 
   /**
+   * Production browser security headers (CSP, HSTS, X-Frame-Options,
+   * Referrer-Policy, X-Content-Type-Options, Permissions-Policy) and
    * CORS headers for image responses served through Next.js routes.
-   *
-   * iOS 14 Safari caches resources as "opaque" (no-CORS) responses when the
-   * server omits CORS headers, and then refuses to render them when the page
-   * later requests them in a cross-origin context.  Setting
-   * Cross-Origin-Resource-Policy to "cross-origin" (and the Access-Control
-   * headers below) ensures every image response carries proper CORS metadata
-   * so Safari stores it as a tainted-but-usable CORS response instead.
-   *
-   * These headers are applied to the Next.js image optimisation route
-   * (_next/image) and to any /api routes that proxy or redirect to image CDN
-   * assets (e.g. pre-signed S3 URLs returned by the evidence upload API).
    */
   async headers() {
-    return [
-      {
-        // Next.js image optimisation endpoint
-        source: "/_next/image",
-        headers: [
-          { key: "Access-Control-Allow-Origin", value: "*" },
-          { key: "Access-Control-Allow-Methods", value: "GET, HEAD, OPTIONS" },
-          { key: "Cross-Origin-Resource-Policy", value: "cross-origin" },
-          { key: "Vary", value: "Origin" },
-        ],
-      },
-      {
-        // API routes that return or redirect to evidence media (S3, IPFS, CDN)
-        source: "/api/campaigns/:path*",
-        headers: [
-          { key: "Access-Control-Allow-Origin", value: "*" },
-          { key: "Access-Control-Allow-Methods", value: "GET, HEAD, OPTIONS" },
-          { key: "Cross-Origin-Resource-Policy", value: "cross-origin" },
-          { key: "Vary", value: "Origin" },
-        ],
-      },
-    ];
+    return buildNextConfigHeaders();
   },
 
   images: {

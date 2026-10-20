@@ -194,14 +194,14 @@ export function SyncQueueBanner({
       data-testid="sync-queue-banner"
       data-variant={variant}
       className={cn(
-        "sticky top-0 z-50 flex min-h-11 items-center justify-between gap-2 border-b px-4 py-2 text-sm",
+        "sticky top-0 z-50 flex w-full max-w-full flex-wrap sm:flex-nowrap min-h-11 items-center justify-between gap-2 overflow-x-hidden border-b px-3 sm:px-4 py-2 text-sm",
         "transition-colors duration-300",
         config.banner,
         className
       )}
     >
       {/* Left: icon + message */}
-      <div className="flex min-w-0 items-center gap-2">
+      <div className="flex min-w-0 flex-1 items-center gap-2">
         <Icon
           aria-hidden="true"
           className={cn(
@@ -215,17 +215,42 @@ export function SyncQueueBanner({
       {/* Right: action buttons */}
       <div className="flex shrink-0 items-center gap-2">
         {/* Retry button — shown when offline has pending items, or items failed */}
-        {(variant === "failed" || variant === "offline" || (variant === "pending" && isOnline)) && (
+        {(variant === "offline" || variant === "failed" || variant === "pending") &&
+          isOnline && (
+            <button
+              type="button"
+              onClick={handleRetry}
+              disabled={isRetrying || isSyncing}
+              aria-label="Retry syncing pending uploads"
+              className={cn(
+                "flex min-h-8 items-center gap-1 rounded-sm px-2.5 py-1 text-xs font-medium",
+                "transition-all duration-150",
+                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50",
+                "disabled:cursor-not-allowed disabled:opacity-50",
+                variant === "failed"
+                  ? "bg-red-800 hover:bg-red-700 active:bg-red-900"
+                  : "bg-amber-800 hover:bg-amber-700 active:bg-amber-900 text-amber-100"
+              )}
+            >
+              <RefreshCw
+                aria-hidden="true"
+                className={cn("h-3 w-3", (isRetrying || isSyncing) && "animate-spin")}
+              />
+              <span>{isRetrying ? "Retrying…" : "Retry"}</span>
+            </button>
+          )}
+
+        {/* View all button — opens action drawer */}
+        {onOpenDrawer && pendingCount + failedItems.length > 0 && (
           <button
             type="button"
             onClick={handleRetry}
             disabled={isSyncing || isRetrying || !isOnline}
             aria-label="Retry syncing pending uploads"
             className={cn(
-              "flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-semibold",
-              "border border-white/20 bg-white/10 hover:bg-white/20 active:bg-white/25",
-              "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50",
-              "disabled:cursor-not-allowed disabled:opacity-40 transition-colors duration-150"
+              "min-h-8 rounded-sm px-2.5 py-1 text-xs font-medium underline-offset-2",
+              "hover:underline focus-visible:outline-none focus-visible:ring-2",
+              "focus-visible:ring-white/50 transition-all duration-150"
             )}
           >
             <RefreshCw
@@ -243,7 +268,7 @@ export function SyncQueueBanner({
             onClick={onOpenDrawer}
             aria-label={variant === "conflict" ? "Review and resolve sync conflicts" : "View pending sync items"}
             className={cn(
-              "rounded-md px-2.5 py-1 text-xs font-semibold underline-offset-2 hover:underline",
+              "min-h-8 min-w-8 inline-flex items-center justify-center rounded-sm p-1 opacity-70 hover:opacity-100",
               "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50",
               "transition-colors duration-150 text-white/90"
             )}

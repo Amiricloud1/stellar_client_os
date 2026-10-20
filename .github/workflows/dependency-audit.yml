@@ -1,0 +1,62 @@
+name: Dependency & License Audit Policy Gate
+
+on:
+  pull_request:
+    paths:
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "apps/**/package.json"
+      - "packages/**/package.json"
+      - "contracts/**/Cargo.toml"
+      - "contracts/**/Cargo.lock"
+      - "contracts/deny.toml"
+      - "security/dependency-audit-policy.json"
+      - "scripts/dependency-audit-gate.mjs"
+      - "apps/web/src/lib/security/**"
+      - ".github/workflows/dependency-audit.yml"
+  push:
+    branches:
+      - main
+  schedule:
+    # Run daily at 06:00 UTC to catch newly disclosed advisories and expiring suppressions
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  audit-policy-gate:
+    name: Audit pnpm & Cargo Dependencies
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Run pnpm vulnerability audit capture
+        run: |
+          pnpm audit --json > pnpm-audit-report.json || true
+
+      - name: Validate dependency & license policy gate
+        run: |
+          node scripts/dependency-audit-gate.mjs
+
+      - name: Run security policy gate & hardening test suite
+        working-directory: apps/web
+        run: |
+          npx vitest run \
+            src/lib/security/dependency-audit-policy.test.ts \
+            src/lib/__tests__/security-headers.test.ts \
+            src/lib/rate-limit.test.ts \
+            src/lib/dependency-health.test.ts

@@ -1,7 +1,11 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { NextRequest } from "next/server";
 import {
   RateLimiter,
+  SharedAtomicCounterStore,
+  SLIDING_WINDOW_SCRIPT,
+  resolveRouteClassPolicy,
   buildRateLimitHeaders,
   createRateLimiter,
   getTierConfig,
@@ -12,6 +16,10 @@ import {
   resolveCampaignApiTierByFunding,
   type RateLimitResult,
 } from "./rate-limit";
+import {
+  checkRateLimit,
+  createRouteClassLimiter,
+} from "@/middlewares/rate-limit.middleware";
 
 // ── Mock Redis client ─────────────────────────────────────────────────────────
 
@@ -37,6 +45,8 @@ describe("RateLimiter.check", () => {
     expect(result.count).toBe(3);
     expect(result.remaining).toBe(7);
     expect(result.limit).toBe(10);
+    expect(result.degraded).toBe(false);
+    expect(result.reason).toBe("OK");
   });
 
   it("returns allowed:false when count exceeds limit", async () => {
@@ -46,6 +56,7 @@ describe("RateLimiter.check", () => {
     expect(result.allowed).toBe(false);
     expect(result.remaining).toBe(0);
     expect(result.count).toBe(11);
+    expect(result.reason).toBe("RATE_LIMIT_EXCEEDED");
   });
 
   it("returns allowed:true at exactly the limit (boundary)", async () => {
@@ -56,20 +67,24 @@ describe("RateLimiter.check", () => {
     expect(result.remaining).toBe(0);
   });
 
-  it("gracefully allows when Redis is null", async () => {
+  it("gracefully allows when Redis is null (default fail-open)", async () => {
     const limiter = new RateLimiter(null, { limit: 10, windowMs: 60_000 });
     const result = await limiter.check("1.2.3.4");
     expect(result.allowed).toBe(true);
     expect(result.remaining).toBe(10);
+    expect(result.degraded).toBe(true);
+    expect(result.reason).toBe("REDIS_UNAVAILABLE_FAIL_OPEN");
   });
 
-  it("gracefully allows when Redis eval throws", async () => {
+  it("gracefully allows when Redis eval throws (default fail-open)", async () => {
     const redis = { eval: vi.fn().mockRejectedValue(new Error("ECONNREFUSED")) };
     const limiter = new RateLimiter(redis as unknown as RedisClientParam, { limit: 5, windowMs: 60_000 });
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     const result = await limiter.check("5.5.5.5");
     spy.mockRestore();
     expect(result.allowed).toBe(true);
+    expect(result.degraded).toBe(true);
+    expect(result.reason).toBe("REDIS_UNAVAILABLE_FAIL_OPEN");
   });
 
   it("uses the configured keyPrefix in the Redis call", async () => {
@@ -125,6 +140,166 @@ describe("RateLimiter.check", () => {
     const calls = (redis.eval as ReturnType<typeof vi.fn>).mock.calls;
     expect(calls[0][2]).toBe("rl:192.168.0.1");
     expect(calls[1][2]).toBe("rl:192.168.0.2");
+  });
+});
+
+// ── Shared Atomic Counters Across App Instances & Redis Outage Behavior (#100) ─
+
+describe("Distributed Atomic Rate Limiting & Outage Fail-Safety (Issue #100)", () => {
+  it("Lua script uses shared atomic Redis INCR counter instead of math.random", () => {
+    expect(SLIDING_WINDOW_SCRIPT).toContain("redis.call('INCR', seq_key)");
+    expect(SLIDING_WINDOW_SCRIPT).not.toContain("math.random");
+    expect(SLIDING_WINDOW_SCRIPT).toContain("if count < limit then");
+  });
+
+  it("enforces exact quota across multiple app instances sharing atomic counters", async () => {
+    const sharedStore = new SharedAtomicCounterStore();
+    const instanceA = new RateLimiter(sharedStore.asRedisClient(), {
+      limit: 5,
+      windowMs: 60_000,
+      keyPrefix: "rl:submit",
+      routeClass: "financial-submission",
+    });
+    const instanceB = new RateLimiter(sharedStore.asRedisClient(), {
+      limit: 5,
+      windowMs: 60_000,
+      keyPrefix: "rl:submit",
+      routeClass: "financial-submission",
+    });
+    const instanceC = new RateLimiter(sharedStore.asRedisClient(), {
+      limit: 5,
+      windowMs: 60_000,
+      keyPrefix: "rl:submit",
+      routeClass: "financial-submission",
+    });
+
+    // Fire 8 concurrent requests distributed across 3 app instances for the same client IP
+    const results = await Promise.all([
+      instanceA.check("203.0.113.10"),
+      instanceB.check("203.0.113.10"),
+      instanceC.check("203.0.113.10"),
+      instanceA.check("203.0.113.10"),
+      instanceB.check("203.0.113.10"),
+      instanceC.check("203.0.113.10"),
+      instanceA.check("203.0.113.10"),
+      instanceB.check("203.0.113.10"),
+    ]);
+
+    const allowedCount = results.filter((r) => r.allowed).length;
+    const rejectedCount = results.filter((r) => !r.allowed).length;
+    expect(allowedCount).toBe(5);
+    expect(rejectedCount).toBe(3);
+    expect(results[4].remaining).toBe(0);
+    expect(results[5].allowed).toBe(false);
+    expect(results[5].reason).toBe("RATE_LIMIT_EXCEEDED");
+  });
+
+  it("does not extend the lockout window when blocked requests continue arriving", () => {
+    const store = new SharedAtomicCounterStore();
+    const t0 = 1_700_000_000_000;
+    // Admit 2 requests (limit = 2, window = 10_000ms)
+    expect(store.evaluate("rl:test:ip", t0, 10_000, 2, 11)[0]).toBe(1);
+    expect(store.evaluate("rl:test:ip", t0 + 1_000, 10_000, 2, 11)[0]).toBe(2);
+
+    // 3rd request at t0 + 5_000 is rejected (count = 3 > 2)
+    const [rejectedCount] = store.evaluate("rl:test:ip", t0 + 5_000, 10_000, 2, 11);
+    expect(rejectedCount).toBe(3);
+
+    // At t0 + 11_001, the first two requests have expired; because the 3rd was not admitted,
+    // a new request is allowed immediately instead of being locked out until t0 + 15_000!
+    const [afterWindowCount] = store.evaluate("rl:test:ip", t0 + 11_001, 10_000, 2, 11);
+    expect(afterWindowCount).toBe(1);
+  });
+
+  it("fails closed for financial-submission, sensitive-mutation, and admin-privileged routes on Redis outage", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const brokenRedis = {
+      eval: vi.fn().mockRejectedValue(new Error("Redis cluster down: ECONNREFUSED")),
+    } as unknown as RedisClientParam;
+
+    for (const routeClass of [
+      "financial-submission",
+      "sensitive-mutation",
+      "admin-privileged",
+    ] as const) {
+      expect(resolveRouteClassPolicy(routeClass).failurePolicy).toBe("fail-closed");
+
+      // Both null Redis and runtime Redis error must fail closed
+      const limiterNull = new RateLimiter(null, { limit: 10, routeClass });
+      const resNull = await limiterNull.check("198.51.100.5");
+      expect(resNull.allowed).toBe(false);
+      expect(resNull.degraded).toBe(true);
+      expect(resNull.failurePolicy).toBe("fail-closed");
+      expect(resNull.routeClass).toBe(routeClass);
+      expect(resNull.reason).toBe("REDIS_UNAVAILABLE_FAIL_CLOSED");
+
+      const limiterErr = new RateLimiter(brokenRedis, { limit: 10, routeClass });
+      const resErr = await limiterErr.check("198.51.100.5");
+      expect(resErr.allowed).toBe(false);
+      expect(resErr.degraded).toBe(true);
+      expect(resErr.reason).toBe("REDIS_UNAVAILABLE_FAIL_CLOSED");
+    }
+    spy.mockRestore();
+  });
+
+  it("falls back to bounded in-memory atomic counter for standard-write routes on Redis outage", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const brokenRedis = {
+      eval: vi.fn().mockRejectedValue(new Error("ETIMEDOUT")),
+    } as unknown as RedisClientParam;
+
+    const limiter = new RateLimiter(brokenRedis, {
+      limit: 2,
+      windowMs: 60_000,
+      routeClass: "standard-write",
+    });
+
+    const first = await limiter.check("198.51.100.99");
+    const second = await limiter.check("198.51.100.99");
+    const third = await limiter.check("198.51.100.99");
+
+    expect(first.allowed).toBe(true);
+    expect(first.degraded).toBe(true);
+    expect(first.failurePolicy).toBe("fallback-memory");
+    expect(first.reason).toBe("REDIS_UNAVAILABLE_FALLBACK_MEMORY");
+
+    expect(second.allowed).toBe(true);
+    expect(second.remaining).toBe(0);
+
+    expect(third.allowed).toBe(false);
+    expect(third.degraded).toBe(true);
+    expect(third.reason).toBe("RATE_LIMIT_EXCEEDED");
+
+    spy.mockRestore();
+  });
+
+  it("fails open for public-read routes on Redis outage", async () => {
+    const limiter = createRouteClassLimiter("public-read", null, { limit: 5 });
+    const res = await limiter.check("198.51.100.77");
+    expect(res.allowed).toBe(true);
+    expect(res.degraded).toBe(true);
+    expect(res.failurePolicy).toBe("fail-open");
+    expect(res.reason).toBe("REDIS_UNAVAILABLE_FAIL_OPEN");
+  });
+
+  it("returns 503 Service Unavailable with X-RateLimit-Degraded header from middleware when fail-closed route encounters Redis outage", async () => {
+    const limiter = createRouteClassLimiter("financial-submission", null, { limit: 10 });
+    const req = new NextRequest("http://localhost/api/tax/generate-1099", {
+      method: "POST",
+      headers: { "x-forwarded-for": "203.0.113.42" },
+    });
+
+    const response = await checkRateLimit(req, limiter);
+    expect(response).not.toBeNull();
+    expect(response!.status).toBe(503);
+    expect(response!.headers.get("X-RateLimit-Degraded")).toBe("true");
+    expect(response!.headers.get("X-RateLimit-Policy-Mode")).toBe("fail-closed");
+    expect(response!.headers.get("Retry-After")).toBeDefined();
+
+    const body = await response!.json();
+    expect(body.code).toBe("RATE_LIMIT_BACKEND_UNAVAILABLE");
+    expect(body.degraded).toBe(true);
+    expect(body.routeClass).toBe("financial-submission");
   });
 });
 
@@ -190,7 +365,7 @@ describe("createRateLimiter", () => {
       keyPrefix: "rl:test",
     });
     await limiter.check("x");
-    expect((redis.eval as ReturnType<typeof vi.fn>).mock.calls[0][4]).toBe("5");
+    expect((redis.eval as ReturnType<typeof vi.fn>).mock.calls[0][5]).toBe("5");
     expect((redis.eval as ReturnType<typeof vi.fn>).mock.calls[0][2]).toBe("rl:test:x");
   });
 });
@@ -282,3 +457,4 @@ describe("Campaign API Rate Limiting by Campaign Size & Funding Tier (Issue #877
     expect(resolveCampaignApiTier(null, null).id).toBe("basic");
   });
 });
+

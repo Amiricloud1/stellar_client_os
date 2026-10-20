@@ -296,11 +296,14 @@ function QueueItemRow({
           {/* Action 1: Keep local */}
           <Button
             type="button"
-            size="sm"
-            variant="outline"
-            onClick={() => onResolveConflict?.(item.id, { action: "use_local" })}
-            className="h-7 text-xs border-orange-500/40 bg-orange-500/10 text-orange-200 hover:bg-orange-500/20"
-            aria-label={`Keep local version for ${item.label}`}
+            onClick={() => onRetry(item.id)}
+            aria-label={`Retry syncing ${item.label}`}
+            className={cn(
+              "inline-flex min-h-9 min-w-9 items-center justify-center rounded-md p-2 text-white/50 hover:text-white",
+              "hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2",
+              "focus-visible:ring-white/30 transition-all duration-150",
+              "disabled:cursor-not-allowed disabled:opacity-40"
+            )}
           >
             <UploadCloud className="mr-1 h-3 w-3" aria-hidden="true" />
             Keep local
@@ -309,11 +312,13 @@ function QueueItemRow({
           {/* Action 2: Accept server */}
           <Button
             type="button"
-            size="sm"
-            variant="outline"
-            onClick={() => onResolveConflict?.(item.id, { action: "use_server" })}
-            className="h-7 text-xs border-white/20 bg-white/5 text-white/80 hover:bg-white/10"
-            aria-label={`Accept server version for ${item.label}`}
+            onClick={() => onRemove(item.id)}
+            aria-label={`Remove ${item.label} from queue`}
+            className={cn(
+              "inline-flex min-h-9 min-w-9 items-center justify-center rounded-md p-2 text-white/30 hover:text-red-400",
+              "hover:bg-red-400/10 focus-visible:outline-none focus-visible:ring-2",
+              "focus-visible:ring-red-400/30 transition-all duration-150"
+            )}
           >
             <Server className="mr-1 h-3 w-3" aria-hidden="true" />
             Accept server
@@ -484,8 +489,9 @@ export function SyncQueueDrawer({ open, onClose, syncQueue }: SyncQueueDrawerPro
     <Sheet open={open} onOpenChange={(o) => !o && onClose()}>
       <SheetContent
         side="bottom"
+        data-testid="sync-queue-drawer"
         className={cn(
-          "max-h-[85dvh] rounded-t-2xl border-white/10",
+          "w-full max-w-full overflow-x-hidden max-h-[85dvh] rounded-t-2xl border-white/10",
           "bg-fundable-dark text-white",
           "flex flex-col gap-0 p-0",
           "sm:side-right sm:max-h-full sm:rounded-none sm:rounded-l-2xl",

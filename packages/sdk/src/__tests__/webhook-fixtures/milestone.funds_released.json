@@ -1,0 +1,12 @@
+{
+  "eventVersion": 1,
+  "eventId": "milestone:cmp_12345:25",
+  "eventType": "milestone.funds_released",
+  "subscriptionId": "sub_12345abcd",
+  "deliveredAt": "2026-07-29T13:00:00.000Z",
+  "payload": {
+    "campaignId": "cmp_12345",
+    "percentage": 25,
+    "releasedAmount": "100.00"
+  }
+}

@@ -15,6 +15,16 @@
  * the network.
  */
 
+import {
+  DEFAULT_MAX_AUTHORITY_STALENESS_MS,
+  getAnalyticsMetricDefinitions,
+  validateStreamMetricsAgainstLedger,
+  type AnalyticsAuthorityReport,
+  type AnalyticsMetricDefinition,
+  type AnalyticsMetricKey,
+  type AuthoritativeLedgerSnapshot,
+} from "@/lib/analytics-authority";
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export type StreamStatusFilter = "Active" | "Paused" | "Canceled" | "Completed";
@@ -75,6 +85,11 @@ export interface GlobalMetrics {
   uniqueRegions: number;
   uniqueCategories: number;
   latestStreamAt: number | null;
+}
+
+export interface GlobalMetricsWithAuthority extends GlobalMetrics {
+  authority: AnalyticsAuthorityReport;
+  metricDefinitions: Record<AnalyticsMetricKey, AnalyticsMetricDefinition>;
 }
 
 export interface RegionFilter {
@@ -194,6 +209,7 @@ function toCo2Kg(volumeUsd: bigint): number {
 /** Pluggable data source interface — swap for a real DB/RPC in production. */
 export interface StreamDataSource {
   getStreams(network: string): Promise<StreamRecord[]>;
+  getLedgerSnapshot?(network: string): Promise<AuthoritativeLedgerSnapshot | null>;
 }
 
 // ── Default data source (reads from env-configured Stellar RPC) ───────────────
@@ -302,6 +318,10 @@ function paginate<T>(items: T[], pagination?: PaginationInput): T[] {
 export class AnalyticsService {
   constructor(private readonly dataSource: StreamDataSource = new DefaultStreamDataSource()) {}
 
+  getMetricDefinitions(): Record<AnalyticsMetricKey, AnalyticsMetricDefinition> {
+    return getAnalyticsMetricDefinitions();
+  }
+
   // ── globalMetrics ─────────────────────────────────────────────────────────
 
   async getGlobalMetrics(network = "testnet"): Promise<GlobalMetrics> {
@@ -327,6 +347,61 @@ export class AnalyticsService {
       uniqueRegions: regions.size,
       uniqueCategories: categories.size,
       latestStreamAt,
+    };
+  }
+
+  async getGlobalMetricsWithAuthority(
+    network = "testnet",
+    options: {
+      now?: number;
+      maxStalenessMs?: number;
+      ledgerSnapshot?: AuthoritativeLedgerSnapshot | null;
+    } = {},
+  ): Promise<GlobalMetricsWithAuthority> {
+    const metrics = await this.getGlobalMetrics(network);
+    const now = options.now ?? Date.now();
+    const maxStalenessMs = options.maxStalenessMs ?? DEFAULT_MAX_AUTHORITY_STALENESS_MS;
+
+    let authority: AnalyticsAuthorityReport;
+    if (options.ledgerSnapshot !== undefined) {
+      authority = validateStreamMetricsAgainstLedger(metrics, options.ledgerSnapshot, {
+        now,
+        maxStalenessMs,
+      });
+    } else if (typeof this.dataSource.getLedgerSnapshot === "function") {
+      try {
+        const snapshot = await this.dataSource.getLedgerSnapshot(network);
+        authority = validateStreamMetricsAgainstLedger(metrics, snapshot, {
+          now,
+          maxStalenessMs,
+        });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : "Authority source unreachable";
+        authority = {
+          state: "unavailable",
+          isAuthoritative: false,
+          isFresh: false,
+          ledgerSequence: null,
+          ledgerClosedAt: null,
+          checkedAt: now,
+          stalenessMs: null,
+          maxStalenessMs,
+          reason: "authority_error",
+          message: `Authoritative stream ledger query failed: ${detail}`,
+          discrepancies: [],
+        };
+      }
+    } else {
+      authority = validateStreamMetricsAgainstLedger(metrics, null, {
+        now,
+        maxStalenessMs,
+      });
+    }
+
+    return {
+      ...metrics,
+      authority,
+      metricDefinitions: getAnalyticsMetricDefinitions(),
     };
   }
 

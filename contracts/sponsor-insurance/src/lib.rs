@@ -239,6 +239,17 @@ impl SponsorInsuranceContract {
             .persistent()
             .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
 
+        // Update insurance fund balance reflecting claim payout
+        let fund: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::InsuranceFund)
+            .unwrap_or(0);
+        let new_fund = fund.saturating_sub(policy.coverage_amount).max(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::InsuranceFund, &new_fund);
+
         env.events().publish(
             ("InsuranceClaimed", tree_id),
             (policy.sponsor, tree_id, policy.coverage_amount),
@@ -469,6 +480,74 @@ mod tests {
         let new_admin = Address::generate(&env);
         client.set_admin(&new_admin);
         assert_eq!(client.get_admin(), new_admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #7)")]
+    fn test_claim_after_expiry_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, token_admin_client) = create_token(&env, &token_admin);
+        let sponsor = Address::generate(&env);
+        token_admin_client.mint(&sponsor, &10_000);
+
+        client.purchase_insurance(&sponsor, &1, &5_000, &token_addr);
+
+        // Advance time past policy duration
+        set_time(&env, 1_000 + POLICY_DURATION + 1);
+        client.claim_insurance(&1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_duplicate_claim_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, token_admin_client) = create_token(&env, &token_admin);
+        let sponsor = Address::generate(&env);
+        token_admin_client.mint(&sponsor, &10_000);
+
+        client.purchase_insurance(&sponsor, &1, &5_000, &token_addr);
+        client.claim_insurance(&1);
+
+        // Second claim attempt must fail with PolicyNotActive
+        client.claim_insurance(&1);
+    }
+
+    #[test]
+    fn test_premium_conservation_and_claim_accounting() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, token_admin_client) = create_token(&env, &token_admin);
+        let sponsor1 = Address::generate(&env);
+        let sponsor2 = Address::generate(&env);
+        token_admin_client.mint(&sponsor1, &10_000);
+        token_admin_client.mint(&sponsor2, &10_000);
+
+        // Policy 1: premium 100 (2% of 5,000)
+        client.purchase_insurance(&sponsor1, &1, &5_000, &token_addr);
+        assert_eq!(client.get_insurance_fund(), 100);
+
+        // Policy 2: premium 200 (2% of 10,000)
+        client.purchase_insurance(&sponsor2, &2, &10_000, &token_addr);
+        assert_eq!(client.get_insurance_fund(), 300);
+
+        // Claim policy 1
+        client.claim_insurance(&1);
+        // Fund accounts for coverage payout
+        assert_eq!(client.get_insurance_fund(), 0);
     }
 }
 

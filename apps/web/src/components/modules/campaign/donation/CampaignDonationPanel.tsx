@@ -114,10 +114,10 @@ export function CampaignDonationPanel({
     return (
       <section
         data-testid="donation-receipt"
-        className="rounded-2xl border border-emerald-500/30 bg-emerald-500/5 p-6"
+        className="w-full max-w-full overflow-x-hidden rounded-2xl border border-emerald-500/30 bg-emerald-500/5 p-4 sm:p-6"
       >
         <div className="flex items-center gap-2 text-emerald-300">
-          <Receipt className="h-5 w-5" aria-hidden="true" />
+          <Receipt className="h-5 w-5 shrink-0" aria-hidden="true" />
           <h2 className="text-lg font-semibold">Donation confirmed</h2>
         </div>
         <p className="mt-2 text-sm text-zinc-300">
@@ -125,25 +125,25 @@ export function CampaignDonationPanel({
         </p>
 
         <dl className="mt-6 divide-y divide-white/10 rounded-xl border border-white/10">
-          <div className="flex justify-between gap-4 p-3 text-sm">
+          <div className="flex flex-wrap justify-between gap-2 sm:gap-4 p-3 text-sm">
             <dt className="text-zinc-400">Receipt reference</dt>
-            <dd data-testid="donation-reference" className="font-mono text-zinc-100">
+            <dd data-testid="donation-reference" className="break-all font-mono text-zinc-100">
               {receipt.reference}
             </dd>
           </div>
-          <div className="flex justify-between gap-4 p-3 text-sm">
+          <div className="flex flex-wrap justify-between gap-2 sm:gap-4 p-3 text-sm">
             <dt className="text-zinc-400">Amount</dt>
             <dd className="text-zinc-100">
               {receipt.amount} {receipt.token}
             </dd>
           </div>
-          <div className="flex justify-between gap-4 p-3 text-sm">
+          <div className="flex flex-wrap justify-between gap-2 sm:gap-4 p-3 text-sm">
             <dt className="text-zinc-400">Allocated to</dt>
             <dd className="text-zinc-100">{receipt.allocationLabel}</dd>
           </div>
-          <div className="flex justify-between gap-4 p-3 text-sm">
+          <div className="flex flex-wrap justify-between gap-2 sm:gap-4 p-3 text-sm">
             <dt className="text-zinc-400">Donor</dt>
-            <dd className="text-zinc-100">
+            <dd className="break-all text-zinc-100">
               {anonymous ? "Anonymous" : maskDonorAddress(receipt.donorAddress)}
             </dd>
           </div>
@@ -159,7 +159,7 @@ export function CampaignDonationPanel({
           </span>
         </div>
 
-        <Button type="button" variant="outline" className="mt-6" onClick={reset}>
+        <Button type="button" variant="outline" className="mt-6 w-full sm:w-auto" onClick={reset}>
           Make another donation
         </Button>
       </section>
@@ -167,9 +167,12 @@ export function CampaignDonationPanel({
   }
 
   return (
-    <section className="rounded-2xl border border-white/10 bg-white/[0.04] p-6 shadow-2xl">
+    <section
+      data-testid="campaign-donation-panel"
+      className="w-full max-w-full overflow-x-hidden rounded-2xl border border-white/10 bg-white/[0.04] p-4 sm:p-6 shadow-2xl"
+    >
       <div className="flex items-center gap-2">
-        <Heart className="h-5 w-5 text-rose-400" aria-hidden="true" />
+        <Heart className="h-5 w-5 shrink-0 text-rose-400" aria-hidden="true" />
         <h2 className="text-lg font-semibold text-zinc-100">
           Donate to {campaignName ?? "this campaign"}
         </h2>
@@ -207,8 +210,8 @@ export function CampaignDonationPanel({
         </div>
       </div>
 
-      <div className="mt-5 grid gap-5 sm:grid-cols-[1fr_auto]">
-        <div>
+      <div className="mt-5 grid gap-4 sm:gap-5 sm:grid-cols-[1fr_auto]">
+        <div className="min-w-0">
           <label htmlFor="donation-amount" className="block text-sm text-zinc-300">
             Donation amount
           </label>
@@ -225,10 +228,10 @@ export function CampaignDonationPanel({
             aria-describedby={error ? "donation-error" : undefined}
             value={amount}
             onChange={(event) => setAmount(event.target.value)}
-            className="mt-2"
+            className="mt-2 w-full"
           />
         </div>
-        <div>
+        <div className="min-w-0">
           <label htmlFor="donation-token" className="block text-sm text-zinc-300">
             Token
           </label>
@@ -238,7 +241,7 @@ export function CampaignDonationPanel({
             aria-label="Select donation token currency"
             value={token}
             onChange={(event) => setToken(event.target.value as DonationToken)}
-            className="mt-2 h-10 rounded-md border border-white/10 bg-black/30 px-3 text-sm text-zinc-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+            className="mt-2 h-10 w-full sm:w-auto rounded-md border border-white/10 bg-black/30 px-3 text-sm text-zinc-100"
           >
             {DONATION_TOKENS.map((option) => (
               <option key={option} value={option}>
@@ -294,7 +297,7 @@ export function CampaignDonationPanel({
         aria-label={submitting ? "Recording donation" : `Submit donation of ${amount ? `${amount} ${token}` : "selected amount"}`}
         disabled={submitting}
         onClick={submit}
-        className="mt-6"
+        className="mt-6 w-full sm:w-auto"
       >
         {submitting ? "Recording donation…" : `Donate ${amount ? `${amount} ${token}` : "now"}`}
       </Button>

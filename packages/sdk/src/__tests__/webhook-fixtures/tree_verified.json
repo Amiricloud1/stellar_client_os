@@ -1,0 +1,15 @@
+{
+  "eventVersion": 1,
+  "eventId": "ver_555123",
+  "eventType": "tree_verified",
+  "subscriptionId": "sub_12345abcd",
+  "deliveredAt": "2026-07-29T13:00:00.000Z",
+  "payload": {
+    "campaignId": "cmp_12345",
+    "treeId": "tree_8849",
+    "verifierId": "vrf_2201",
+    "verifiedAt": "2026-07-29T13:00:00.000Z",
+    "latitude": 12.345678,
+    "longitude": 98.765432
+  }
+}
