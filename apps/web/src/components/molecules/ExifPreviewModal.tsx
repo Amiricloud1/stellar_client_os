@@ -1,8 +1,12 @@
 /**
  * ExifPreviewModal - Shows client-side extracted GPS, timestamp, and device
  * metadata for a proof file before the user confirms submission.
+ *
+ * GPS coordinates are always stripped before upload (privacy default).
+ * If GPS data was found in the file the modal surfaces a notice so the
+ * submitter is aware that location data was removed.
  */
-import { MapPin, Clock, Smartphone, AlertCircle } from 'lucide-react';
+import { MapPin, Clock, Smartphone, AlertCircle, ShieldCheck } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -42,6 +46,7 @@ export function ExifPreviewModal({
           <DialogTitle>Review file metadata</DialogTitle>
           <DialogDescription>
             Confirm the details extracted from your proof file before submitting.
+            GPS location data is always removed before upload to protect your privacy.
           </DialogDescription>
         </DialogHeader>
 
@@ -64,14 +69,20 @@ export function ExifPreviewModal({
 
         {status === 'success' && data && (
           <div className="space-y-3">
+            {/* GPS privacy notice */}
+            {data.gpsRedacted && (
+              <div className="flex items-center gap-2 p-3 rounded-lg bg-blue-500/10 border border-blue-500/20">
+                <ShieldCheck className="h-4 w-4 text-blue-400 shrink-0" />
+                <p className="text-sm text-blue-300">
+                  GPS location was found in this file and has been removed to protect your privacy.
+                </p>
+              </div>
+            )}
+
             <MetadataRow
               icon={<MapPin className="h-4 w-4 text-zinc-400" />}
               label="GPS location"
-              value={
-                data.gps
-                  ? `${data.gps.latitude.toFixed(5)}, ${data.gps.longitude.toFixed(5)}`
-                  : 'Not available'
-              }
+              value="Removed for privacy"
             />
             <MetadataRow
               icon={<Clock className="h-4 w-4 text-zinc-400" />}

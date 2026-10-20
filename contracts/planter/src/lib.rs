@@ -94,6 +94,8 @@ pub enum Error {
     InvalidRewardAmount = 6,
     /// Reward already claimed.
     RewardAlreadyClaimed = 7,
+    /// Metrics bounds exceeded (e.g. success rate > 10,000 bps or negative bond).
+    InvalidMetricsBounds = 8,
 }
 
 // ---------------------------------------------------------------------------
@@ -368,9 +370,68 @@ impl PlanterContract {
             })
     }
 
-    /// Persist aggregate metrics for a planter wallet.
-    pub fn set_planter_metrics(env: Env, wallet: Address, metrics: PlanterMetrics) {
+    /// Persist aggregate metrics for a planter wallet with bounds checking.
+    pub fn set_planter_metrics(env: Env, admin: Address, wallet: Address, metrics: PlanterMetrics) -> Result<(), Error> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        admin.require_auth();
+
+        // Enforce reporting units and invariant bounds:
+        // success_rate must be expressed in basis points (0..=10_000 bps)
+        if metrics.success_rate > 10_000 || metrics.current_bond_locked < 0 {
+            return Err(Error::InvalidMetricsBounds);
+        }
+
         env.storage().persistent().set(&wallet, &metrics);
+        env.storage().persistent().extend_ttl(&wallet, LEDGER_THRESHOLD, LEDGER_BUMP);
+        Ok(())
+    }
+
+    /// Record a verified planting batch from an authorized reporter,
+    /// updating aggregate metrics according to an independent reference model.
+    pub fn report_verified_planting_batch(
+        env: Env,
+        reporter: Address,
+        wallet: Address,
+        trees_count: u32,
+        duration_seconds: u64,
+        successful: bool,
+    ) -> Result<PlanterMetrics, Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if reporter != admin {
+            return Err(Error::Unauthorized);
+        }
+        admin.require_auth();
+
+        let mut metrics = Self::get_planter_metrics(env.clone(), wallet.clone());
+        let previous_trees = metrics.trees_completed;
+
+        if successful {
+            metrics.trees_completed = metrics.trees_completed.saturating_add(trees_count);
+        }
+
+        if previous_trees == 0 {
+            metrics.avg_completion_time = duration_seconds;
+        } else {
+            metrics.avg_completion_time = (metrics.avg_completion_time + duration_seconds) / 2;
+        }
+
+        metrics.success_rate = if successful { 10_000 } else { 0 };
+
+        env.storage().persistent().set(&wallet, &metrics);
+        env.storage().persistent().extend_ttl(&wallet, LEDGER_THRESHOLD, LEDGER_BUMP);
+
+        Ok(metrics)
     }
 }
 
@@ -479,5 +540,91 @@ mod tests {
 
         let referral_info = client.get_referral_info(&referrer);
         assert_eq!(referral_info.successful_referrals, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #24: Constrain planter metrics to verifiable units and bounds
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_planter_metrics_bounds_and_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, _, _, client) = setup(&env);
+        let stranger = Address::generate(&env);
+        let planter = Address::generate(&env);
+
+        let valid_metrics = PlanterMetrics {
+            trees_completed: 50,
+            avg_completion_time: 3600,
+            success_rate: 9_500, // 95.00%
+            current_bond_locked: 1_000_000,
+        };
+
+        // Unauthorized caller rejected
+        let res_unauth = client.try_set_planter_metrics(&stranger, &planter, &valid_metrics);
+        assert_eq!(res_unauth, Err(Ok(Error::Unauthorized)));
+
+        // Out of bounds success rate (>10_000 bps) rejected
+        let invalid_success_rate = PlanterMetrics {
+            trees_completed: 50,
+            avg_completion_time: 3600,
+            success_rate: 10_001,
+            current_bond_locked: 1_000_000,
+        };
+        let res_invalid = client.try_set_planter_metrics(&admin, &planter, &invalid_success_rate);
+        assert_eq!(res_invalid, Err(Ok(Error::InvalidMetricsBounds)));
+
+        // Negative bond rejected
+        let negative_bond = PlanterMetrics {
+            trees_completed: 50,
+            avg_completion_time: 3600,
+            success_rate: 9_500,
+            current_bond_locked: -1,
+        };
+        let res_negative = client.try_set_planter_metrics(&admin, &planter, &negative_bond);
+        assert_eq!(res_negative, Err(Ok(Error::InvalidMetricsBounds)));
+
+        // Valid update succeeds
+        let res_ok = client.try_set_planter_metrics(&admin, &planter, &valid_metrics);
+        assert_eq!(res_ok, Ok(Ok(())));
+        let stored = client.get_planter_metrics(&planter);
+        assert_eq!(stored, valid_metrics);
+    }
+
+    #[test]
+    fn test_reference_model_aggregation_comparison() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, _, _, client) = setup(&env);
+        let planter = Address::generate(&env);
+
+        // Independent reference model
+        struct ReferenceModel {
+            trees: u32,
+            avg_time: u64,
+            success_bps: u32,
+        }
+        let mut reference = ReferenceModel { trees: 0, avg_time: 0, success_bps: 0 };
+
+        // Batch 1: 100 trees, 7200 seconds, successful
+        let res1 = client.report_verified_planting_batch(&admin, &planter, &100, &7200, &true);
+        reference.trees += 100;
+        reference.avg_time = 7200;
+        reference.success_bps = 10_000;
+
+        assert_eq!(res1.trees_completed, reference.trees);
+        assert_eq!(res1.avg_completion_time, reference.avg_time);
+        assert_eq!(res1.success_rate, reference.success_bps);
+
+        // Batch 2: 50 trees, 3600 seconds, successful
+        let res2 = client.report_verified_planting_batch(&admin, &planter, &50, &3600, &true);
+        reference.trees += 50;
+        reference.avg_time = (reference.avg_time + 3600) / 2; // (7200 + 3600) / 2 = 5400
+        reference.success_bps = 10_000;
+
+        assert_eq!(res2.trees_completed, reference.trees);
+        assert_eq!(res2.avg_completion_time, reference.avg_time);
+        assert_eq!(res2.success_rate, reference.success_bps);
     }
 }

@@ -1,8 +1,41 @@
 'use client';
 
-import { Bell, Menu, X, Loader2 } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Bell, Contrast, Menu, X, Loader2 } from 'lucide-react';
 import { useWallet } from '@/providers/StellarWalletProvider';
-import { HighContrastToggle } from '@/components/ui/high-contrast-toggle';
+
+const HIGH_CONTRAST_STORAGE_KEY = 'fundable-high-contrast';
+
+function HighContrastToggle() {
+  const [enabled, setEnabled] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const stored = window.localStorage.getItem(HIGH_CONTRAST_STORAGE_KEY) === 'true';
+    setEnabled(stored);
+  }, []);
+
+  const toggle = () => {
+    const next = !enabled;
+    setEnabled(next);
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem(HIGH_CONTRAST_STORAGE_KEY, String(next));
+      document.documentElement.classList.toggle('high-contrast', next);
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={toggle}
+      aria-pressed={enabled}
+      aria-label="Toggle high contrast mode"
+      className="inline-grid size-10 shrink-0 place-content-center rounded-full bg-fundable-mid-dark hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-fundable-purple-2"
+    >
+      <Contrast aria-hidden="true" className="size-4" />
+    </button>
+  );
+}
 
 export interface HeaderProps {
   title: string;
@@ -18,7 +51,7 @@ function WalletStatus() {
     return (
       <div
         role="status"
-        aria-label="Connecting wallet…
+        aria-label="Connecting wallet…"
         className="flex items-center gap-2 text-sm text-white/60"
       >
         <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
@@ -55,25 +88,25 @@ export function Header({
   const MenuIcon = isMenuOpen ? X : Menu;
 
   return (
-    <header className="flex items-center justify-between border-b border-b-fundable-mid-dark px-3 py-3 text-white md:px-5">
-      <div className="flex items-center gap-x-2">
+    <header className="flex w-full max-w-full items-center justify-between gap-2 overflow-x-hidden border-b border-b-fundable-mid-dark px-3 py-3 text-white md:px-5">
+      <div className="flex min-w-0 items-center gap-x-2">
         {onMenuToggle && (
           <button
             type="button"
             onClick={onMenuToggle}
             aria-label={isMenuOpen ? "Close navigation menu" : "Open navigation menu"}
             aria-expanded={isMenuOpen}
-            className="inline-grid size-10 place-content-center rounded-md hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-fundable-purple-2"
+            className="inline-grid size-10 shrink-0 place-content-center rounded-md hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-fundable-purple-2"
           >
             <MenuIcon aria-hidden="true" className="size-5" />
           </button>
         )}
-        <h1 className="font-bricolage text-xl font-medium capitalize md:text-2xl">
+        <h1 className="truncate font-bricolage text-xl font-medium capitalize md:text-2xl">
           {title}
         </h1>
       </div>
 
-      <div className="flex items-center gap-2">
+      <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
         <WalletStatus />
         <HighContrastToggle />
         {onNotificationsClick && (
@@ -81,7 +114,7 @@ export function Header({
             type="button"
             onClick={onNotificationsClick}
             aria-label="View notifications"
-            className="inline-grid size-12 place-content-center rounded-full bg-fundable-mid-dark hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-fundable-purple-2"
+            className="inline-grid size-10 sm:size-12 place-content-center rounded-full bg-fundable-mid-dark hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-fundable-purple-2"
           >
             <Bell aria-hidden="true" className="size-5" />
           </button>

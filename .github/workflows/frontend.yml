@@ -52,4 +52,17 @@ jobs:
       - name: Lint frontend
         run: pnpm lint
 
-  
+      - name: Run frontend unit and component workflow tests
+        run: |
+          pnpm --filter @fundable/web exec vitest run \
+            src/services/admin-analytics-dashboard.service.test.ts \
+            analytics/page.test.tsx \
+            src/graphql/analytics.service.test.ts \
+            src/lib/__tests__/sanitize-error.test.ts \
+            src/lib/error-reporting.test.ts \
+            src/components/__tests__/responsive-workflows.test.tsx \
+            src/components/organisms/SyncQueueBanner.test.tsx \
+            src/stories/__tests__/storybook.test.tsx
+
+      - name: Build and verify Storybook static assets
+        run: pnpm --filter @fundable/web build-storybook

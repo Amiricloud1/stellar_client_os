@@ -1,4 +1,3 @@
-import type { ReactNode } from "react";
 
 export type ActionType =
   | "all"
@@ -50,29 +49,40 @@ export function FilterPanel({
   };
 
   return (
-    <aside className="rounded-2xl border border-white/10 bg-[#111827] p-4 text-sm text-slate-200">
+    <aside
+      aria-label="Audit filters"
+      className="rounded-2xl border border-white/10 bg-[#111827] p-4 text-sm text-slate-200"
+    >
       <div className="mb-4 flex items-center justify-between">
         <h2 className="text-base font-semibold text-white">Filters</h2>
-        <span className="text-xs text-slate-400">{totalResults} results</span>
+        <span className="text-xs text-slate-400" aria-live="polite">
+          {totalResults} results
+        </span>
       </div>
 
       <div className="space-y-4">
         <div>
-          <label className="mb-1 block text-xs uppercase tracking-wide text-slate-400">Search</label>
+          <label htmlFor="audit-filter-search" className="mb-1 block text-xs uppercase tracking-wide text-slate-400">
+            Search
+          </label>
           <input
+            id="audit-filter-search"
             value={filters.search}
             onChange={(event) => updateField("search", event.target.value)}
-            className="w-full rounded-lg border border-white/10 bg-slate-900 px-3 py-2 text-sm text-white outline-none ring-0"
+            className="w-full rounded-lg border border-white/10 bg-slate-900 px-3 py-2 text-sm text-white outline-none focus-visible:ring-2 focus-visible:ring-fundable-purple-2"
             placeholder="Search actions"
           />
         </div>
 
         <div>
-          <label className="mb-1 block text-xs uppercase tracking-wide text-slate-400">Action</label>
+          <label htmlFor="audit-filter-action" className="mb-1 block text-xs uppercase tracking-wide text-slate-400">
+            Action
+          </label>
           <select
+            id="audit-filter-action"
             value={filters.actionType}
             onChange={(event) => updateField("actionType", event.target.value as ActionType)}
-            className="w-full rounded-lg border border-white/10 bg-slate-900 px-3 py-2 text-sm text-white outline-none"
+            className="w-full rounded-lg border border-white/10 bg-slate-900 px-3 py-2 text-sm text-white outline-none focus-visible:ring-2 focus-visible:ring-fundable-purple-2"
           >
             <option value="all">All</option>
             <option value="stream_created">stream created</option>
@@ -88,11 +98,14 @@ export function FilterPanel({
         </div>
 
         <div>
-          <label className="mb-1 block text-xs uppercase tracking-wide text-slate-400">Date range</label>
+          <label htmlFor="audit-filter-date-range" className="mb-1 block text-xs uppercase tracking-wide text-slate-400">
+            Date range
+          </label>
           <select
+            id="audit-filter-date-range"
             value={filters.dateRange}
             onChange={(event) => updateField("dateRange", event.target.value as AuditFilters["dateRange"])}
-            className="w-full rounded-lg border border-white/10 bg-slate-900 px-3 py-2 text-sm text-white outline-none"
+            className="w-full rounded-lg border border-white/10 bg-slate-900 px-3 py-2 text-sm text-white outline-none focus-visible:ring-2 focus-visible:ring-fundable-purple-2"
           >
             <option value="7d">Last 7 days</option>
             <option value="30d">Last 30 days</option>
@@ -102,41 +115,53 @@ export function FilterPanel({
 
         <div className="grid grid-cols-2 gap-2">
           <div>
-            <label className="mb-1 block text-[10px] uppercase tracking-wide text-slate-400">From</label>
+            <label htmlFor="audit-filter-custom-start" className="mb-1 block text-[10px] uppercase tracking-wide text-slate-400">
+              From
+            </label>
             <input
+              id="audit-filter-custom-start"
               type="date"
               value={filters.customStart}
               onChange={(event) => updateField("customStart", event.target.value)}
-              className="w-full rounded-lg border border-white/10 bg-slate-900 px-2 py-2 text-sm text-white outline-none"
+              className="w-full rounded-lg border border-white/10 bg-slate-900 px-2 py-2 text-sm text-white outline-none focus-visible:ring-2 focus-visible:ring-fundable-purple-2"
             />
           </div>
           <div>
-            <label className="mb-1 block text-[10px] uppercase tracking-wide text-slate-400">To</label>
+            <label htmlFor="audit-filter-custom-end" className="mb-1 block text-[10px] uppercase tracking-wide text-slate-400">
+              To
+            </label>
             <input
+              id="audit-filter-custom-end"
               type="date"
               value={filters.customEnd}
               onChange={(event) => updateField("customEnd", event.target.value)}
-              className="w-full rounded-lg border border-white/10 bg-slate-900 px-2 py-2 text-sm text-white outline-none"
+              className="w-full rounded-lg border border-white/10 bg-slate-900 px-2 py-2 text-sm text-white outline-none focus-visible:ring-2 focus-visible:ring-fundable-purple-2"
             />
           </div>
         </div>
 
         <div>
-          <label className="mb-1 block text-xs uppercase tracking-wide text-slate-400">User</label>
+          <label htmlFor="audit-filter-user" className="mb-1 block text-xs uppercase tracking-wide text-slate-400">
+            User
+          </label>
           <input
+            id="audit-filter-user"
             value={filters.user}
             onChange={(event) => updateField("user", event.target.value)}
-            className="w-full rounded-lg border border-white/10 bg-slate-900 px-3 py-2 text-sm text-white outline-none"
+            className="w-full rounded-lg border border-white/10 bg-slate-900 px-3 py-2 text-sm text-white outline-none focus-visible:ring-2 focus-visible:ring-fundable-purple-2"
             placeholder="alice@stellar.org"
           />
         </div>
 
         <div>
-          <label className="mb-1 block text-xs uppercase tracking-wide text-slate-400">Resource</label>
+          <label htmlFor="audit-filter-resource" className="mb-1 block text-xs uppercase tracking-wide text-slate-400">
+            Resource
+          </label>
           <input
+            id="audit-filter-resource"
             value={filters.resource}
             onChange={(event) => updateField("resource", event.target.value)}
-            className="w-full rounded-lg border border-white/10 bg-slate-900 px-3 py-2 text-sm text-white outline-none"
+            className="w-full rounded-lg border border-white/10 bg-slate-900 px-3 py-2 text-sm text-white outline-none focus-visible:ring-2 focus-visible:ring-fundable-purple-2"
             placeholder="stream-..."
           />
         </div>
@@ -144,7 +169,7 @@ export function FilterPanel({
         <button
           type="button"
           onClick={onReset}
-          className="w-full rounded-lg border border-white/10 bg-slate-800 px-3 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700"
+          className="min-h-[36px] w-full rounded-lg border border-white/10 bg-slate-800 px-3 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-fundable-purple-2 transition-colors"
         >
           Reset filters
         </button>
