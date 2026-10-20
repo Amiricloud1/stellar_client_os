@@ -101,3 +101,5 @@ export {
   CONTRACT_ERRORS,
   type ParsedContractError,
 } from "./utils/errors.js";
+export * from "./utils/error-catalog.js";
+
