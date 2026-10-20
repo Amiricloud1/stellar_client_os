@@ -416,6 +416,8 @@ pub struct SpeciesProofVerifiedEvent {
     pub campaign_id: u64,
     pub planting_id: u64,
     pub species_code: BytesN<32>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InsurancePoolFundedEvent {
@@ -423,6 +425,7 @@ pub struct InsurancePoolFundedEvent {
     pub token: Address,
     pub amount: i128,
     pub pool_balance: i128,
+}
 /// Contribution event used when a sponsor chooses anonymity on public surfaces.
 ///
 /// The contributor address is deliberately omitted. Soroban ledger data and the
@@ -783,6 +786,11 @@ pub enum Error {
     UnauthorizedVerifier = 42,
     /// Escrow account is currently disputed.
     EscrowDisputed = 43,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     // -----------------------------------------------------------------------
     // Campaign Escrow Tests (Issue #864)
@@ -853,6 +861,144 @@ pub enum Error {
 
         // Cannot release funds before verification! (Panics with EscrowNotVerified #40)
         client.release_escrow_to_creator(&id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Escrow State Transition Edge Tests (Issue #19)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_escrow_repeated_deposits_accumulate_consistently() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, token_admin_client) = create_token(&env, &token_admin);
+        let creator = Address::generate(&env);
+        let verifier = Address::generate(&env);
+        let sponsor_a = Address::generate(&env);
+        let sponsor_b = Address::generate(&env);
+
+        token_admin_client.mint(&sponsor_a, &10_000);
+        token_admin_client.mint(&sponsor_b, &10_000);
+        let id = client.create_campaign(&creator, &token_addr, &10_000, &5_000, &2_000);
+        client.initialize_campaign_escrow(&id, &verifier, &500);
+
+        client.deposit_to_campaign_escrow(&id, &sponsor_a, &1_000);
+        client.deposit_to_campaign_escrow(&id, &sponsor_a, &2_000);
+        client.deposit_to_campaign_escrow(&id, &sponsor_b, &1_500);
+
+        let escrow = client.get_campaign_escrow(&id);
+        assert_eq!(escrow.total_escrowed, 4_500);
+        assert_eq!(escrow.released_amount, 0);
+        assert_eq!(escrow.status, EscrowStatus::Held);
+        assert_eq!(escrow.is_verified, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #39)")]
+    fn test_escrow_double_initialize_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+        let creator = Address::generate(&env);
+        let verifier = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let id = client.create_campaign(&creator, &token, &10_000, &5_000, &2_000);
+        client.initialize_campaign_escrow(&id, &verifier, &500);
+        // Second initialization must fail with EscrowAlreadyInitialized (#39).
+        client.initialize_campaign_escrow(&id, &verifier, &500);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #4)")]
+    fn test_escrow_zero_deposit_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, _) = create_token(&env, &token_admin);
+        let creator = Address::generate(&env);
+        let verifier = Address::generate(&env);
+        let sponsor = Address::generate(&env);
+
+        let id = client.create_campaign(&creator, &token_addr, &10_000, &5_000, &2_000);
+        client.initialize_campaign_escrow(&id, &verifier, &500);
+        // Zero deposits are invalid (InvalidAmount #4).
+        client.deposit_to_campaign_escrow(&id, &sponsor, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #41)")]
+    fn test_escrow_double_release_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, token_admin_client) = create_token(&env, &token_admin);
+        let creator = Address::generate(&env);
+        let verifier = Address::generate(&env);
+        let sponsor = Address::generate(&env);
+
+        token_admin_client.mint(&sponsor, &10_000);
+        let id = client.create_campaign(&creator, &token_addr, &10_000, &5_000, &2_000);
+        client.initialize_campaign_escrow(&id, &verifier, &500);
+        client.deposit_to_campaign_escrow(&id, &sponsor, &5_000);
+        client.approve_tree_verification(&id, &500);
+
+        assert_eq!(client.release_escrow_to_creator(&id), 5_000);
+        // Second release must fail with EscrowAlreadyReleased (#41).
+        client.release_escrow_to_creator(&id);
+    }
+
+    #[test]
+    fn test_escrow_release_state_is_stable_after_failed_retry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, token_admin_client) = create_token(&env, &token_admin);
+        let creator = Address::generate(&env);
+        let verifier = Address::generate(&env);
+        let sponsor = Address::generate(&env);
+
+        token_admin_client.mint(&sponsor, &10_000);
+        let id = client.create_campaign(&creator, &token_addr, &10_000, &5_000, &2_000);
+        client.initialize_campaign_escrow(&id, &verifier, &500);
+        client.deposit_to_campaign_escrow(&id, &sponsor, &5_000);
+        client.approve_tree_verification(&id, &500);
+        client.release_escrow_to_creator(&id);
+
+        // A rejected retry must not mutate escrow accounting.
+        assert!(client.try_release_escrow_to_creator(&id).is_err());
+        let escrow = client.get_campaign_escrow(&id);
+        assert_eq!(escrow.status, EscrowStatus::Released);
+        assert_eq!(escrow.total_escrowed, 5_000);
+        assert_eq!(escrow.released_amount, 5_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #38)")]
+    fn test_escrow_deposit_without_initialization_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, token_admin_client) = create_token(&env, &token_admin);
+        let creator = Address::generate(&env);
+        let sponsor = Address::generate(&env);
+
+        token_admin_client.mint(&sponsor, &10_000);
+        let id = client.create_campaign(&creator, &token_addr, &10_000, &5_000, &2_000);
+        // No escrow initialized (EscrowNotInitialized #38).
+        client.deposit_to_campaign_escrow(&id, &sponsor, &1_000);
     }
 
     // -----------------------------------------------------------------------

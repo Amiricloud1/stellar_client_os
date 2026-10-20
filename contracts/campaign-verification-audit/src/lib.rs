@@ -238,6 +238,64 @@ impl CampaignVerificationAuditContract {
             .unwrap_or(Vec::new(&env))
     }
 
+    /// Retrieve paginated verification audit history using deterministic ID-based cursor pagination.
+    ///
+    /// # Arguments
+    /// * `campaign_id` — The ID of the campaign.
+    /// * `cursor` — Optional cursor (activity ID). If provided, returns entries strictly after this ID.
+    /// * `limit` — Maximum number of entries to return (capped at 50).
+    ///
+    /// Returns `(entries: Vec<AuditEntry>, next_cursor: Option<u32>)`.
+    pub fn get_audit_trail_paginated(
+        env: Env,
+        campaign_id: u64,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> (Vec<AuditEntry>, Option<u32>) {
+        let max_limit = 50u32;
+        let page_size = if limit == 0 || limit > max_limit {
+            max_limit
+        } else {
+            limit
+        };
+
+        let trail: Vec<AuditEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditTrail(campaign_id))
+            .unwrap_or(Vec::new(&env));
+
+        let total = trail.len();
+        let mut results = Vec::new(&env);
+
+        let start_index = match cursor {
+            Some(c) => {
+                let mut found = total;
+                for i in 0..total {
+                    if trail.get(i).unwrap().id > c {
+                        found = i;
+                        break;
+                    }
+                }
+                found
+            }
+            None => 0,
+        };
+
+        let end_index = (start_index + page_size).min(total);
+        for i in start_index..end_index {
+            results.push_back(trail.get(i).unwrap());
+        }
+
+        let next_cursor = if end_index < total && !results.is_empty() {
+            Some(results.get(results.len() - 1).unwrap().id)
+        } else {
+            None
+        };
+
+        (results, next_cursor)
+    }
+
     /// Get the total number of logged activities for a campaign.
     pub fn get_activity_count(env: Env, campaign_id: u64) -> u32 {
         env.storage()
