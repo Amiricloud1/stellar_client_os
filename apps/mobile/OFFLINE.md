@@ -1,115 +1,301 @@
-# Mobile offline mode & services
+# Mobile offline mode
 
-Related issues:
-- [Fundable-Protocol/stellar_client_os#893](https://github.com/Fundable-Protocol/stellar_client_os/issues/893) — Offline browsing & wishlist sync
-- [Amiricloud1/stellar_client_os#90](https://github.com/Amiricloud1/stellar_client_os/issues/90) — Push token rotation & preferences reconciliation
-- [Amiricloud1/stellar_client_os#91](https://github.com/Amiricloud1/stellar_client_os/issues/91) — Deep links to cached campaign details
-- [Amiricloud1/stellar_client_os#94](https://github.com/Amiricloud1/stellar_client_os/issues/94) — Bounded cache size & freshness presentation
+Issues:
+- [#86 Expo/React Native build commands](https://github.com/Amiricloud1/stellar_client_os/issues/86)
+- [#87 Encrypt sensitive offline storage](https://github.com/Amiricloud1/stellar_client_os/issues/87)
+- [#88 Idempotent offline action queue](https://github.com/Amiricloud1/stellar_client_os/issues/88)
+- [#89 Server-authoritative conflict resolution](https://github.com/Amiricloud1/stellar_client_os/issues/89)
 
-Sponsors can browse campaigns, open deep links, and manage a wishlist even with poor or zero connectivity. When offline, deep links resolve to cached campaign details, stale payloads surface friendly freshness labels, and wishlist mutations queue for deterministic synchronization upon reconnect. Device push notification tokens and preferences are managed locally and reconciled with remote delivery systems.
-
-## Architecture & Modules
-
-All offline and device-management logic is **pure TypeScript** under `src/offline/`, running and tested independently of React Native, Expo, or native device runtimes.
-
-| Module                  | Primary Responsibility                                                                      |
-| ----------------------- | ------------------------------------------------------------------------------------------- |
-| `storage.ts`            | `KeyValueStorage` abstraction, in-memory implementation, and JSON serialization helpers.    |
-| `types.ts`              | Local cache schemas for `CampaignSummary` and `CampaignDetail`.                             |
-| `campaignCache.ts`      | Bounded LRU cache, wishlist protection, data freshness metadata, and `CampaignRepository`.  |
-| `wishlist.ts`           | Offline-first wishlist (`add` / `remove` / `list`), persisted across app restarts.          |
-| `sync.ts`               | Durable queue with latest-op-wins deduplication, sync engine, and reconnect monitor.        |
-| `deepLinks.ts`          | Deep-link URL parsing, validation, cold-start offline resolution, and refresh flow.         |
-| `pushNotifications.ts`  | Push token lifecycle, per-device category preferences, and remote reconciliation verdicts.|
-| `index.ts`              | Service composition (`getOfflineServices`), default wiring, and barrel exports.             |
+Sponsors can browse campaigns and manage a wishlist without a connection; queued
+wishlist changes are flushed when connectivity is restored. Sensitive fields
+are encrypted at rest, queued actions carry stable IDs for idempotent replay,
+and conflicts are resolved using a server-authoritative merge strategy.
 
 ---
 
-## 1. Bounded Cache & Data Freshness (Issue #94)
+## What lives here
 
-### LRU Eviction & Wishlist Protection
-To prevent unbounded storage growth on mobile devices:
-- `CampaignCache` tracks detail entries in a persisted LRU index (`PersistedDetailIndex`).
-- Maximum detail capacity defaults to `maxDetailEntries = 50` (configurable).
-- When new detail entries exceed capacity, the least-recently-accessed entries are evicted first.
-- **Wishlist protection**: Campaigns saved to the user's wishlist (`protectedIds`) are exempted from eviction regardless of age or access order.
+All offline logic is **pure TypeScript** under `src/offline/`, so it runs and is
+tested off-device. It never imports React Native, Expo or a native storage
+module directly — those are injected via interfaces.
 
-### Stale-State Presentation & Metadata
-- Every cached payload records `cachedAt: number` timestamp.
-- Read operations via `CampaignRepository` return a `ReadResult<T>` with:
-  - `data: T`: The campaign summary or detail payload.
-  - `fromCache: boolean`: True when served from local cache.
-  - `cachedAt: number | null`: Local cache timestamp.
-  - `stale: boolean`: True when served from cache and the age exceeds `staleAfterMs` (default 15 minutes).
-- `formatFreshness(ageMs)` computes user-friendly relative age indicators (e.g., `"updated just now"`, `"updated 5m ago"`, `"updated 2h ago"`, `"updated 3d ago"`).
-
-### Migration from Unbounded Cache
-When upgrading an existing install:
-- Pre-existing cached items lack an LRU index.
-- On storage engines providing `getAllKeys()`, existing `campaigns.detail.*` keys are automatically indexed on first load with `lastAccessedAt = cachedAt`.
-- On engines without key enumeration, legacy entries remain readable and join eviction as they are accessed or updated.
+| Module                  | Responsibility                                                           |
+| ----------------------- | ------------------------------------------------------------------------ |
+| `storage.ts`            | `KeyValueStorage` contract, in-memory implementation, JSON helpers.      |
+| `types.ts`              | `CampaignSummary` / `CampaignDetail` shapes cached locally.             |
+| `campaignCache.ts`      | Persisted campaign list/detail cache + read-through `CampaignRepository`. |
+| `wishlist.ts`           | Offline-first wishlist (`add` / `remove` / `list`), persisted.           |
+| `sync.ts`               | Durable wishlist sync queue, sync engine, connectivity monitor.         |
+| `encryptedStorage.ts`   | Cipher interface, XOR test cipher, encrypted read/write helpers, schema migration, `clearSensitiveStorage`, `EncryptedKeyValueStorage`. |
+| `actionQueue.ts`        | `IdempotentActionQueue` with stable `operationId`, `flushActionQueue`.   |
+| `conflictResolution.ts` | Campaign server-wins merge, wishlist merge, permission-change detection, partial sync recovery. |
+| `index.ts`              | `getOfflineServices()` composition + barrel exports.                    |
 
 ---
 
-## 2. Deep Links to Cached Campaigns (Issue #91)
+## #86 — Expo / React Native build toolchain
 
-### Route Parsing & Validation
-`parseCampaignDeepLink(url, options)` parses deep links into campaign targets without side effects:
-- Supported schemes & formats:
-  - HTTPS / HTTP: `https://app.fundable.com/campaigns/<id>` (also accepts `www.fundable.com` and `fundable.com`)
-  - Custom App Scheme: `fundable://campaigns/<id>`
-- Query parameters (e.g. `?utm_source=push`) and URL-encoded identifiers (e.g. `%2D`) are supported.
-- Malformed inputs, wrong paths, missing IDs, or unsupported hosts return typed errors (`DeepLinkError`) rather than throwing:
-  `"not_a_url"` | `"unsupported_scheme"` | `"unsupported_host"` | `"not_a_campaign_route"` | `"missing_campaign_id"` | `"invalid_campaign_id"`
+### Runtime requirements
 
-### Resolution Flow & Offline Fallback
-`resolveCampaignDeepLink(url, repository, fetchDetail, options)`:
-1. **Online (Warm / Cold)**: Attempts network fetch; on success, updates local cache and returns `{ status: "ok", fromCache: false, stale: false, data }`.
-2. **Offline (Cached Campaign)**: If network fetch fails, resolves from `CampaignCache` with `{ status: "ok", fromCache: true, stale, cachedAt, data }`.
-3. **Offline (Uncached Campaign)**: If neither network nor cache has the campaign, gracefully resolves to `{ status: "unavailable", campaignId, staleLabel }` so the UI can present an actionable offline placeholder and retry when connectivity is restored.
-4. **Malformed Link**: Returns `{ status: "malformed", error }` allowing navigation to fall back to the root campaign directory.
+| Tool        | Version  | Purpose                            |
+|-------------|----------|------------------------------------|
+| Node.js     | ≥ 18     | Build scripts, offline layer tests |
+| pnpm        | 9        | Monorepo package manager           |
+| Expo CLI    | 52       | `expo start`, `expo run:*`         |
+| EAS CLI     | ≥ 12     | Cloud builds, OTA updates          |
+
+### Development builds
+
+```bash
+# Start the Metro dev server (or Expo Go):
+pnpm --filter @fundable/mobile start
+
+# Run on a connected Android device/emulator:
+pnpm --filter @fundable/mobile android
+
+# Run on a connected iOS simulator (macOS only):
+pnpm --filter @fundable/mobile ios
+```
+
+### Production builds (EAS Build)
+
+Set the `EAS_TOKEN` environment variable (or `EXPO_TOKEN`) then:
+
+```bash
+# Android internal preview:
+pnpm --filter @fundable/mobile build:android:preview
+
+# iOS internal preview:
+pnpm --filter @fundable/mobile build:ios:preview
+
+# Both platforms, production channel:
+pnpm --filter @fundable/mobile build:all:prod
+```
+
+Build profiles are defined in `eas.json`:
+
+| Profile      | Distribution | Channel    | Description                          |
+|--------------|--------------|------------|--------------------------------------|
+| `development`| Internal     | —          | Dev client with hot reload           |
+| `preview`    | Internal     | `preview`  | QA distribution via EAS              |
+| `production` | Store        | `production` | App Store / Google Play release    |
+
+### OTA updates
+
+```bash
+pnpm --filter @fundable/mobile update
+# Publishes an update to the active channel via EAS Update.
+```
+
+### CI
+
+The `.github/workflows/mobile.yml` workflow runs on every push / PR that
+touches `apps/mobile/**`. It:
+
+1. Runs the full offline test suite (`vitest run`).
+2. Type-checks the offline layer (`tsc --noEmit`).
+3. Validates `eas.json` schema and `app.config.ts` structure.
+
+EAS Build steps are guarded by `github.event.pull_request.head.repo.fork != true`
+so they only run on same-repo PRs where secrets are available.
 
 ---
 
-## 3. Push Token Rotation & Preferences (Issue #90)
+## #87 — Encrypted sensitive offline storage
 
-### Token Lifecycle & Device Identity
-`PushTokenManager` persists and coordinates push notification credentials:
-- Generates a stable per-install `deviceId` that survives token rotations but regenerates on a clean reinstall.
-- Records current `token` and preserves `previousToken` across rotations until the backend confirms receipt.
-- Invalidation: Tracks permission changes (`granted`, `denied`, `undetermined`); token is invalidated if permission is denied or revoked by the OS.
+### Field classification
 
-### Per-Device Preferences
-Sponsors can toggle individual notification categories per device:
-- `campaignUpdates` (default: true)
-- `milestones` (default: true)
-- `sponsorActivity` (default: true)
-- `productNews` (default: false)
+| Classification | Examples                             | Storage treatment           |
+|----------------|--------------------------------------|-----------------------------|
+| **Sensitive**  | wallet address, auth token, seed phrase | Encrypted via `StorageCipher` |
+| **Non-sensitive** | campaign list, wishlist IDs, cache TTLs | Stored as plain JSON      |
 
-### Reconciliation Protocol
-The `reconcile(remote)` method synchronizes local state with `PushRemote` transport:
-- Handles token rotation: registers new token while instructing backend to retire `previousToken`.
-- Handles server verdicts:
-  - `keep`: Local token matches server records; no action.
-  - `revoke`: Server retired or rejected the token; local token is cleared and ready for new registration.
-  - `supersede`: Server has a newer token for this device ID; local store adopts the updated token.
-  - `reregister`: Reinstall detected; device identity is reset to generate a fresh registration.
+Sensitive keys live under the `fundable.offline.secure.*` namespace.
+
+### Wiring a cipher in an Expo app
+
+```ts
+import * as SecureStore from "expo-secure-store";
+import { EncryptedKeyValueStorage, type StorageCipher } from "./src/offline";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+// Build a cipher backed by expo-secure-store's device-level key.
+const cipher: StorageCipher = {
+  async encrypt(plaintext) {
+    const key = await SecureStore.getItemAsync("storage-key");
+    // ... AES-256-GCM encrypt plaintext with key
+    return ciphertext;
+  },
+  async decrypt(ciphertext) {
+    const key = await SecureStore.getItemAsync("storage-key");
+    // ... decrypt
+    return plaintext;
+  },
+};
+
+const storage = new EncryptedKeyValueStorage(AsyncStorage, cipher);
+configureOfflineStorage(storage);
+```
+
+### Schema versioning
+
+Every stored blob includes a `schemaVersion` integer. When a new app version
+changes the persisted shape, register a migration:
+
+```ts
+import { readEncryptedJSON, type MigrationMap } from "./src/offline";
+
+const migrations: MigrationMap = {
+  // Upgrade a v1 blob to v2 (increment CURRENT_SCHEMA_VERSION in encryptedStorage.ts).
+  1: (data) => ({ ...(data as OldShape), newField: "default" }),
+};
+
+const value = await readEncryptedJSON(storage, cipher, key, migrations);
+```
+
+### Logout / account-switch cleanup
+
+```ts
+import { clearSensitiveStorage } from "./src/offline";
+
+async function onLogout() {
+  await clearSensitiveStorage(storage);
+  // Non-sensitive campaign cache is untouched.
+}
+```
+
+### Corruption recovery
+
+If decryption or JSON parsing fails (tampered data, key rotation), the corrupt
+entry is automatically deleted and `null` is returned. The caller should treat
+`null` as a cache miss and re-fetch from the network.
 
 ---
 
-## 4. Offline Wishlist & Sync Queue
+## #88 — Idempotent offline action queue
 
-`WishlistSyncEngine` and `WishlistSyncQueue` provide durable offline mutations:
-- Adding or removing campaigns locally updates the offline wishlist immediately.
-- Enqueued operations use a deterministic latest-operation-wins merge, preventing duplicate requests during flush.
-- `bindSyncOnReconnect` automatically flushes pending operations when transitioning from offline to online.
+Every mutation is assigned a **stable `operationId`** (UUID v4) at enqueue time
+and persisted before any network call. Replaying the queue after a crash
+re-uses the same ID, so the server can detect and discard duplicates.
+
+### Usage
+
+```ts
+import { IdempotentActionQueue, flushActionQueue } from "./src/offline";
+
+const actionQueue = new IdempotentActionQueue(storage);
+
+// Enqueue a mutation (returns the action with its stable operationId):
+const action = await actionQueue.enqueue("wishlist/add", { campaignId: "c1" });
+
+// On reconnect, flush all pending/failed actions:
+await flushActionQueue(actionQueue, async (action) => {
+  // Forward action.operationId as an idempotency key to your server:
+  await api.wishlist.add(action.payload.campaignId, {
+    idempotencyKey: action.operationId,
+  });
+});
+```
+
+### Lifecycle
+
+```
+enqueue() → status: "pending"
+flushActionQueue() calls markInFlight() → status: "in-flight", attemptCount++
+  success → dequeue()              (removed from queue)
+  failure → markFailed()           status: "failed"
+
+Next flush picks up "pending" | "failed" entries.
+```
+
+A crash between `markInFlight` and `dequeue` leaves the entry as `"in-flight"`.
+The next flush ignores `"in-flight"` entries (they won't be retried
+automatically). Use `markFailed` on startup to reset any stale `"in-flight"`
+entries if your crash-recovery policy requires it.
 
 ---
 
-## Wiring into the Mobile Application
+## #89 — Server-authoritative conflict resolution
 
-### Storage Configuration
-Register your preferred storage backend (e.g. `@react-native-async-storage/async-storage`) during app initialization:
+The server is the single source of truth. Three merge strategies cover the
+main conflict surfaces.
+
+### Campaign detail — server-wins
+
+```ts
+import { resolveCampaignConflict } from "./src/offline";
+
+const resolution = resolveCampaignConflict(localCampaign, serverCampaign);
+if (resolution.localDataDiscarded) {
+  console.warn(resolution.description);
+}
+await cache.saveDetail(resolution.resolved!.id, resolution.resolved!);
+```
+
+| Scenario                     | Outcome            |
+|------------------------------|--------------------|
+| Server differs from local    | `server-wins`      |
+| Server returns null (deleted)| `deleted`          |
+| No local version             | `server-wins`      |
+
+### Wishlist — merge with pending additions
+
+```ts
+import { resolveWishlistConflict } from "./src/offline";
+
+const resolution = resolveWishlistConflict({
+  localIds: await wishlist.list(),
+  serverIds: serverWishlist,
+  // IDs still in the actionQueue that haven't been confirmed yet:
+  pendingLocalAdditions: pendingAddIds,
+});
+await wishlist.replace(resolution.resolved);
+```
+
+Server removals always win. Unsynced local additions survive until the server
+confirms or the next full sync drops them.
+
+### Partial sync recovery
+
+```ts
+import { mergePartialSync } from "./src/offline";
+
+const result = mergePartialSync(batchOutcomes);
+await queue.markSynced(result.confirmedIds);
+// result.permanentlyFailedIds: surface to user (permission revoked, entity deleted)
+// result.retryIds: left in queue automatically
+```
+
+### Permission changes
+
+```ts
+import { classifyServerError } from "./src/offline";
+
+const { permanent, outcome, description } = classifyServerError({
+  status: response.status,
+  message: response.statusText,
+});
+if (permanent) {
+  await actionQueue.dequeue(action.operationId);
+  showError(description);
+}
+```
+
+---
+
+## Read-through cache
+
+`CampaignRepository.loadList` / `loadDetail` are network-first: a successful
+fetch refreshes the cache, and a failed fetch transparently falls back to the
+last cached payload (`fromCache: true`). If nothing is cached the caller can
+supply a `fallback` (e.g. `[]` for the browse list) or the original error is
+re-thrown.
+
+---
+
+## Wiring into an app
+
+### 1. Storage
 
 ```ts
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -118,33 +304,54 @@ import { configureOfflineStorage } from "./src/offline";
 configureOfflineStorage(AsyncStorage);
 ```
 
-### Accessing Services
-```ts
-import { getOfflineServices } from "./src/offline";
+For sensitive data, wrap with `EncryptedKeyValueStorage` first (see #87 above).
 
-const { repository, cache, wishlist, queue } = getOfflineServices();
+## Testing & Verification
+
+```ts
+import NetInfo from "@react-native-community/netinfo";
+import {
+  createConnectivityMonitor,
+  bindSyncOnReconnect,
+  WishlistSyncEngine,
+} from "./src/offline";
+
+const monitor = createConnectivityMonitor({
+  subscribe: (listener) =>
+    NetInfo.addEventListener((state) => listener(!!state.isConnected)),
+});
+
+bindSyncOnReconnect(monitor, { engine: syncEngine });
 ```
 
 ---
 
-## Testing & Verification
-
-Run the test suite and type checking:
+## Tests
 
 ```bash
-# Workspace root commands
-pnpm test:mobile
-pnpm typecheck:mobile
-
-# Or directly in apps/mobile
-npm run test --prefix apps/mobile
-npm run typecheck --prefix apps/mobile
+pnpm --filter @fundable/mobile test        # vitest run (all offline tests)
+pnpm --filter @fundable/mobile typecheck   # tsc --noEmit
 ```
 
-Automated test suites:
-- `__tests__/campaignCache.test.ts` — LRU eviction, capacity cap, wishlist protection, stale detection, freshness formatting.
-- `__tests__/deepLinks.test.ts` — URL scheme parsing, malformed link handling, cold-start offline fallback, uncached state.
-- `__tests__/pushNotifications.test.ts` — Token rotation, revocation, per-device preferences, server reconciliation verdicts.
-- `__tests__/wishlist.test.ts` — Wishlist persistence, idempotency across app restarts.
-- `__tests__/sync.test.ts` — Sync queue deduplication, network reconnect flushing.
-- `__tests__/offlineFlow.test.ts` — End-to-end integration: browse offline -> modify wishlist -> sync upon reconnection.
+Coverage:
+
+- `__tests__/campaignCache.test.ts` — cache write → offline read; empty-cache
+  fallback and error re-throw; namespace isolation.
+- `__tests__/wishlist.test.ts` — offline add/remove persistence across restarts;
+  idempotency.
+- `__tests__/sync.test.ts` — queue collapse; flush without duplicates; failed
+  ops stay queued; flush happens only on reconnect.
+- `__tests__/offlineFlow.test.ts` — end-to-end offline browse → wishlist edits →
+  sync-on-reconnect; empty-cache offline path.
+- `__tests__/encryptedStorage.test.ts` — cipher round-trips; corruption recovery;
+  schema migration; `clearSensitiveStorage`; `EncryptedKeyValueStorage`.
+- `__tests__/actionQueue.test.ts` — stable operationId across crashes; failed
+  actions stay queued; in-flight not re-run; attemptCount increments.
+- `__tests__/conflictResolution.test.ts` — campaign server-wins; wishlist merge;
+  permission-change classification; partial sync recovery; campaign list reconciliation.
+
+> Note: the pre-existing `src/screens/CampaignDetailScreen.tsx` imports
+> `react-native` / `expo-notifications`, which are not part of this repo's
+> dependency manifest. The mobile `typecheck`/`test` scripts therefore scope to
+> the pure offline modules. Add the React Native toolchain (or a Jest preset) if
+> you want component-level tests too.

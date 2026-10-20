@@ -173,7 +173,7 @@ function QueueItemRow({
             onClick={() => onRetry(item.id)}
             aria-label={`Retry syncing ${item.label}`}
             className={cn(
-              "rounded-md p-1.5 text-white/50 hover:text-white",
+              "inline-flex min-h-9 min-w-9 items-center justify-center rounded-md p-2 text-white/50 hover:text-white",
               "hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2",
               "focus-visible:ring-white/30 transition-all duration-150",
               "disabled:cursor-not-allowed disabled:opacity-40"
@@ -188,7 +188,7 @@ function QueueItemRow({
             onClick={() => onRemove(item.id)}
             aria-label={`Remove ${item.label} from queue`}
             className={cn(
-              "rounded-md p-1.5 text-white/30 hover:text-red-400",
+              "inline-flex min-h-9 min-w-9 items-center justify-center rounded-md p-2 text-white/30 hover:text-red-400",
               "hover:bg-red-400/10 focus-visible:outline-none focus-visible:ring-2",
               "focus-visible:ring-red-400/30 transition-all duration-150"
             )}
@@ -223,8 +223,9 @@ export function SyncQueueDrawer({ open, onClose, syncQueue }: SyncQueueDrawerPro
     <Sheet open={open} onOpenChange={(o) => !o && onClose()}>
       <SheetContent
         side="bottom"
+        data-testid="sync-queue-drawer"
         className={cn(
-          "max-h-[85dvh] rounded-t-2xl border-white/10",
+          "w-full max-w-full overflow-x-hidden max-h-[85dvh] rounded-t-2xl border-white/10",
           "bg-fundable-dark text-white",
           "flex flex-col gap-0 p-0",
           // Desktop: slide in from right instead

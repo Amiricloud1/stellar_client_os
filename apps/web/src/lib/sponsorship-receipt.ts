@@ -22,6 +22,18 @@ import { TREE_SPECIES, calculateCo2Offset, getTreeSpecies } from "./co2-impact";
 /** Schema version, hashed into the commitment so the format can never drift silently. */
 export const SPONSORSHIP_RECEIPT_VERSION = 1;
 
+/**
+ * Determinism guarantee (issue #72).
+ *
+ * Every function in this module is pure: it reads no clock, no environment, no
+ * network and no randomness. The same sponsorship input therefore always yields
+ * the same `receiptHash` and `receiptId`, which is what lets the E2E suite
+ * assert on receipt display against fixed fixtures instead of live funds or a
+ * live Horizon endpoint. Callers that need a timestamp (e.g. "issued at") must
+ * pass it in explicitly rather than relying on this module to read one.
+ */
+export const SPONSORSHIP_RECEIPT_DETERMINISTIC = true as const;
+
 /** Stellar public keys are 56 base32 characters and start with `G`. */
 const STELLAR_PUBLIC_KEY_PATTERN = /^G[A-Z2-7]{55}$/;
 
@@ -205,6 +217,12 @@ function requireString(value: unknown, field: string, maxLength = 256): string {
   return trimmed;
 }
 
+/**
+ * Upper bound on a single sponsorship. Keeps a receipt (and its token) small
+ * enough to travel in a URL/QR code and rejects absurd payloads early.
+ */
+export const MAX_SPONSORSHIP_TREE_COUNT = 1_000_000;
+
 function requireTreeCount(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     throw new SponsorshipReceiptError("treeCount must be a number");
@@ -214,6 +232,11 @@ function requireTreeCount(value: unknown): number {
   }
   if (value <= 0) {
     throw new SponsorshipReceiptError("treeCount must be greater than 0");
+  }
+  if (value > MAX_SPONSORSHIP_TREE_COUNT) {
+    throw new SponsorshipReceiptError(
+      `treeCount must be at most ${MAX_SPONSORSHIP_TREE_COUNT}`,
+    );
   }
   return value;
 }
@@ -240,7 +263,9 @@ function requireCoordinate(value: unknown, field: string, limit: number): number
   if (value < -limit || value > limit) {
     throw new SponsorshipReceiptError(`${field} must be between -${limit} and ${limit}`);
   }
-  return value;
+  // Normalize -0 to 0 so two coordinates that are numerically equal always
+  // serialize (and therefore hash) identically.
+  return value === 0 ? 0 : value;
 }
 
 function requirePlantingLocation(value: unknown): PlantingLocation {
@@ -273,6 +298,11 @@ function parsePlantingDate(value: unknown): { iso: string; date: Date } {
   const year = Number(match[1]);
   const month = Number(match[2]);
   const day = Number(match[3]);
+  // `Date.UTC` maps years 0-99 to 1900-1999, which would silently accept
+  // impossible dates like 0099-02-29. Reject those years explicitly.
+  if (year < 100) {
+    throw new SponsorshipReceiptError("plantedAt must be a real calendar date");
+  }
   const date = new Date(Date.UTC(year, month - 1, day));
   const isRealDate =
     date.getUTCFullYear() === year &&
@@ -299,6 +329,30 @@ function optionalString(value: unknown, field: string, maxLength: number): strin
     throw new SponsorshipReceiptError(`${field} must be at most ${maxLength} characters`);
   }
   return trimmed;
+}
+
+/**
+ * Normalize an optional amount to a canonical decimal string.
+ *
+ * Amounts are hashed verbatim, so `"10"`, `"10.0"` and `" 10.00 "` would
+ * otherwise produce three different commitments for the same payment. Accept
+ * only plain non-negative decimals (no exponent, no sign, no thousands
+ * separators) and strip trailing zeros so the commitment is stable.
+ */
+function optionalAmount(value: unknown, field: string, maxLength: number): string | null {
+  const raw = optionalString(value, field, maxLength);
+  if (raw === null) {
+    return null;
+  }
+  if (!/^\d+(\.\d+)?$/.test(raw)) {
+    throw new SponsorshipReceiptError(`${field} must be a non-negative decimal amount`);
+  }
+  const [whole, fraction] = raw.split(".");
+  const normalizedWhole = whole.replace(/^0+(?=\d)/, "");
+  const normalizedFraction = fraction === undefined ? "" : fraction.replace(/0+$/, "");
+  return normalizedFraction.length > 0
+    ? `${normalizedWhole}.${normalizedFraction}`
+    : normalizedWhole;
 }
 
 /**
@@ -329,7 +383,7 @@ export function parseSponsorshipReceiptInput(value: unknown): SponsorshipReceipt
     // padding or a different separator cannot produce a different commitment.
     plantedAt: parsePlantingDate(input.plantedAt).iso,
     currency: optionalString(input.currency, "currency", 12),
-    amount: optionalString(input.amount, "amount", 40),
+    amount: optionalAmount(input.amount, "amount", 40),
   };
 }
 
@@ -377,6 +431,17 @@ export function buildSponsorshipReceipt(input: SponsorshipReceiptInput): Sponsor
     receiptHash,
     receiptId: `rcpt_${receiptHash.slice(0, 16)}`,
   };
+}
+
+/**
+ * Build a receipt from an untrusted payload in one step.
+ *
+ * Convenience for the API route and the E2E fixtures: it validates, normalizes
+ * and hashes in a single call, so a test can assert on the exact `receiptId`
+ * a given fixture produces without duplicating the validation pipeline.
+ */
+export function buildSponsorshipReceiptFromPayload(payload: unknown): SponsorshipReceipt {
+  return buildSponsorshipReceipt(parseSponsorshipReceiptInput(payload));
 }
 
 /**
@@ -546,6 +611,11 @@ export function memoHashToHex(memo: string): string | null {
   if (SHA256_HEX_PATTERN.test(trimmed.toLowerCase())) {
     return trimmed.toLowerCase();
   }
+  // `Buffer.from(..., "base64")` is lenient and silently drops invalid
+  // characters, so validate the alphabet first to avoid accepting garbage.
+  if (!BASE64URL_PATTERN.test(trimmed.replace(/=+$/, ""))) {
+    return null;
+  }
   const decoded = Buffer.from(trimmed, "base64");
   return decoded.length === 32 ? decoded.toString("hex") : null;
 }
@@ -563,6 +633,29 @@ function memoMatches(
     return { supported: true, matches: memo === receipt.receiptId };
   }
   return { supported: false, matches: false };
+}
+
+/**
+ * Build a synthetic, successful chain transaction that binds a receipt.
+ *
+ * This is the fixture the E2E suite uses to exercise the "verified" path
+ * without touching a live network or real funds: it mirrors the shape Horizon
+ * returns for a payment carrying the receipt's commitment as a hash memo.
+ */
+export function buildMockReceiptTransaction(
+  receipt: SponsorshipReceipt,
+  overrides: Partial<ChainTransactionRecord> = {},
+): ChainTransactionRecord {
+  return {
+    hash: receipt.receiptHash,
+    successful: true,
+    memoType: "hash",
+    memo: receipt.receiptHash,
+    sourceAccount: receipt.sponsorAddress,
+    ledger: 1,
+    createdAt: null,
+    ...overrides,
+  };
 }
 
 /**

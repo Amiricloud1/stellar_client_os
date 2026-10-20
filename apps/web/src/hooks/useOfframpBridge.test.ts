@@ -429,6 +429,8 @@ describe("useOfframpBridge", () => {
 
         const { result } = renderHook(() => useOfframpBridge(), { wrapper: createWrapper() });
         await setupToQuoteStep(result);
+        await act(async () => { await result.current.confirmAndBridge(); });
+        expect(result.current.step).toBe("processing");
 
         await act(async () => { vi.advanceTimersByTime(10000); });
         await act(async () => { await Promise.resolve(); });
@@ -439,6 +441,47 @@ describe("useOfframpBridge", () => {
         await act(async () => { vi.advanceTimersByTime(30000); });
         await act(async () => { await Promise.resolve(); });
         expect((offrampService.getQuoteStatus as ReturnType<typeof vi.fn>).mock.calls.length).toBe(callCount);
+    });
+
+    it("rejects getQuote when quote has expired", async () => {
+        (offrampService.getAggregatedRates as ReturnType<typeof vi.fn>).mockResolvedValue({
+            success: true,
+            data: {
+                best: { ...mockQuote, expiresAt: new Date(Date.now() - 1000).toISOString() },
+                all: [],
+                errors: [],
+                timestamp: new Date().toISOString(),
+            },
+        });
+
+        const { result } = renderHook(() => useOfframpBridge(), { wrapper: createWrapper() });
+        act(() => { result.current.handleFormChange("amount", "10"); });
+        await drainTimers();
+
+        await act(async () => { await result.current.getQuote({ ...result.current.formState }); });
+
+        expect(result.current.error).toBe("Quote has expired. Please refresh your quote.");
+        expect(result.current.step).toBe("form");
+    });
+
+    it("payout polling transitions to failed when polling timeout is exceeded", async () => {
+        (offrampService.createOfframp as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, data: mockOfframpData });
+        (offrampService.getQuoteStatus as ReturnType<typeof vi.fn>).mockResolvedValue({
+            success: true,
+            data: { status: "processing", providerMessage: "Still processing" },
+        });
+
+        const { result } = renderHook(() => useOfframpBridge(), { wrapper: createWrapper() });
+        await setupToQuoteStep(result);
+        await act(async () => { await result.current.confirmAndBridge(); });
+        expect(result.current.step).toBe("processing");
+
+        // Advance beyond SETTLEMENT_POLL_TIMEOUT_MS (10 minutes)
+        await act(async () => { vi.advanceTimersByTime(600000 + 10000); });
+        await act(async () => { await Promise.resolve(); });
+
+        expect(result.current.step).toBe("failed");
+        expect(result.current.error).toContain("Settlement timed out");
     });
 
     // --- goBack ---
