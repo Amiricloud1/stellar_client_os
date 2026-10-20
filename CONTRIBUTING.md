@@ -6,6 +6,23 @@ requirements) and the environment inventory in
 [`docs/environment-variables.md`](./docs/environment-variables.md).
 Start there; what follows is only the contributor workflow checklist.
 
+## Toolchain
+
+The Rust compiler and wasm target are pinned in
+[`rust-toolchain.toml`](./rust-toolchain.toml) at the repository root. CI and
+local contract builds both consume that file, so the versions always match.
+
+- Install [rustup](https://rustup.rs) if you don't already have it. With
+  rustup present, the pinned channel and `wasm32-unknown-unknown` target are
+  installed automatically the first time you run a `cargo` command inside the
+  repo — no manual `rustup target add` needed.
+- If you use a non-rustup Rust install, you must install the pinned channel and
+  wasm target yourself; otherwise `pnpm build:contracts` / `pnpm test:contracts`
+  will fail or produce artifacts that differ from CI.
+- Bumping the toolchain is a compatibility change: update `rust-toolchain.toml`
+  in the same PR and note the migration impact (e.g. minimum rustup version) in
+  the PR description.
+
 ## Workflow
 
 1. Pick an issue, then create a branch from an up-to-date `main`:
