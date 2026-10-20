@@ -28,7 +28,7 @@ export interface CampaignSummary {
 /** Full campaign payload cached for offline detail browsing. */
 export interface CampaignDetail extends CampaignSummary {
   sponsors: Sponsor[];
-  verificationProgress: number;
+  verificationProgress?: number;
   treeSpeciesDiversity?: number;
   regionClimateImpact?: number;
   soilHealthImprovement?: number;

@@ -52,6 +52,7 @@ pub enum Error {
     TimelockNotElapsed = 5,
     ActionAlreadyExecuted = 6,
     InvalidAction = 7,
+    ActionExpired = 8,
 }
 
 // ---------------------------------------------------------------------------
@@ -59,7 +60,9 @@ pub enum Error {
 // ---------------------------------------------------------------------------
 
 /// 48 hours in seconds (48 * 60 * 60 = 172800).
-const TIMELOCK_SECONDS: u64 = 172_800;
+pub const TIMELOCK_SECONDS: u64 = 172_800;
+/// Expiry window after timelock elapses: 7 days (7 * 24 * 60 * 60 = 604800).
+pub const EXPIRY_WINDOW_SECONDS: u64 = 604_800;
 /// Storage TTL threshold: ~30 days at 5 s/ledger.
 const LEDGER_THRESHOLD: u32 = 518_400;
 /// Storage TTL bump: ~31 days at 5 s/ledger.
@@ -115,13 +118,19 @@ impl TimelockContract {
 
         // Check no pending action exists.
         if env.storage().instance().has(&DataKey::PendingAction) {
-            // Allow overriding if previous action was executed or cancelled.
+            // Allow overriding if previous action was executed, cancelled, or expired.
             let existing: TimelockAction = env
                 .storage()
                 .instance()
                 .get(&DataKey::PendingAction)
                 .unwrap();
-            if !existing.executed {
+            let elapsed = env
+                .ledger()
+                .timestamp()
+                .checked_sub(existing.approved_at)
+                .unwrap_or(0);
+            let expired = elapsed >= TIMELOCK_SECONDS + EXPIRY_WINDOW_SECONDS;
+            if !existing.executed && !expired {
                 panic_with_error!(&env, Error::InvalidAction);
             }
         }
@@ -148,10 +157,11 @@ impl TimelockContract {
     /// Execute a previously approved action after the 48h timelock.
     ///
     /// # Errors
-    /// * [`Error::Unauthorized`] ??? caller is not the admin.
-    /// * [`Error::NoPendingAction`] ??? no action has been proposed.
-    /// * [`Error::TimelockNotElapsed`] ??? less than 48h since approval.
-    /// * [`Error::ActionAlreadyExecuted`] ??? action was already executed.
+    /// * [`Error::Unauthorized`] — caller is not the admin.
+    /// * [`Error::NoPendingAction`] — no action has been proposed.
+    /// * [`Error::TimelockNotElapsed`] — less than 48h since approval.
+    /// * [`Error::ActionExpired`] — more than 7 days have elapsed since timelock passed.
+    /// * [`Error::ActionAlreadyExecuted`] — action was already executed.
     pub fn execute_action(env: Env) {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
@@ -174,6 +184,10 @@ impl TimelockContract {
 
         if elapsed < TIMELOCK_SECONDS {
             panic_with_error!(&env, Error::TimelockNotElapsed);
+        }
+
+        if elapsed >= TIMELOCK_SECONDS + EXPIRY_WINDOW_SECONDS {
+            panic_with_error!(&env, Error::ActionExpired);
         }
 
         // Record in history.
@@ -206,8 +220,8 @@ impl TimelockContract {
     /// Cancel a pending action.
     ///
     /// # Errors
-    /// * [`Error::Unauthorized`] ??? caller is not the admin.
-    /// * [`Error::NoPendingAction`] ??? no action is pending.
+    /// * [`Error::Unauthorized`] — caller is not the admin.
+    /// * [`Error::NoPendingAction`] — no action is pending.
     pub fn cancel_action(env: Env) {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
@@ -238,7 +252,7 @@ impl TimelockContract {
         env.storage().instance().get(&DataKey::PendingAction)
     }
 
-    /// Check whether the pending action has passed the 48h timelock.
+    /// Check whether the pending action has passed the 48h timelock and has not expired.
     pub fn is_action_ready(env: Env) -> bool {
         let action: TimelockAction = match env
             .storage()
@@ -259,7 +273,31 @@ impl TimelockContract {
             .checked_sub(action.approved_at)
             .unwrap_or(0);
 
-        elapsed >= TIMELOCK_SECONDS
+        elapsed >= TIMELOCK_SECONDS && elapsed < TIMELOCK_SECONDS + EXPIRY_WINDOW_SECONDS
+    }
+
+    /// Check whether the pending action has expired.
+    pub fn is_action_expired(env: Env) -> bool {
+        let action: TimelockAction = match env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAction)
+        {
+            Some(a) => a,
+            None => return false,
+        };
+
+        if action.executed {
+            return false;
+        }
+
+        let elapsed = env
+            .ledger()
+            .timestamp()
+            .checked_sub(action.approved_at)
+            .unwrap_or(0);
+
+        elapsed >= TIMELOCK_SECONDS + EXPIRY_WINDOW_SECONDS
     }
 
     /// Return the admin address.
@@ -414,4 +452,82 @@ mod tests {
         client.set_admin(&new_admin);
         assert_eq!(client.get_admin(), new_admin);
     }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #8)")]
+    fn test_execute_after_expiry_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client) = setup_contract(&env);
+
+        let action_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let desc = String::from_str(&env, "Upgrade contract");
+        client.propose_action(&action_hash, &None, &desc);
+
+        // Exceed 48h + 7 days window (172800 + 604800 = 777600)
+        set_time(&env, 1_000 + TIMELOCK_SECONDS + EXPIRY_WINDOW_SECONDS);
+        assert!(client.is_action_expired());
+        assert!(!client.is_action_ready());
+
+        client.execute_action();
+    }
+
+    #[test]
+    fn test_action_expiry_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client) = setup_contract(&env);
+
+        let action_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let desc = String::from_str(&env, "Upgrade contract");
+        client.propose_action(&action_hash, &None, &desc);
+
+        // Before timelock: neither ready nor expired
+        set_time(&env, 1_000 + 100);
+        assert!(!client.is_action_ready());
+        assert!(!client.is_action_expired());
+
+        // Ready window (between 48h and 48h + 7d)
+        set_time(&env, 1_000 + TIMELOCK_SECONDS);
+        assert!(client.is_action_ready());
+        assert!(!client.is_action_expired());
+
+        // Just before expiry (48h + 7d - 1)
+        set_time(&env, 1_000 + TIMELOCK_SECONDS + EXPIRY_WINDOW_SECONDS - 1);
+        assert!(client.is_action_ready());
+        assert!(!client.is_action_expired());
+
+        // Expired (48h + 7d)
+        set_time(&env, 1_000 + TIMELOCK_SECONDS + EXPIRY_WINDOW_SECONDS);
+        assert!(!client.is_action_ready());
+        assert!(client.is_action_expired());
+    }
+
+    #[test]
+    fn test_propose_overrides_expired_action() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client) = setup_contract(&env);
+
+        let action_hash1 = BytesN::from_array(&env, &[1u8; 32]);
+        let desc1 = String::from_str(&env, "First action");
+        client.propose_action(&action_hash1, &None, &desc1);
+
+        // Fast forward to expired
+        set_time(&env, 1_000 + TIMELOCK_SECONDS + EXPIRY_WINDOW_SECONDS + 100);
+        assert!(client.is_action_expired());
+
+        // New action can be proposed without manual cancellation
+        let action_hash2 = BytesN::from_array(&env, &[2u8; 32]);
+        let desc2 = String::from_str(&env, "Second action");
+        client.propose_action(&action_hash2, &None, &desc2);
+
+        let current = client.get_pending_action().unwrap();
+        assert_eq!(current.action_hash, action_hash2);
+        assert!(!client.is_action_expired());
+    }
 }
+

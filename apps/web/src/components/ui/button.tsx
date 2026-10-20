@@ -1,11 +1,11 @@
 import * as React from "react"
-import { Slot } from "@radix-ui.react-slot"
+import { Slot } from "@radix-ui/react-slot"
 import { cva, type VariantProps } from "class-variance-authority"
 
 import { cn } from "@/lib/utils"
 
 const buttonVariants = cva(
-  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-all disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg:not([class*='size-'])]:size-4 shrink-0 [&_svg]:shrink-0 outline-none focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px] aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:border-destructive contrast-more:text-base contrast-more:font-semedibold contrast-more:outline-2 contrast-more:outline-offset-2 contrast-more:outline-current contrast-more:focus-visible:ring-[4px] contrast-more:focus-visible:ring-ring contrast-more:focus-visible:ring-offset-2 contrast-more:focus-visible:ring-offset-background",
+  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-all disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg:not([class*='size-'])]:size-4 shrink-0 [&_svg]:shrink-0 outline-none focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px] aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:border-destructive contrast-more:text-base contrast-more:font-semibold contrast-more:outline-2 contrast-more:outline-offset-2 contrast-more:outline-current contrast-more:focus-visible:ring-[4px] contrast-more:focus-visible:ring-ring contrast-more:focus-visible:ring-offset-2 contrast-more:focus-visible:ring-offset-background",
   {
     variants: {
       variant: {

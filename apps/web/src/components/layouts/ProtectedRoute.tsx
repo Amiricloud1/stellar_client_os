@@ -6,6 +6,7 @@ import { Wallet } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useWallet } from "@/providers/StellarWalletProvider";
+import { ClientOnly } from "@/components/ui/client-only";
 
 interface ConnectWalletPromptProps {
   title?: string;
@@ -59,7 +60,52 @@ interface ProtectedRouteProps extends ConnectWalletPromptProps {
   children: ReactNode;
 }
 
+/**
+ * ProtectedRoute
+ *
+ * Wraps wallet-dependent pages in a <ClientOnly> guard so that the server
+ * and the initial client render always emit the same "connect wallet" prompt
+ * (the `fallback`), preventing the React hydration mismatch that occurs when
+ * `address` is non-null on the client but unknown during SSR.
+ *
+ * Once the component mounts in the browser, if `address` is available the
+ * children are rendered; otherwise the connect-wallet prompt is shown.
+ */
 export default function ProtectedRoute({
+  children,
+  title,
+  description,
+  actionLabel,
+  containerClassName,
+  cardClassName,
+}: ProtectedRouteProps) {
+  return (
+    <ClientOnly
+      fallback={
+        <ConnectWalletPrompt
+          title={title}
+          description={description}
+          actionLabel={actionLabel}
+          containerClassName={containerClassName}
+          cardClassName={cardClassName}
+        />
+      }
+    >
+      <ProtectedRouteInner
+        title={title}
+        description={description}
+        actionLabel={actionLabel}
+        containerClassName={containerClassName}
+        cardClassName={cardClassName}
+      >
+        {children}
+      </ProtectedRouteInner>
+    </ClientOnly>
+  );
+}
+
+/** Inner component only rendered after hydration, safe to read wallet state. */
+function ProtectedRouteInner({
   children,
   title,
   description,

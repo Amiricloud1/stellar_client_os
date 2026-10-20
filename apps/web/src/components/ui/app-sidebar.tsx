@@ -103,6 +103,11 @@ const mobileItems = [
     icon: <DashboardIcon aria-hidden="true" />,
   },
   {
+    title: "Campaigns",
+    url: "/campaigns",
+    icon: <BookIcon aria-hidden="true" />,
+  },
+  {
     title: "Profile",
     url: "/profile",
     icon: <TreePine aria-hidden="true" className="text-emerald-400 size-5" />,
@@ -153,8 +158,8 @@ export function AppSidebar() {
   // Mobile bottom navigation
   if (isMobile) {
     return (
-      <div className={`fixed bottom-0 left-0 right-0 bg-black border-t border-gray-800 z-50 safe-area-pb ${highContrast ? "high-contrast" : ""}`}>
-        <nav className="flex items-center justify-around py-1 px-2 sm:py-2 sm:px-4" aria-label="Mobile navigation">
+      <div className={`fixed bottom-0 left-0 right-0 w-full max-w-full overflow-x-hidden bg-black border-t border-gray-800 z-50 safe-area-pb ${highContrast ? "high-contrast" : ""}`}>
+        <nav className="flex w-full max-w-full items-center justify-around py-1 px-1 sm:py-2 sm:px-4" aria-label="Mobile navigation">
           {mobileItems.map((item) => {
             const isActive = pathname === item.url;
 
@@ -162,6 +167,7 @@ export function AppSidebar() {
               <Link
                 key={item.title}
                 href={item.url}
+                aria-current={isActive ? "page" : undefined}
                 className={`flex flex-col items-center justify-center py-1 px-1 sm:py-2 sm:px-3 min-w-0 flex-1 transition-colors touch-manipulation focus:outline-none focus-visible:ring-2 focus-visible:ring-yellow-300 focus-visible:ring-offset-2 focus-visible:ring-offset-black ${isActive ? "text-white" : "text-gray-400"
                   }`}
                 onClick={() => setOpenMobile(false)}
@@ -170,7 +176,7 @@ export function AppSidebar() {
                   }`}>
                   {item.icon}
                 </div>
-                <span className={`text-[11px] sm:text-sm font-medium leading-tight ${isActive ? "text-white" : "text-gray-400"
+                <span className={`truncate max-w-full text-[10px] sm:text-sm font-medium leading-tight ${isActive ? "text-white" : "text-gray-400"
                   }`}>
                   {item.title}
                 </span>

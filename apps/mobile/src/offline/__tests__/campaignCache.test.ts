@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CampaignCache, CampaignRepository } from "../campaignCache";
+import { CampaignCache, CampaignRepository, formatFreshness } from "../campaignCache";
 import { createMemoryStorage } from "../storage";
 import type { CampaignDetail, CampaignSummary } from "../types";
 
@@ -64,7 +64,12 @@ describe("CampaignCache + CampaignRepository", () => {
 
     const result = await repository.loadList(networkFailure, { fallback: [] });
 
-    expect(result).toEqual({ data: [], fromCache: true, cachedAt: null });
+    expect(result).toEqual({
+      data: [],
+      fromCache: true,
+      cachedAt: null,
+      stale: false,
+    });
   });
 
   it("rethrows the network error when offline with an empty cache and no fallback", async () => {
@@ -100,5 +105,87 @@ describe("CampaignCache + CampaignRepository", () => {
 
     expect(await first.readList()).not.toBeNull();
     expect(await second.readList()).toBeNull();
+  });
+
+  it("evicts least-recently-used details above the cap", async () => {
+    const storage = createMemoryStorage();
+    const clock = () => 100;
+    const cache = new CampaignCache(storage, {
+      clock,
+      maxDetailEntries: 2,
+    });
+
+    await cache.saveDetail("a", detail("a"));
+    await cache.saveDetail("b", detail("b"));
+    await cache.saveDetail("c", detail("c"));
+
+    expect(await cache.readDetail("a")).toBeNull(); // LRU victim
+    expect(await cache.readDetail("b")).not.toBeNull();
+    expect(await cache.readDetail("c")).not.toBeNull();
+    expect(await cache.detailCount()).toBe(2);
+  });
+
+  it("never evicts wishlisted (protected) campaigns", async () => {
+    const storage = createMemoryStorage();
+    const clock = () => 100;
+    const cache = new CampaignCache(storage, {
+      clock,
+      maxDetailEntries: 1,
+      protectedIds: () => ["b"],
+    });
+
+    await cache.saveDetail("a", detail("a"));
+    await cache.saveDetail("b", detail("b")); // protected, survives
+
+    expect(await cache.readDetail("a")).toBeNull();
+    expect(await cache.readDetail("b")).not.toBeNull();
+  });
+
+  it("marks cache-served reads stale when they exceed the threshold", async () => {
+    const storage = createMemoryStorage();
+    const cache = new CampaignCache(storage, { clock: () => 100_000 });
+    const repository = new CampaignRepository(cache);
+
+    await repository.loadDetail("a", async () => detail("a"), {
+      staleAfterMs: null,
+    });
+    // Advance the clock past the default 15 min stale threshold (900_000 ms).
+    const staleCache = new CampaignCache(storage, { clock: () => 1_000_001 });
+    const staleRepo = new CampaignRepository(staleCache);
+
+    const result = await staleRepo.loadDetail("a", async () => {
+      throw new Error("offline");
+    });
+
+    expect(result.fromCache).toBe(true);
+    expect(result.stale).toBe(true);
+    expect(result.cachedAt).toBe(100_000);
+  });
+
+  it("detailFreshness reports age and staleness without touching LRU order", async () => {
+    const storage = createMemoryStorage();
+    const clock = () => 1_000;
+    const cache = new CampaignCache(storage, { clock });
+
+    await cache.saveDetail("a", detail("a"));
+
+    const freshness = await cache.detailFreshness("a");
+    expect(freshness).toEqual({ cachedAt: 1_000, ageMs: 0, stale: false });
+
+    const later = new CampaignCache(storage, { clock: () => 2_000 });
+    expect(await later.detailFreshness("a")).toEqual({
+      cachedAt: 1_000,
+      ageMs: 1_000,
+      stale: false,
+    });
+    expect(await later.detailFreshness("missing")).toBeNull();
+  });
+
+  it("formatFreshness is deterministic across age buckets", () => {
+    expect(formatFreshness(null)).toBe("updated just now");
+    expect(formatFreshness(30_000)).toBe("updated just now");
+    expect(formatFreshness(5 * 60_000)).toBe("updated 5m ago");
+    expect(formatFreshness(90 * 60_000)).toBe("updated 1h ago");
+    expect(formatFreshness(2 * 24 * 60 * 60_000)).toBe("updated 2d ago");
   });
 });

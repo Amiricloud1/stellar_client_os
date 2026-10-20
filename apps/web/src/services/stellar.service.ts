@@ -52,6 +52,7 @@ import {
 } from './errors';
 import { isAbortError, withAbortSignal, withRetry } from '@/utils/retry';
 import { getStellarServerOptions } from '@/utils/rpc-connection-options';
+import { withSpan } from '@/lib/tracing';
 
 // Default configuration values
 const DEFAULT_TIMEOUT = 30; // seconds
@@ -922,51 +923,61 @@ export class StellarService {
    * Submit transaction and wait for confirmation
    */
   private async submitAndWait(tx: Transaction | FeeBumpTransaction): Promise<TransactionResult<unknown>> {
-    const sendResponse = await withRetry(() => this.rpcServer.sendTransaction(tx), { maxRetries: this.maxRetries }) as Awaited<ReturnType<typeof this.rpcServer.sendTransaction>>;
-    const hash = sendResponse.hash;
+    return withSpan('stellar.rpc.submitTransaction', async (span) => {
+      span.setAttribute('rpc.service', 'stellar.soroban');
+      span.setAttribute('rpc.method', 'sendTransaction');
 
-    if (sendResponse.status === 'ERROR') {
-      throw new TransactionError('Transaction submission failed', {
+      const sendResponse = await withRetry(() => this.rpcServer.sendTransaction(tx), { maxRetries: this.maxRetries }) as Awaited<ReturnType<typeof this.rpcServer.sendTransaction>>;
+      const hash = sendResponse.hash;
+      span.setAttribute('stellar.tx_hash', hash);
+
+      if (sendResponse.status === 'ERROR') {
+        span.setStatus('error');
+        throw new TransactionError('Transaction submission failed', {
+          txHash: hash,
+          resultCodes: sendResponse.errorResult
+            ? [sendResponse.errorResult.result().switch().name]
+            : undefined,
+        });
+      }
+
+      // Poll for transaction result
+      let getResponse = await withRetry(() => this.rpcServer.getTransaction(hash), { maxRetries: this.maxRetries });
+      const maxWaitTime = this.defaultTimeout * 1000;
+      const startTime = Date.now();
+
+      while (getResponse.status === Api.GetTransactionStatus.NOT_FOUND) {
+        if (Date.now() - startTime > maxWaitTime) {
+          span.setStatus('error');
+          throw new TransactionTimeoutError(hash);
+        }
+
+        await sleep(1000);
+        getResponse = await withRetry(() => this.rpcServer.getTransaction(hash), { maxRetries: this.maxRetries });
+      }
+
+      if (getResponse.status === Api.GetTransactionStatus.SUCCESS) {
+        let result: unknown = undefined;
+        if (getResponse.returnValue) {
+          result = scValToNative(getResponse.returnValue);
+        }
+
+        span.setStatus('ok');
+        return {
+          hash,
+          success: true,
+          result,
+          ledger: getResponse.ledger,
+        };
+      }
+
+      span.setStatus('error');
+      throw new TransactionError('Transaction failed', {
         txHash: hash,
-        resultCodes: sendResponse.errorResult
-          ? [sendResponse.errorResult.result().switch().name]
+        resultCodes: getResponse.resultXdr
+          ? [getResponse.resultXdr.result().switch().name]
           : undefined,
       });
-    }
-
-    // Poll for transaction result
-    let getResponse = await withRetry(() => this.rpcServer.getTransaction(hash), { maxRetries: this.maxRetries });
-    const maxWaitTime = this.defaultTimeout * 1000;
-    const startTime = Date.now();
-
-    while (getResponse.status === Api.GetTransactionStatus.NOT_FOUND) {
-      if (Date.now() - startTime > maxWaitTime) {
-        throw new TransactionTimeoutError(hash);
-      }
-
-      await sleep(1000);
-      getResponse = await withRetry(() => this.rpcServer.getTransaction(hash), { maxRetries: this.maxRetries });
-    }
-
-    if (getResponse.status === Api.GetTransactionStatus.SUCCESS) {
-      let result: unknown = undefined;
-      if (getResponse.returnValue) {
-        result = scValToNative(getResponse.returnValue);
-      }
-
-      return {
-        hash,
-        success: true,
-        result,
-        ledger: getResponse.ledger,
-      };
-    }
-
-    throw new TransactionError('Transaction failed', {
-      txHash: hash,
-      resultCodes: getResponse.resultXdr
-        ? [getResponse.resultXdr.result().switch().name]
-        : undefined,
     });
   }
 
