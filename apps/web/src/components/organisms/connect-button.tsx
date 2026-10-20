@@ -26,10 +26,40 @@ const ArrowDownIcon = ({
   </svg>
 );
 
+export type ConnectButtonState =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "rejected";
+
 export function ConnectButton() {
   const { isConnected, isLocked, address, openModal, disconnect } = useWallet();
   const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [connectState, setConnectState] = useState<ConnectButtonState>("idle");
   const dropdownRef = useRef<HTMLDivElement>(null);
+
+  // Keep the exposed state in sync with the wallet provider. A rejected
+  // connection attempt stays visible until the user retries.
+  useEffect(() => {
+    if (isConnected && address) {
+      setConnectState("connected");
+    } else if (connectState === "connected") {
+      setConnectState("idle");
+    }
+  }, [isConnected, address, connectState]);
+
+  const handleConnect = async () => {
+    if (connectState === "connecting") return;
+    setConnectState("connecting");
+    try {
+      await openModal();
+      // The provider flips `isConnected` on success; if it does not, the
+      // attempt is treated as rejected so the UI is deterministic in tests.
+      setConnectState((prev) => (prev === "connecting" ? "rejected" : prev));
+    } catch {
+      setConnectState("rejected");
+    }
+  };
 
   // Close dropdown when clicking outside
   useEffect(() => {
@@ -66,10 +96,16 @@ export function ConnectButton() {
 
   if (isConnected && address) {
     return (
-      <div className="relative" ref={dropdownRef}>
+      <div
+        className="relative"
+        ref={dropdownRef}
+        data-testid="connect-button"
+        data-wallet-state="connected"
+      >
         <motion.button
           type="button"
           data-wallet-trigger
+          data-testid="connect-button-trigger"
           aria-expanded={dropdownOpen}
           aria-haspopup="menu"
           aria-label={`Wallet connected: ${formatAddress(address)}. Click to open wallet menu`}
@@ -104,6 +140,7 @@ export function ConnectButton() {
               <button
                 type="button"
                 role="menuitem"
+                data-testid="wallet-disconnect"
                 aria-label="Disconnect wallet"
                 onClick={handleDisconnect}
                 className="flex items-center gap-3 w-full px-4 py-3 text-red-400 hover:bg-red-500/10 rounded-xl transition-all text-sm font-bold"
@@ -120,25 +157,50 @@ export function ConnectButton() {
 
   // Locked extension wallet — show Locked badge instead of generic Connect CTA.
   if (isLocked) {
-    return <WalletStatus />;
+    return (
+      <div data-testid="connect-button" data-wallet-state="locked">
+        <WalletStatus />
+      </div>
+    );
   }
 
+  const isConnecting = connectState === "connecting";
+  const isRejected = connectState === "rejected";
+
   return (
-    <motion.button
-      type="button"
-      data-wallet-trigger
-      aria-label="Connect your Stellar wallet"
-      whileHover={{ scale: 1.02 }}
-      whileTap={{ scale: 0.98 }}
-      onClick={openModal}
-      className="group relative flex items-center"
+    <div
+      data-testid="connect-button"
+      data-wallet-state={connectState}
+      className="flex flex-col items-end gap-1"
     >
-      <div className="flex items-center gap-4 px-8 py-3 rounded-2xl bg-white border border-white/20 hover:shadow-[0_0_20px_rgba(255,255,255,0.2)] transition-all text-[#0F1621] font-bold tracking-wider shadow-xl">
-        <span>CONNECT WALLET</span>
-        <div className="group-hover:translate-x-1 transition-transform">
-          <ArrowDownIcon className="text-[#0F1621]/70" />
+      <motion.button
+        type="button"
+        data-wallet-trigger
+        data-testid="connect-button-trigger"
+        aria-label="Connect your Stellar wallet"
+        aria-busy={isConnecting}
+        disabled={isConnecting}
+        whileHover={isConnecting ? undefined : { scale: 1.02 }}
+        whileTap={isConnecting ? undefined : { scale: 0.98 }}
+        onClick={handleConnect}
+        className="group relative flex items-center disabled:cursor-wait disabled:opacity-70"
+      >
+        <div className="flex items-center gap-4 px-8 py-3 rounded-2xl bg-white border border-white/20 hover:shadow-[0_0_20px_rgba(255,255,255,0.2)] transition-all text-[#0F1621] font-bold tracking-wider shadow-xl">
+          <span>{isConnecting ? "CONNECTING..." : "CONNECT WALLET"}</span>
+          <div className="group-hover:translate-x-1 transition-transform">
+            <ArrowDownIcon className="text-[#0F1621]/70" />
+          </div>
         </div>
-      </div>
-    </motion.button>
+      </motion.button>
+      {isRejected && (
+        <p
+          role="alert"
+          data-testid="connect-button-error"
+          className="text-xs font-semibold text-red-400"
+        >
+          Connection rejected. Please try again.
+        </p>
+      )}
+    </div>
   );
 }
