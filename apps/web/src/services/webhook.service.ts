@@ -3,6 +3,16 @@ import type { CampaignWebhookEvent } from "../types/webhook";
 import path from 'path';
 import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import type { WebhookSubscription, WebhookDeliveryAttempt, WebhookPayload } from '../types/webhook';
+import {
+  getActiveTrace,
+  createChildContext,
+  extractTraceContext,
+  injectTraceHeaders,
+  Span,
+  sanitizeObject,
+  sanitizeString,
+  type TraceContext,
+} from '@/lib/tracing';
 
 /** Current signature scheme version. Included in the signed canonical string. */
 export const WEBHOOK_SIGNATURE_VERSION = 'v1';
@@ -520,7 +530,12 @@ export class WebhookService {
    * delivery for events without a stable identity and effectively-once
    * delivery for events with one, including across process restarts.
    */
-  async dispatchEvent(event: string, eventData: Record<string, unknown>): Promise<void> {
+  async dispatchEvent(
+    event: string,
+    eventData: Record<string, unknown>,
+    traceContext?: TraceContext
+  ): Promise<void> {
+    const parentTrace = traceContext ?? getActiveTrace();
     const subscriptions = await this.getSubscriptions();
     const matchingSubs = subscriptions.filter(
       (sub) => sub.events.includes(event) || sub.events.includes('*')
@@ -533,7 +548,7 @@ export class WebhookService {
       const eventKey = sourceKey ? `${sub.id}:${sourceKey}` : null;
       if (!(await this.reserveEvent(eventKey))) continue;
 
-      const deliveryPromise = this.deliverWithRetry(sub, event, eventData).then(
+      const deliveryPromise = this.deliverWithRetry(sub, event, eventData, 1, parentTrace).then(
         (delivered) => this.completeEvent(eventKey, delivered),
         async () => {
           await this.completeEvent(eventKey, false);
@@ -575,6 +590,17 @@ export class WebhookService {
     };
     const { deliveryId, timestamp, signatureVersion } = metadata;
 
+    // Trace context and span propagation
+    const active = traceContext ?? getActiveTrace();
+    const traceCtx = active ? createChildContext(active) : extractTraceContext({});
+    const span = new Span(traceCtx, 'webhook.deliver', {
+      'webhook.subscription_id': sub.id,
+      'webhook.event': event,
+      'webhook.attempt': attemptNum,
+      'webhook.url': sub.url,
+      'webhook.delivery_id': deliveryId,
+    });
+
     const payload: WebhookPayload = {
       id: deliveryId,
       event,
@@ -592,6 +618,15 @@ export class WebhookService {
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s HTTP timeout
+
+      const outgoingHeaders: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'X-Webhook-Timestamp': timestamp.toString(),
+        'X-Webhook-Signature': signature,
+        'X-Webhook-Event': event,
+        'X-Webhook-Delivery-Id': deliveryId,
+      };
+      injectTraceHeaders(traceCtx, outgoingHeaders);
 
       const response = await fetch(sub.url, {
         method: 'POST',
@@ -619,26 +654,36 @@ export class WebhookService {
       errorMessage = err instanceof Error ? err.message : String(err);
     }
 
+    span.setAttribute('http.status_code', statusCode ?? 0);
+    if (success) {
+      span.end('ok');
+    } else {
+      if (errorMessage) span.setAttribute('error.message', sanitizeString(errorMessage));
+      span.end('error');
+    }
+
     const attemptRecord: WebhookDeliveryAttempt = {
       id: deliveryId,
       subscriptionId: sub.id,
       event,
       url: sub.url,
-      payload: eventData,
+      payload: sanitizeObject(eventData),
       timestamp: new Date().toISOString(),
       statusCode,
       success,
-      errorMessage,
+      errorMessage: errorMessage ? sanitizeString(errorMessage) : null,
       attempt: attemptNum,
     };
 
     if (success) {
-      console.log(`[Webhook success] Event: ${event}, Sub: ${sub.id}, Url: ${sub.url}`);
+      console.log(sanitizeString(`[Webhook success] Event: ${event}, Sub: ${sub.id}, Url: ${sub.url}`));
       return true;
     }
 
     console.warn(
-      `[Webhook failure] Attempt ${attemptNum}/${this.maxRetries} to ${sub.url} failed. Error: ${errorMessage}`
+      sanitizeString(
+        `[Webhook failure] Attempt ${attemptNum}/${this.maxRetries} to ${sub.url} failed. Error: ${errorMessage}`
+      )
     );
 
     if (attemptNum < this.maxRetries) {
@@ -658,7 +703,9 @@ export class WebhookService {
       return retryPromise;
     } else {
       console.error(
-        `[Webhook dead-letter] All retries (${this.maxRetries}) exhausted for ${sub.url}. Writing to DLQ.`
+        sanitizeString(
+          `[Webhook dead-letter] All retries (${this.maxRetries}) exhausted for ${sub.url}. Writing to DLQ.`
+        )
       );
       await this.logToDeadLetter(attemptRecord);
       return false;
