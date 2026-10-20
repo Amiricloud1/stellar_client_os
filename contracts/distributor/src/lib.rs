@@ -799,4 +799,118 @@ mod test {
         distributor_client.distribute_equal(&sender, &token_address, &1000, &recipients);
     }
 
+    // ---------------------------------------------------------------------------
+    // Property-based financial invariant tests (Issue #36)
+    // ---------------------------------------------------------------------------
+
+    struct DeterministicRng {
+        state: u64,
+    }
+
+    impl DeterministicRng {
+        fn new(seed: u64) -> Self {
+            Self {
+                state: if seed == 0 { 0xA5A5_5A5A_0123_4567 } else { seed },
+            }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.state = x;
+            x
+        }
+
+        fn next_in_range(&mut self, min: u64, max: u64) -> u64 {
+            if min >= max {
+                return min;
+            }
+            min + (self.next_u64() % (max - min + 1))
+        }
+    }
+
+    #[test]
+    fn test_property_based_distribution_invariants() {
+        // Deterministic seeds to generate pseudo-random call sequences
+        const SEEDS: [u64; 4] = [
+            0x1234_5678_9ABC_DEF0,
+            0xFEED_FACE_CAFE_BEEF,
+            0xDEAD_BEEF_0000_0001,
+            0x0123_4567_89AB_CDEF,
+        ];
+
+        for &seed in &SEEDS {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let admin = Address::generate(&env);
+            let (token_address, token_client, token_admin) = create_token_contract(&env, &admin);
+            let (_contract_id, distributor_client, _admin, fee_address) = setup_distributor(&env);
+
+            let sender = Address::generate(&env);
+            let initial_funding: i128 = 10_000_000;
+            token_admin.mint(&sender, &initial_funding);
+
+            let mut rng = DeterministicRng::new(seed);
+            let mut total_sender_debited: i128 = 0;
+            let mut total_system_credited: i128 = 0;
+
+            for step in 0..15 {
+                let op_type = rng.next_in_range(0, 1);
+                let num_recipients = rng.next_in_range(1, 6) as usize;
+
+                let mut recipients = Vec::new(&env);
+                for _ in 0..num_recipients {
+                    recipients.push_back(Address::generate(&env));
+                }
+
+                let sender_bal_before = token_client.balance(&sender);
+                let fee_bal_before = token_client.balance(&fee_address);
+                let mut rec_bals_before: [i128; 6] = [0; 6];
+                for (i, r) in recipients.iter().enumerate() {
+                    rec_bals_before[i] = token_client.balance(&r);
+                }
+
+                if op_type == 0 {
+                    // Distribute equal
+                    let total_amount = (rng.next_in_range(num_recipients as u64, 50_000)) as i128;
+                    distributor_client.distribute_equal(&sender, &token_address, &total_amount, &recipients);
+                } else {
+                    // Distribute weighted
+                    let mut amounts = Vec::new(&env);
+                    for _ in 0..num_recipients {
+                        let amt = (rng.next_in_range(1, 10_000)) as i128;
+                        amounts.push_back(amt);
+                    }
+                    distributor_client.distribute_weighted(&sender, &token_address, &recipients, &amounts);
+                }
+
+                let sender_bal_after = token_client.balance(&sender);
+                let fee_bal_after = token_client.balance(&fee_address);
+                let debited = sender_bal_before - sender_bal_after;
+
+                let mut credited = fee_bal_after - fee_bal_before;
+                for (i, r) in recipients.iter().enumerate() {
+                    let rec_after = token_client.balance(&r);
+                    credited += rec_after - rec_bals_before[i];
+                }
+
+                // Invariant 1: Exact balance conservation per transaction (no tokens created or destroyed)
+                assert_eq!(
+                    debited, credited,
+                    "Conservation invariant violated at seed {:#X}, step {}",
+                    seed, step
+                );
+
+                total_sender_debited += debited;
+                total_system_credited += credited;
+            }
+
+            // Invariant 2: Total conservation over entire call sequence
+            assert_eq!(total_sender_debited, total_system_credited);
+            assert_eq!(token_client.balance(&sender), initial_funding - total_sender_debited);
+        }
+    }
 }
