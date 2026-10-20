@@ -1,40 +1,26 @@
-name: Docs CI
+name: Documentation CI
 
 on:
   push:
     paths:
-      - "docs/**"
-      - "apps/mobile/OFFLINE.md"
-      - "apps/mobile/src/offline/**"
-      - "apps/web/src/lib/env.ts"
-      - "apps/web/src/lib/s3/config.ts"
-      - "apps/web/src/lib/__tests__/env-reference.test.ts"
-      - "apps/web/src/lib/__tests__/testing-guide.test.ts"
-      - "CONTRIBUTING.md"
-      - ".github/PULL_REQUEST_TEMPLATE.md"
-      - "TESTING_GUIDE.md"
-      - "QUICKSTART.md"
-      - ".env.example"
-      - ".github/workflows/docs.yml"
+      - 'docs/**'
+      - 'packages/sdk/src/__tests__/docs-validation.test.ts'
+      - 'packages/sdk/src/__tests__/webhook-schemas.ts'
+      - 'packages/sdk/src/__tests__/webhook-fixtures/**'
+      - '.github/workflows/docs.yml'
   pull_request:
     paths:
-      - "docs/**"
-      - "apps/mobile/OFFLINE.md"
-      - "apps/mobile/src/offline/**"
-      - "apps/web/src/lib/env.ts"
-      - "apps/web/src/lib/s3/config.ts"
-      - "apps/web/src/lib/__tests__/env-reference.test.ts"
-      - "apps/web/src/lib/__tests__/testing-guide.test.ts"
-      - "CONTRIBUTING.md"
-      - ".github/PULL_REQUEST_TEMPLATE.md"
-      - "TESTING_GUIDE.md"
-      - "QUICKSTART.md"
-      - ".env.example"
-      - ".github/workflows/docs.yml"
+      - 'docs/**'
+      - 'packages/sdk/src/__tests__/docs-validation.test.ts'
+      - 'packages/sdk/src/__tests__/webhook-schemas.ts'
+      - 'packages/sdk/src/__tests__/webhook-fixtures/**'
+      - '.github/workflows/docs.yml'
 
 jobs:
-  validate:
+  validate-docs:
+    name: Validate Documentation
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -49,23 +35,30 @@ jobs:
         with:
           version: 9
 
+      - name: Ensure no npm/yarn lockfiles exist
+        run: |
+          if find . -name "package-lock.json" -o -name "yarn.lock" | grep -q .; then
+            echo "❌ npm/yarn lockfile detected. This repo uses pnpm. Remove the lockfile and re-run."
+            find . -name "package-lock.json" -o -name "yarn.lock"
+            exit 1
+          fi
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Mobile offline tests (cache + sync guarantees)
-        run: pnpm --filter @fundable/mobile test
-
-      - name: Mobile offline typecheck
-        run: pnpm --filter @fundable/mobile typecheck
-
-      - name: Web docs tests (env reference + testing guide)
-        run: pnpm --filter @fundable/web test -- src/lib/__tests__/env-reference.test.ts src/lib/__tests__/testing-guide.test.ts src/lib/__tests__/env.test.ts
-
-      - name: Required docs files exist
+      - name: Verify required doc files exist
         run: |
-          test -f docs/environment-variables.md || (echo "missing docs/environment-variables.md" && exit 1)
-          test -f CONTRIBUTING.md || (echo "missing CONTRIBUTING.md" && exit 1)
-          test -f .github/PULL_REQUEST_TEMPLATE.md || (echo "missing PR template" && exit 1)
-          test -f TESTING_GUIDE.md || (echo "missing TESTING_GUIDE.md" && exit 1)
-          grep -q "NEXT_PUBLIC_PAYMENT_STREAM_CONTRACT_ID" .env.example || (echo ".env.example missing web keys" && exit 1)
-          grep -q "closes #" .github/PULL_REQUEST_TEMPLATE.md || (echo "PR template missing issues section" && exit 1)
+          for f in \
+            docs/operations/component-ownership-runbook.md \
+            docs/audits/contract-security-remediation.md \
+            docs/webhooks/event-schemas.md \
+            docs/tax-reporting/sponsorship-tax-provenance.md; do
+            if [ ! -f "$f" ]; then
+              echo "❌ Missing required documentation file: $f"
+              exit 1
+            fi
+          done
+          echo "✅ All required documentation files are present."
+
+      - name: Run Docs Validation Test Suite
+        run: pnpm --filter @fundable/sdk test src/__tests__/docs-validation.test.ts

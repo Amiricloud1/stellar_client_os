@@ -1,0 +1,130 @@
+groups:
+  - name: fundable_slo_alerts
+    rules:
+      # ========================================================================
+      # Flow: Reads (Availability Target: 99.9%, Budget: 0.1%)
+      # Owner: Core Platform Team (@fundable/platform-core)
+      # ========================================================================
+      - alert: ReadsCriticalBurnRate1h
+        expr: fundable_slo_burn_rate{flow="reads",window="1h"} >= 14.4
+        for: 2m
+        labels:
+          severity: critical
+          tier: p1
+          flow: reads
+          owner: platform-core
+        annotations:
+          summary: "Reads flow burning error budget at >= 14.4x over 1h"
+          description: "Consuming > 2% of 30-day budget in 1 hour. Immediate response required."
+          runbook_url: "docs/runbooks/slo-burn-rate.md#reads-flow-degradation"
+          escalation: "pager-platform-core"
+
+      - alert: ReadsWarningBurnRate6h
+        expr: fundable_slo_burn_rate{flow="reads",window="6h"} >= 6.0
+        for: 15m
+        labels:
+          severity: warning
+          tier: p2
+          flow: reads
+          owner: platform-core
+        annotations:
+          summary: "Reads flow burning error budget at >= 6.0x over 6h"
+          description: "Consuming > 5% of 30-day budget in 6 hours."
+          runbook_url: "docs/runbooks/slo-burn-rate.md#reads-flow-degradation"
+          escalation: "slack-incidents"
+
+      # ========================================================================
+      # Flow: Submission (Availability Target: 99.5%, Budget: 0.5%)
+      # Owner: Blockchain Operations Team (@fundable/blockchain-ops)
+      # ========================================================================
+      - alert: SubmissionCriticalBurnRate1h
+        expr: fundable_slo_burn_rate{flow="submission",window="1h"} >= 14.4
+        for: 2m
+        labels:
+          severity: critical
+          tier: p1
+          flow: submission
+          owner: blockchain-ops
+        annotations:
+          summary: "Submission flow burning error budget at >= 14.4x over 1h"
+          description: "Payment streams, withdrawals, and contract transactions failing at high rate."
+          runbook_url: "docs/runbooks/slo-burn-rate.md#submission-flow-degradation"
+          escalation: "pager-blockchain-ops"
+
+      - alert: SubmissionWarningBurnRate6h
+        expr: fundable_slo_burn_rate{flow="submission",window="6h"} >= 6.0
+        for: 15m
+        labels:
+          severity: warning
+          tier: p2
+          flow: submission
+          owner: blockchain-ops
+        annotations:
+          summary: "Submission flow burning error budget at >= 6.0x over 6h"
+          description: "Sustained submission failures over 6-hour window."
+          runbook_url: "docs/runbooks/slo-burn-rate.md#submission-flow-degradation"
+          escalation: "slack-incidents"
+
+      # ========================================================================
+      # Flow: Webhooks (Availability Target: 99.9%, Budget: 0.1%)
+      # Owner: Integrations Team (@fundable/integrations)
+      # ========================================================================
+      - alert: WebhooksCriticalBurnRate1h
+        expr: fundable_slo_burn_rate{flow="webhooks",window="1h"} >= 14.4
+        for: 2m
+        labels:
+          severity: critical
+          tier: p1
+          flow: webhooks
+          owner: integrations
+        annotations:
+          summary: "Webhook delivery burning error budget at >= 14.4x over 1h"
+          description: "Delivery exhaustion and dead-letter queue surges detected."
+          runbook_url: "docs/runbooks/slo-burn-rate.md#webhooks-flow-degradation"
+          escalation: "pager-integrations"
+
+      - alert: WebhooksWarningBurnRate6h
+        expr: fundable_slo_burn_rate{flow="webhooks",window="6h"} >= 6.0
+        for: 15m
+        labels:
+          severity: warning
+          tier: p2
+          flow: webhooks
+          owner: integrations
+        annotations:
+          summary: "Webhook delivery burning error budget at >= 6.0x over 6h"
+          description: "Sustained delivery failures over 6-hour window."
+          runbook_url: "docs/runbooks/slo-burn-rate.md#webhooks-flow-degradation"
+          escalation: "slack-incidents"
+
+      # ========================================================================
+      # Flow: Sync (Availability Target: 99.9%, Budget: 0.1%)
+      # Owner: Node & Sync Team (@fundable/node-sync)
+      # ========================================================================
+      - alert: SyncCriticalBurnRate1h
+        expr: fundable_slo_burn_rate{flow="sync",window="1h"} >= 14.4
+        for: 2m
+        labels:
+          severity: critical
+          tier: p1
+          flow: sync
+          owner: node-sync
+        annotations:
+          summary: "Sync flow burning error budget at >= 14.4x over 1h"
+          description: "Ledger indexer drift, Horizon poll lag, or event sync failures."
+          runbook_url: "docs/runbooks/slo-burn-rate.md#sync-flow-degradation"
+          escalation: "pager-node-sync"
+
+      - alert: SyncWarningBurnRate6h
+        expr: fundable_slo_burn_rate{flow="sync",window="6h"} >= 6.0
+        for: 15m
+        labels:
+          severity: warning
+          tier: p2
+          flow: sync
+          owner: node-sync
+        annotations:
+          summary: "Sync flow burning error budget at >= 6.0x over 6h"
+          description: "Sustained sync lag over 6-hour window."
+          runbook_url: "docs/runbooks/slo-burn-rate.md#sync-flow-degradation"
+          escalation: "slack-incidents"

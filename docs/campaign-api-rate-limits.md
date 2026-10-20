@@ -35,16 +35,20 @@ Campaign tiers can be resolved automatically via the campaign's registered fundi
 
 ## 🛠️ Throttling Strategy & Implementation
 
-Fundable uses an atomic **Sliding-Window Counter** algorithm backed by Redis sorted sets (`ZSET`) and Lua scripts (`SLIDING_WINDOW_SCRIPT`).
+Fundable uses an atomic **Sliding-Window Counter** algorithm backed by Redis sorted sets (`ZSET`), shared atomic sequence counters (`INCR`), and Lua scripts (`SLIDING_WINDOW_SCRIPT`).
 
 ### Algorithm Characteristics
 1. **Precision Sliding Window:** Unlike fixed-window counters, the sliding window prevents traffic bursts at window boundaries (up to 2x limit).
-2. **Atomic Execution:** Evaluated as a single Redis command to prevent TOCTOU (Time-Of-Check To Time-Of-Use) race conditions under high concurrency.
-3. **Graceful Degradation:** In the event of a Redis connectivity outage, the rate-limiting middleware fails-open (`allowed: true`) to prevent blocking legitimate transaction flow.
+2. **Shared Atomic Execution Across App Instances (Issue #100):** Evaluated as a single Redis Lua script using an atomic `<key>:seq` counter (`INCR`) rather than non-deterministic PRNG values, preventing member collisions across horizontally scaled instances and refusing to admit rejected requests into the window.
+3. **Route-Class Fail-Safe Outage Behavior (Issue #100):**
+   - `public-read` (`GET` campaign queries): Fails open (`allowed: true`, `X-RateLimit-Degraded: true`).
+   - `standard-write` (`POST` stream/campaign mutations): Falls back to a bounded in-memory sliding-window counter (`fallback-memory`).
+   - `financial-submission`, `sensitive-mutation`, `admin-privileged`: Fails closed (`HTTP 503 Service Unavailable`, `RATE_LIMIT_BACKEND_UNAVAILABLE`) when Redis is unreachable.
 4. **Key Extraction Strategy:**
    - Evaluates `X-Forwarded-For` header (primary).
    - Falls back to `X-Real-IP`.
    - Falls back to authenticated wallet address / API Key.
+
 
 ---
 

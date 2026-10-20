@@ -16,49 +16,208 @@ interface DeployConfig {
   networkPassphrase: string;
 }
 
+/**
+ * Resource limits applied to public contract compilation / WASM uploads.
+ *
+ * These bounds protect the deployer service from oversized or untrusted
+ * inputs. All values are intentionally conservative and can be overridden
+ * per-deployer via {@link DeployConfig.limits} for trusted/internal callers.
+ *
+ * - `maxWasmBytes`        — Maximum accepted WASM payload size (bytes).
+ * - `maxRequestBytes`     — Maximum accepted total request size (bytes).
+ * - `maxCpuInstructions`  — Maximum simulated CPU instruction budget.
+ * - `maxConcurrent`       — Maximum in-flight compilation/upload operations.
+ * - `timeoutMs`           — Wall-clock timeout for a single operation.
+ * - `maxOutputBytes`      — Maximum accepted serialized output size (bytes).
+ */
+export interface CompilationLimits {
+  maxWasmBytes: number;
+  maxRequestBytes: number;
+  maxCpuInstructions: number;
+  maxConcurrent: number;
+  timeoutMs: number;
+  maxOutputBytes: number;
+}
+
+export const DEFAULT_COMPILATION_LIMITS: Readonly<CompilationLimits> = Object.freeze({
+  maxWasmBytes: 256 * 1024, // 256 KiB
+  maxRequestBytes: 512 * 1024, // 512 KiB
+  maxCpuInstructions: 100_000_000,
+  maxConcurrent: 4,
+  timeoutMs: 30_000,
+  maxOutputBytes: 1024 * 1024, // 1 MiB
+});
+
+/**
+ * Stable error codes emitted when a compilation resource limit is violated.
+ * Callers (and the API layer) should branch on these codes rather than on
+ * human-readable messages.
+ */
+export type CompilationErrorCode =
+  | 'COMPILATION_WASM_TOO_LARGE'
+  | 'COMPILATION_REQUEST_TOO_LARGE'
+  | 'COMPILATION_CPU_BUDGET_EXCEEDED'
+  | 'COMPILATION_CONCURRENCY_LIMIT'
+  | 'COMPILATION_TIMEOUT'
+  | 'COMPILATION_OUTPUT_TOO_LARGE';
+
+export class CompilationLimitError extends Error {
+  readonly code: CompilationErrorCode;
+
+  constructor(code: CompilationErrorCode, message: string) {
+    super(message);
+    this.name = 'CompilationLimitError';
+    this.code = code;
+  }
+}
+=======
+
 export class ContractDeployer {
   private rpcServer: RpcServer;
   private networkPassphrase: string;
+  private limits: CompilationLimits;
+  private inFlight = 0;
 
-  constructor(config: DeployConfig) {
+  constructor(config: DeployConfig & { limits?: Partial<CompilationLimits> }) {
     this.rpcServer = new RpcServer(config.rpcUrl, getStellarServerOptions(config.rpcUrl));
     this.networkPassphrase = config.networkPassphrase;
+    this.limits = { ...DEFAULT_COMPILATION_LIMITS, ...(config.limits ?? {}) };
+  }
+
+  /** Returns the effective compilation limits (read-only copy). */
+  getLimits(): Readonly<CompilationLimits> {
+    return { ...this.limits };
+  }
+
+  /**
+   * Validates the WASM payload and request size against the configured limits.
+   * Throws a {@link CompilationLimitError} with a stable code on violation.
+   */
+  private assertWasmWithinLimits(wasmBytes: Uint8Array): void {
+    if (wasmBytes.byteLength > this.limits.maxWasmBytes) {
+      throw new CompilationLimitError(
+        'COMPILATION_WASM_TOO_LARGE',
+        `WASM payload of ${wasmBytes.byteLength} bytes exceeds limit of ${this.limits.maxWasmBytes} bytes.`
+      );
+    }
+    if (wasmBytes.byteLength > this.limits.maxRequestBytes) {
+      throw new CompilationLimitError(
+        'COMPILATION_REQUEST_TOO_LARGE',
+        `Request of ${wasmBytes.byteLength} bytes exceeds limit of ${this.limits.maxRequestBytes} bytes.`
+      );
+    }
+  }
+
+  /**
+   * Runs `fn` under the concurrency and timeout bounds. Rejects with a stable
+   * {@link CompilationLimitError} when the concurrency limit is exceeded or the
+   * operation exceeds the wall-clock timeout.
+   */
+  private async withResourceBounds<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.inFlight >= this.limits.maxConcurrent) {
+      throw new CompilationLimitError(
+        'COMPILATION_CONCURRENCY_LIMIT',
+        `Concurrency limit of ${this.limits.maxConcurrent} reached.`
+      );
+    }
+    this.inFlight++;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new CompilationLimitError(
+              'COMPILATION_TIMEOUT',
+              `Operation exceeded timeout of ${this.limits.timeoutMs}ms.`
+            )
+          );
+        }, this.limits.timeoutMs);
+      });
+      return await Promise.race([fn(), timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      this.inFlight--;
+    }
+  }
+
+  /**
+   * Asserts the simulated CPU instruction budget and serialized output size.
+   */
+  private assertSimulationWithinLimits(simulation: Api.SimulateTransactionSuccessResponse): void {
+    const cost = simulation.cost;
+    if (cost && typeof cost.cpuInsns === 'string') {
+      const cpuInsns = Number(cost.cpuInsns);
+      if (Number.isFinite(cpuInsns) && cpuInsns > this.limits.maxCpuInstructions) {
+        throw new CompilationLimitError(
+          'COMPILATION_CPU_BUDGET_EXCEEDED',
+          `Simulated CPU instructions (${cpuInsns}) exceed limit of ${this.limits.maxCpuInstructions}.`
+        );
+      }
+    }
+    const result = simulation.result;
+    if (result) {
+      const outputBytes = result.retval.toXDR().byteLength;
+      if (outputBytes > this.limits.maxOutputBytes) {
+        throw new CompilationLimitError(
+          'COMPILATION_OUTPUT_TOO_LARGE',
+          `Simulation output of ${outputBytes} bytes exceeds limit of ${this.limits.maxOutputBytes} bytes.`
+        );
+      }
+    }
   }
 
   /**
    * Builds the transaction to upload a WASM file to the network.
+   *
+   * Resource limits (see {@link CompilationLimits}):
+   * - WASM payload must not exceed `maxWasmBytes` / `maxRequestBytes`
+   *   (`COMPILATION_WASM_TOO_LARGE`, `COMPILATION_REQUEST_TOO_LARGE`).
+   * - At most `maxConcurrent` uploads may be in flight
+   *   (`COMPILATION_CONCURRENCY_LIMIT`).
+   * - The whole operation must complete within `timeoutMs`
+   *   (`COMPILATION_TIMEOUT`).
+   * - Simulated CPU instructions must not exceed `maxCpuInstructions`
+   *   (`COMPILATION_CPU_BUDGET_EXCEEDED`).
+   * - Serialized simulation output must not exceed `maxOutputBytes`
+   *   (`COMPILATION_OUTPUT_TOO_LARGE`).
    */
   async buildUploadWasmTx(
     address: string,
     wasmBytes: Uint8Array,
     fee: string = '1000' // Increased default fee for Wasm upload
   ): Promise<{ transaction: Transaction; simulation: Api.SimulateTransactionSuccessResponse }> {
-    const account = await this.getAccount(address);
-    
-    // Convert Uint8Array to Buffer for the SDK
-    const wasmBuffer = Buffer.from(wasmBytes);
+    this.assertWasmWithinLimits(wasmBytes);
 
-    const tx = new TransactionBuilder(account, {
-      fee,
-      networkPassphrase: this.networkPassphrase,
-    })
-      .addOperation(
-        Operation.invokeHostFunction({
-          func: xdr.HostFunction.hostFunctionTypeUploadContractWasm(wasmBuffer),
-          auth: [],
-        })
-      )
-      .setTimeout(60) // Generous timeout for uploads
-      .build();
+    return this.withResourceBounds(async () => {
+      const account = await this.getAccount(address);
 
-    const simulation = await this.rpcServer.simulateTransaction(tx);
-    
-    if (Api.isSimulationError(simulation)) {
-      throw new Error(`Wait! Wasm upload simulation failed: ${simulation.error}`);
-    }
+      // Convert Uint8Array to Buffer for the SDK
+      const wasmBuffer = Buffer.from(wasmBytes);
 
-    const assembledTx = assembleTransaction(tx, simulation).build();
-    return { transaction: assembledTx, simulation };
+      const tx = new TransactionBuilder(account, {
+        fee,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          Operation.invokeHostFunction({
+            func: xdr.HostFunction.hostFunctionTypeUploadContractWasm(wasmBuffer),
+            auth: [],
+          })
+        )
+        .setTimeout(60) // Generous timeout for uploads
+        .build();
+
+      const simulation = await this.rpcServer.simulateTransaction(tx);
+
+      if (Api.isSimulationError(simulation)) {
+        throw new Error(`Wait! Wasm upload simulation failed: ${simulation.error}`);
+      }
+
+      this.assertSimulationWithinLimits(simulation);
+
+      const assembledTx = assembleTransaction(tx, simulation).build();
+      return { transaction: assembledTx, simulation };
+    });
   }
 
   /**
@@ -167,48 +326,59 @@ export class ContractDeployer {
     salt?: Buffer,
     fee: string = '1000',
   ): Promise<{ transaction: Transaction; simulation: Api.SimulateTransactionSuccessResponse; salt: Buffer }> {
-    const account = await this.getAccount(address);
-
-    // Use the provided salt or generate a cryptographically random one.
-    const saltBuffer: Buffer = salt ?? (() => {
-      const buf = new Uint8Array(32);
-      crypto.getRandomValues(buf);
-      return Buffer.from(buf);
-    })();
-
-    const func = xdr.HostFunction.hostFunctionTypeCreateContract(
-      new xdr.CreateContractArgs({
-        contractIdPreimage: xdr.ContractIdPreimage.contractIdPreimageFromAddress(
-          new xdr.ContractIdPreimageFromAddress({
-            address: new Address(address).toScAddress(),
-            salt: saltBuffer,
-          })
-        ),
-        executable: xdr.ContractExecutable.contractExecutableWasm(wasmHash),
-      })
-    );
-
-    const tx = new TransactionBuilder(account, {
-      fee,
-      networkPassphrase: this.networkPassphrase,
-    })
-      .addOperation(
-        Operation.invokeHostFunction({
-          func,
-          auth: [],
-        })
-      )
-      .setTimeout(60)
-      .build();
-
-    const simulation = await this.rpcServer.simulateTransaction(tx);
-
-    if (Api.isSimulationError(simulation)) {
-      throw new Error(`Wait! Create contract simulation failed: ${simulation.error}`);
+    if (wasmHash.byteLength > this.limits.maxRequestBytes) {
+      throw new CompilationLimitError(
+        'COMPILATION_REQUEST_TOO_LARGE',
+        `Request of ${wasmHash.byteLength} bytes exceeds limit of ${this.limits.maxRequestBytes} bytes.`
+      );
     }
 
-    const assembledTx = assembleTransaction(tx, simulation).build();
-    return { transaction: assembledTx, simulation, salt: saltBuffer };
+    return this.withResourceBounds(async () => {
+      const account = await this.getAccount(address);
+
+      // Use the provided salt or generate a cryptographically random one.
+      const saltBuffer: Buffer = salt ?? (() => {
+        const buf = new Uint8Array(32);
+        crypto.getRandomValues(buf);
+        return Buffer.from(buf);
+      })();
+
+      const func = xdr.HostFunction.hostFunctionTypeCreateContract(
+        new xdr.CreateContractArgs({
+          contractIdPreimage: xdr.ContractIdPreimage.contractIdPreimageFromAddress(
+            new xdr.ContractIdPreimageFromAddress({
+              address: new Address(address).toScAddress(),
+              salt: saltBuffer,
+            })
+          ),
+          executable: xdr.ContractExecutable.contractExecutableWasm(wasmHash),
+        })
+      );
+
+      const tx = new TransactionBuilder(account, {
+        fee,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          Operation.invokeHostFunction({
+            func,
+            auth: [],
+          })
+        )
+        .setTimeout(60)
+        .build();
+
+      const simulation = await this.rpcServer.simulateTransaction(tx);
+
+      if (Api.isSimulationError(simulation)) {
+        throw new Error(`Wait! Create contract simulation failed: ${simulation.error}`);
+      }
+
+      this.assertSimulationWithinLimits(simulation);
+
+      const assembledTx = assembleTransaction(tx, simulation).build();
+      return { transaction: assembledTx, simulation, salt: saltBuffer };
+    });
   }
   
   /**
