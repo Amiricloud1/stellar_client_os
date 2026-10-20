@@ -156,9 +156,11 @@ export async function waitForTransaction<T = unknown>(
   // Ensure the transaction has been sent
   const txHash = tx?.signed?.hash ? tx.signed.hash().toString("hex") : undefined;
   if (!txHash) {
-    throw new Error(
+    throw new TransactionError(
+      "wallet",
       "Transaction has not been signed and sent. " +
-      "Call signAndSend() first before waiting for confirmation.",
+        "Call signAndSend() first before waiting for confirmation.",
+      { retryable: true },
     );
   }
 
@@ -333,7 +335,11 @@ export async function waitForTransaction<T = unknown>(
         `Error polling transaction status: ${rpcError instanceof Error ? rpcError.message : String(rpcError)}`,
         "Transaction polling",
       );
-      throw new FundableStellarError(parsedError);
+      throw new TransactionError("rpc", parsedError.message, {
+        hash: txHash,
+        retryable: true,
+        cause: rpcError,
+      });
     }
   }
 
@@ -388,11 +394,17 @@ export async function signAndWait<T = unknown>(
   options: WaitForTransactionOptions = {},
 ): Promise<TransactionWaitResult<T>> {
   // Sign and send the transaction
-  await tx.signAndSend({
-    signTransaction: async (xdr: string) => ({
-      signedTxXdr: await signTransaction(xdr),
-    }),
-  });
+  try {
+    await tx.signAndSend({
+      signTransaction: async (xdr: string) => ({
+        signedTxXdr: await signTransaction(xdr),
+      }),
+    });
+  } catch (error) {
+    // Classify signing / submission failures (wallet, simulation, RPC) so the
+    // caller can map them to a safe recovery action.
+    throw classifyTransactionError(error);
+  }
 
   // Wait for confirmation
   return waitForTransaction(tx, rpcUrl, options);

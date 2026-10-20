@@ -269,9 +269,101 @@ export function getCampaignCreatorBadge(campaignCount: number): CampaignCreatorB
   return getCampaignCreatorBadges(campaignCount).at(-1) ?? null;
 }
 
+/**
+ * Source-of-truth model
+ * ---------------------
+ * The campaign data source is the single durable source of truth for campaign
+ * state (status, raised amounts, sponsors, certificates, insurance claims,
+ * webhook-relevant milestones). Everything else — emails, push notifications,
+ * webhooks, impact NFTs, grant matching — is a best-effort side effect that is
+ * derived from a committed campaign record and must never be treated as
+ * authoritative.
+ *
+ * Transaction boundaries
+ * ----------------------
+ * Every logical mutation (create, contribution, status transition, partner
+ * review, insurance claim, certificate issuance/listing/transfer, translation)
+ * is expressed as a single `transactCampaign` call. The transaction reads the
+ * current record, applies the mutation, and writes the result exactly once.
+ * If the write fails, nothing is persisted and the caller observes the error;
+ * side effects are only dispatched after the write commits. This guarantees
+ * that a crash mid-mutation can never leave a partially applied campaign.
+ *
+ * Idempotency
+ * -----------
+ * Mutations that may be retried (contributions, status transitions, claims,
+ * certificate operations) derive a deterministic idempotency key from the
+ * operation inputs. Replaying the same key returns the previously committed
+ * record without re-applying the mutation or re-dispatching side effects.
+ */
 export interface CampaignDataSource {
   getCampaigns(network?: string): Promise<CampaignRecord[]>;
   saveCampaign(campaign: CampaignRecord): Promise<CampaignRecord>;
+}
+
+/** Optional capability implemented by durable data sources. */
+export interface TransactionalCampaignDataSource extends CampaignDataSource {
+  /**
+   * Atomically read-modify-write a campaign. Implementations must either commit
+   * the returned record or throw without persisting any change.
+   */
+  transactCampaign<T>(
+    campaignId: string,
+    mutate: (current: CampaignRecord | null) => { campaign: CampaignRecord; result: T },
+  ): Promise<{ campaign: CampaignRecord; result: T }>;
+}
+
+export interface CampaignTransactionOptions {
+  /** Deterministic key identifying this logical mutation. */
+  idempotencyKey?: string;
+}
+
+const committedIdempotencyKeys = new Map<string, CampaignRecord>();
+
+/** Reset the in-process idempotency ledger (used by tests). */
+export function resetCampaignIdempotencyLedger(): void {
+  committedIdempotencyKeys.clear();
+}
+
+/**
+ * Run a campaign mutation inside a single transaction boundary.
+ *
+ * The mutation callback receives the current committed record (or `null` when
+ * absent) and returns the next record plus an arbitrary result. The write is
+ * performed exactly once; side effects should be dispatched by the caller only
+ * after this promise resolves. When `idempotencyKey` has already been committed
+ * the stored record is returned unchanged and the mutation is skipped.
+ */
+export async function transactCampaign<T>(
+  campaignId: string,
+  mutate: (current: CampaignRecord | null) => { campaign: CampaignRecord; result: T },
+  dataSource: CampaignDataSource = getCampaignDataSource(),
+  options: CampaignTransactionOptions = {},
+): Promise<{ campaign: CampaignRecord; result: T; replayed: boolean }> {
+  const key = options.idempotencyKey;
+  if (key) {
+    const committed = committedIdempotencyKeys.get(key);
+    if (committed) {
+      return { campaign: committed, result: undefined as T, replayed: true };
+    }
+  }
+
+  const transactional = dataSource as Partial<TransactionalCampaignDataSource>;
+  let committed: CampaignRecord;
+  let result: T;
+  if (typeof transactional.transactCampaign === "function") {
+    const outcome = await transactional.transactCampaign(campaignId, mutate);
+    committed = outcome.campaign;
+    result = outcome.result;
+  } else {
+    const current = await getCampaign(campaignId, dataSource);
+    const outcome = mutate(current);
+    committed = await dataSource.saveCampaign(outcome.campaign);
+    result = outcome.result;
+  }
+
+  if (key) committedIdempotencyKeys.set(key, committed);
+  return { campaign: committed, result, replayed: false };
 }
 
 export interface CampaignFilter {
@@ -311,14 +403,6 @@ export class InMemoryCampaignDataSource implements CampaignDataSource {
 
   async saveCampaign(campaign: CampaignRecord): Promise<CampaignRecord> {
     const existing = this.campaigns.get(campaign.id);
-    if (existing && campaign.sponsorCount > 0) {
-      if ((existing.treeCount ?? 0) < (campaign.treeCount ?? 0)) {
-        pushNotificationService.notifyMilestone(campaign.id, campaign.name, "trees planted", campaign.creator).catch(() => {});
-      }
-      if (!existing.impactAchieved && campaign.impactAchieved) {
-        pushNotificationService.notifyMilestone(campaign.id, campaign.name, "impact achieved", campaign.creator).catch(() => {});
-      }
-    }
     const alreadyReached = new Set<ImpactMilestone>([
       ...(existing?.impactMilestonesReached ?? []),
       ...(existing ? reachedImpactMilestones(existing) : []),
@@ -329,7 +413,18 @@ export class InMemoryCampaignDataSource implements CampaignDataSource {
       ...campaign,
       impactMilestonesReached: [...new Set([...alreadyReached, ...currentMilestones])],
     };
+    // Commit first: the map write is the durable boundary. Side effects below
+    // only run once the record is committed.
     this.campaigns.set(campaign.id, saved);
+
+    if (existing && campaign.sponsorCount > 0) {
+      if ((existing.treeCount ?? 0) < (campaign.treeCount ?? 0)) {
+        pushNotificationService.notifyMilestone(campaign.id, campaign.name, "trees planted", campaign.creator).catch(() => {});
+      }
+      if (!existing.impactAchieved && campaign.impactAchieved) {
+        pushNotificationService.notifyMilestone(campaign.id, campaign.name, "impact achieved", campaign.creator).catch(() => {});
+      }
+    }
 
     for (const milestone of newlyReached) {
       try {
@@ -345,6 +440,19 @@ export class InMemoryCampaignDataSource implements CampaignDataSource {
       }
     }
     return saved;
+  }
+
+  async transactCampaign<T>(
+    campaignId: string,
+    mutate: (current: CampaignRecord | null) => { campaign: CampaignRecord; result: T },
+  ): Promise<{ campaign: CampaignRecord; result: T }> {
+    const current = this.campaigns.get(campaignId) ?? null;
+    const outcome = mutate(current);
+    if (outcome.campaign.id !== campaignId) {
+      throw new Error(`Transaction for ${campaignId} attempted to write campaign ${outcome.campaign.id}`);
+    }
+    const committed = await this.saveCampaign(outcome.campaign);
+    return { campaign: committed, result: outcome.result };
   }
 }
 
@@ -679,47 +787,62 @@ export async function recordCampaignContribution(
   if (!campaign) return null;
 
   const contribution = parseContributionAmount(amount);
-  const previousRaised = /^\d+$/.test(campaign.raisedAmount)
-    ? BigInt(campaign.raisedAmount)
-    : 0n;
-  const newRaised = previousRaised + contribution;
-  const reached = crossedCampaignMilestones(
-    previousRaised.toString(),
-    newRaised.toString(),
-    campaign.goalAmount,
+  const idempotencyKey = `contribution:${campaignId}:${amount}:${now}`;
+
+  // Single transaction: read the committed record, compute the new raised
+  // amount and milestone bookkeeping, and write once. A failure here leaves
+  // the campaign untouched.
+  const { campaign: updated, result: newlyReached, replayed } = await transactCampaign(
+    campaignId,
+    (current) => {
+      if (!current) throw new Error(`Campaign ${campaignId} not found`);
+      const previousRaised = /^\d+$/.test(current.raisedAmount) ? BigInt(current.raisedAmount) : 0n;
+      const newRaised = previousRaised + contribution;
+      const reached = crossedCampaignMilestones(
+        previousRaised.toString(),
+        newRaised.toString(),
+        current.goalAmount,
+      );
+      const notified = current.milestonesNotified ?? [];
+      const milestones = reached.filter((percentage) => !notified.includes(percentage));
+      return {
+        campaign: {
+          ...current,
+          raisedAmount: newRaised.toString(),
+          milestonesNotified: [...notified, ...milestones],
+          updatedAt: now,
+        },
+        result: milestones,
+      };
+    },
+    dataSource,
+    { idempotencyKey },
   );
 
-  const notified = campaign.milestonesNotified ?? [];
-  const newlyReached = reached.filter((percentage) => !notified.includes(percentage));
+  if (replayed) {
+    return { campaign: updated, milestones: [] };
+  }
 
-  if (newlyReached.length > 0 && campaign.creatorEmail) {
+  if (newlyReached.length > 0 && updated.creatorEmail) {
     // Build impact metrics to include in every milestone email (#983).
     // CO2 estimate: use a conservative average of 20 kg CO2/tree/year.
     const CO2_KG_PER_TREE_PER_YEAR = 20;
     const impactMetrics: MilestoneEmailImpactMetrics = {
-      treeCount: campaign.treeCount,
-      co2OffsetKg: campaign.treeCount * CO2_KG_PER_TREE_PER_YEAR,
-      sponsorCount: campaign.sponsorCount,
-      raisedAmount: newRaised.toString(),
-      goalAmount: campaign.goalAmount,
-      location: campaign.location,
+      treeCount: updated.treeCount,
+      co2OffsetKg: updated.treeCount * CO2_KG_PER_TREE_PER_YEAR,
+      sponsorCount: updated.sponsorCount,
+      raisedAmount: updated.raisedAmount,
+      goalAmount: updated.goalAmount,
+      location: updated.location,
     };
     for (const percentage of newlyReached) {
       await emailService.sendEmail({
-        to: campaign.creatorEmail,
-        subject: `${campaign.name} reached ${percentage}% of its goal`,
-        html: milestoneEmailHtml(campaign.name, percentage, impactMetrics),
+        to: updated.creatorEmail,
+        subject: `${updated.name} reached ${percentage}% of its goal`,
+        html: milestoneEmailHtml(updated.name, percentage, impactMetrics),
       });
     }
   }
-
-  const updated: CampaignRecord = {
-    ...campaign,
-    raisedAmount: newRaised.toString(),
-    milestonesNotified: [...notified, ...newlyReached],
-    updatedAt: now,
-  };
-  await dataSource.saveCampaign(updated);
 
   // Platform-funded creator grant matching: campaigns from underrepresented
   // communities get their first `matchPercentage`% of funds matched
@@ -842,7 +965,19 @@ export async function reviewCampaignNonprofitPartner(
     verifiedAt: verificationStatus === "VERIFIED" ? now : undefined,
     verifiedBy: verificationStatus === "VERIFIED" ? reviewer.trim() : undefined,
   };
-  return dataSource.saveCampaign({ ...campaign, nonprofitPartner: partner, updatedAt: now });
+  const { campaign: saved } = await transactCampaign(
+    campaign.id,
+    (current) => {
+      if (!current) throw new Error(`Campaign ${campaign.id} not found`);
+      return {
+        campaign: { ...current, nonprofitPartner: partner, updatedAt: now },
+        result: undefined,
+      };
+    },
+    dataSource,
+    { idempotencyKey: `partner-review:${campaign.id}:${verificationStatus}:${now}` },
+  );
+  return saved;
 }
 
 /**
@@ -881,14 +1016,26 @@ export async function autoTranslateCampaignDescription(
   if (campaign.translations?.[targetLanguage]) return campaign;
   if (!translator) throw new Error("No campaign translator configured");
   const translated = await translator(campaign.description ?? "", targetLanguage, sourceLanguage);
-  return dataSource.saveCampaign({
-    ...campaign,
-    language: sourceLanguage,
-    translations: {
-      ...campaign.translations,
-      [targetLanguage]: translated,
+  const { campaign: saved } = await transactCampaign(
+    campaign.id,
+    (current) => {
+      if (!current) throw new Error(`Campaign ${campaign.id} not found`);
+      return {
+        campaign: {
+          ...current,
+          language: sourceLanguage,
+          translations: {
+            ...current.translations,
+            [targetLanguage]: translated,
+          },
+        },
+        result: undefined,
+      };
     },
-  });
+    dataSource,
+    { idempotencyKey: `translate:${campaign.id}:${targetLanguage}` },
+  );
+  return saved;
 }
 
 export interface CampaignDuplicateLookup {
@@ -977,22 +1124,39 @@ export async function transitionCampaignStatus(
   if (!allowedTransitions[campaign.status].includes(toStatus)) {
     throw new Error(`Invalid campaign status transition: ${campaign.status} -> ${toStatus}`);
   }
-  const next: CampaignRecord = {
-    ...campaign,
-    updatedAt: now,
-    status: toStatus,
-    statusChangedAt: now,
-    statusHistory: [...campaign.statusHistory, {
-      id: `${campaign.id}:${now}:${campaign.statusHistory.length}`,
-      campaignId: campaign.id,
-      fromStatus: campaign.status,
-      toStatus,
-      changedBy,
-      changedAt: now,
-      reason,
-    }],
-  };
-  const saved = await dataSource.saveCampaign(next);
+
+  // The status change and its history entry are committed atomically.
+  const { campaign: saved } = await transactCampaign(
+    campaign.id,
+    (current) => {
+      if (!current) throw new Error(`Campaign ${campaign.id} not found`);
+      if (current.status === toStatus) return { campaign: current, result: undefined };
+      if (!allowedTransitions[current.status].includes(toStatus)) {
+        throw new Error(`Invalid campaign status transition: ${current.status} -> ${toStatus}`);
+      }
+      return {
+        campaign: {
+          ...current,
+          updatedAt: now,
+          status: toStatus,
+          statusChangedAt: now,
+          statusHistory: [...current.statusHistory, {
+            id: `${current.id}:${now}:${current.statusHistory.length}`,
+            campaignId: current.id,
+            fromStatus: current.status,
+            toStatus,
+            changedBy,
+            changedAt: now,
+            reason,
+          }],
+        },
+        result: undefined,
+      };
+    },
+    dataSource,
+    { idempotencyKey: `status:${campaign.id}:${toStatus}:${now}` },
+  );
+
   if (toStatus === "COMPLETED") {
     void new CampaignWebhookService().campaignCompleted({
       completionId: `${campaign.id}:completed:${now}`,
@@ -1047,11 +1211,22 @@ export async function submitCampaignInsuranceClaim(
     status: "PENDING",
   };
 
-  return dataSource.saveCampaign({
-    ...campaign,
-    insuranceClaim: claim,
-    updatedAt: now,
-  });
+  // Claim creation is a single transaction so a failed write cannot leave a
+  // half-recorded claim behind.
+  const { campaign: saved } = await transactCampaign(
+    campaign.id,
+    (current) => {
+      if (!current) throw new Error("Campaign not found");
+      if (current.insuranceClaim) throw new Error("Insurance claim already submitted for this campaign");
+      return {
+        campaign: { ...current, insuranceClaim: claim, updatedAt: now },
+        result: undefined,
+      };
+    },
+    dataSource,
+    { idempotencyKey: `insurance-claim:${campaign.id}:${now}` },
+  );
+  return saved;
 }
 
 export const requestCampaignInsurancePayout = submitCampaignInsuranceClaim;
@@ -1237,11 +1412,23 @@ export async function issueCampaignCarbonCertificates(
       updatedAt: now,
     };
   });
-  return dataSource.saveCampaign({
-    ...campaign,
-    carbonCertificates: [...existingCertificates, ...certificates],
-    updatedAt: now,
-  });
+  const { campaign: saved } = await transactCampaign(
+    campaign.id,
+    (current) => {
+      if (!current) throw new Error(`Campaign ${campaign.id} not found`);
+      return {
+        campaign: {
+          ...current,
+          carbonCertificates: [...(current.carbonCertificates ?? []), ...certificates],
+          updatedAt: now,
+        },
+        result: undefined,
+      };
+    },
+    dataSource,
+    { idempotencyKey: `issue-credits:${campaign.id}:${now}` },
+  );
+  return saved;
 }
 
 export async function listCarbonCreditCertificate(
@@ -1264,11 +1451,24 @@ export async function listCarbonCreditCertificate(
       listedAt: now,
       updatedAt: now,
     };
-    await dataSource.saveCampaign({
-      ...campaign,
-      carbonCertificates: certificates.map((item) => item.id === certificateId ? updatedCertificate : item),
-      updatedAt: now,
-    });
+    await transactCampaign(
+      campaign.id,
+      (current) => {
+        if (!current) throw new Error(`Campaign ${campaign.id} not found`);
+        return {
+          campaign: {
+            ...current,
+            carbonCertificates: (current.carbonCertificates ?? []).map((item) =>
+              item.id === certificateId ? updatedCertificate : item,
+            ),
+            updatedAt: now,
+          },
+          result: undefined,
+        };
+      },
+      dataSource,
+      { idempotencyKey: `list-credit:${certificateId}:${now}` },
+    );
     return updatedCertificate;
   }
   return null;
@@ -1292,11 +1492,24 @@ export async function transferCarbonCreditCertificate(
       status: "transferred",
       updatedAt: now,
     };
-    await dataSource.saveCampaign({
-      ...campaign,
-      carbonCertificates: certificates.map((item) => item.id === certificateId ? updatedCertificate : item),
-      updatedAt: now,
-    });
+    await transactCampaign(
+      campaign.id,
+      (current) => {
+        if (!current) throw new Error(`Campaign ${campaign.id} not found`);
+        return {
+          campaign: {
+            ...current,
+            carbonCertificates: (current.carbonCertificates ?? []).map((item) =>
+              item.id === certificateId ? updatedCertificate : item,
+            ),
+            updatedAt: now,
+          },
+          result: undefined,
+        };
+      },
+      dataSource,
+      { idempotencyKey: `transfer-credit:${certificateId}:${toAddress}:${now}` },
+    );
     return updatedCertificate;
   }
   return null;

@@ -4,13 +4,38 @@ import React from "react";
 import { useWallet } from "@/providers/StellarWalletProvider";
 import { WalletNetwork } from "@creit.tech/stellar-wallets-kit";
 import { motion, AnimatePresence } from "framer-motion";
-import { ChevronDown, Loader2 } from "lucide-react";
+import { ChevronDown, Loader2, RefreshCw, AlertTriangle } from "lucide-react";
+import {
+  classifyWalletError,
+  type WalletRecoveryAction,
+} from "@/lib/wallet-errors";
 
 export function NetworkSwitcher() {
-  const { network, setNetwork, connectionStatus } = useWallet();
+  const { network, setNetwork, connectionStatus, error, clearError } =
+    useWallet();
   const [isOpen, setIsOpen] = React.useState(false);
 
   const isLocked = connectionStatus === "connecting";
+
+  // Map the last wallet failure to a safe recovery action. Network-switch
+  // failures surface a "switch network" affordance; reconnect failures surface
+  // a "reconnect" affordance. Form/network selection state is preserved.
+  const recovery = React.useMemo(() => {
+    if (!error) return null;
+    return classifyWalletError(error);
+  }, [error]);
+
+  const handleRecovery = React.useCallback(() => {
+    if (!recovery) return;
+    const action: WalletRecoveryAction = recovery.action;
+    if (action === "switch-network" && recovery.targetNetwork) {
+      setNetwork(recovery.targetNetwork);
+    } else if (action === "reconnect") {
+      // Re-trigger the connection flow without discarding the current network.
+      setNetwork(network);
+    }
+    clearError?.();
+  }, [recovery, setNetwork, network, clearError]);
 
   const networks = [
     { id: WalletNetwork.TESTNET, name: "Testnet", color: "bg-yellow-500" },
@@ -48,6 +73,34 @@ export function NetworkSwitcher() {
           />
         )}
       </button>
+
+      <AnimatePresence>
+        {recovery && (
+          <motion.div
+            initial={{ opacity: 0, y: -5 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -5 }}
+            role="alert"
+            className="absolute top-full right-0 mt-2 w-56 bg-[#0F1621] border border-amber-500/30 rounded-xl shadow-2xl overflow-hidden z-50 p-2"
+          >
+            <div className="flex items-start gap-2 px-1 py-1">
+              <AlertTriangle className="w-3.5 h-3.5 text-amber-400 mt-0.5 shrink-0" />
+              <p className="text-white/70 text-[11px] leading-snug">
+                {recovery.message}
+              </p>
+            </div>
+            <button
+              onClick={handleRecovery}
+              className="mt-1 w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 text-[11px] font-bold uppercase tracking-wider transition-all"
+            >
+              <RefreshCw className="w-3 h-3" />
+              {recovery.action === "switch-network"
+                ? "Switch network"
+                : "Reconnect"}
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <AnimatePresence>
         {isOpen && !isLocked && (

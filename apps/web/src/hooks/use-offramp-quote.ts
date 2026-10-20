@@ -18,6 +18,11 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { offrampService } from "@/services/offramp.service";
+import {
+  classifyWalletError,
+  type WalletErrorAction,
+  type WalletErrorInfo,
+} from "@/lib/wallet-errors";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -76,9 +81,16 @@ export interface UseOfframpQuoteReturn {
   isInitialLoading: boolean;
   /** True on subsequent refreshes (previous quote still visible) */
   isRefreshing: boolean;
+  /** Human-readable error message (null when no error) */
   error: string | null;
+  /** Classified error with a safe recovery action (null when no error) */
+  errorInfo: WalletErrorInfo | null;
+  /** Safe recovery action the UI should offer (null when no error) */
+  recoveryAction: WalletErrorAction | null;
   /** Manually trigger a fresh quote fetch */
   refresh: () => void;
+  /** Retry the last failed fetch, preserving the current form values */
+  retry: () => void;
   /** Seconds until the current quote expires (null if no quote) */
   expiresInSeconds: number | null;
 }
@@ -160,17 +172,34 @@ export function useOfframpQuote({
   const [isLoading, setIsLoading] = useState(false);
   const [isInitialLoading, setIsInitialLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [errorInfo, setErrorInfo] = useState<WalletErrorInfo | null>(null);
   const [expiresInSeconds, setExpiresInSeconds] = useState<number | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hasFetchedOnce = useRef(false);
 
+  /**
+   * Record a failure: classify it into a safe recovery action and keep the
+   * previous quote (and the form values, which live in the caller) intact so
+   * the user can retry or switch networks without re-entering data.
+   */
+  const applyError = useCallback((raw: unknown, fallbackMessage: string) => {
+    const info = classifyWalletError(raw, { fallbackMessage });
+    setError(info.message);
+    setErrorInfo(info);
+  }, []);
+
+  const clearError = useCallback(() => {
+    setError(null);
+    setErrorInfo(null);
+  }, []);
+
   const fetchQuote = useCallback(
     async (signal: AbortSignal) => {
       const numAmount = parseFloat(amount);
       if (!numAmount || numAmount <= 0) {
-        setError("Enter a valid amount");
+        applyError(new Error("Enter a valid amount"), "Enter a valid amount");
         setIsLoading(false);
         setIsInitialLoading(false);
         return;
@@ -185,8 +214,10 @@ export function useOfframpQuote({
         if (signal.aborted) return;
 
         if (!result.success) {
-          setError(result.error ?? "Failed to fetch quote");
-          setQuote(null);
+          applyError(
+            result.error ?? new Error("Failed to fetch quote"),
+            "Failed to fetch quote"
+          );
         } else {
           const parsed = parseQuote(
             (result.data as Record<string, unknown>) ?? {},
@@ -194,14 +225,13 @@ export function useOfframpQuote({
             currency
           );
           setQuote(parsed);
-          setError(null);
+          clearError();
           hasFetchedOnce.current = true;
           setExpiresInSeconds(QUOTE_TTL_SECONDS);
         }
       } catch (err) {
         if (signal.aborted) return;
-        setError(err instanceof Error ? err.message : "Failed to fetch quote");
-        setQuote(null);
+        applyError(err, "Failed to fetch quote");
       } finally {
         if (!signal.aborted) {
           setIsLoading(false);
@@ -209,7 +239,7 @@ export function useOfframpQuote({
         }
       }
     },
-    [token, amount, country, currency]
+    [token, amount, country, currency, applyError, clearError]
   );
 
   // Debounced effect: re-run whenever inputs change
@@ -268,9 +298,18 @@ export function useOfframpQuote({
     const controller = new AbortController();
     abortRef.current = controller;
     setIsLoading(true);
-    setError(null);
+    clearError();
     fetchQuote(controller.signal);
-  }, [disabled, fetchQuote]);
+  }, [disabled, fetchQuote, clearError]);
+
+  /**
+   * Retry after a failure. Reuses the current form values (token/amount/
+   * country/currency) and the previous quote, so a transient RPC, network or
+   * simulation failure never forces the user to re-enter their input.
+   */
+  const retry = useCallback(() => {
+    refresh();
+  }, [refresh]);
 
   return {
     quote,
@@ -278,7 +317,10 @@ export function useOfframpQuote({
     isInitialLoading,
     isRefreshing: isLoading && hasFetchedOnce.current,
     error,
+    errorInfo,
+    recoveryAction: errorInfo?.action ?? null,
     refresh,
+    retry,
     expiresInSeconds,
   };
 }

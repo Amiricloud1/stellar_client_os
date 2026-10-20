@@ -1,16 +1,38 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+    classifyWalletError,
+    type WalletErrorAction,
+    type WalletErrorCategory,
+} from "../lib/walletErrorClassifier";
 
 export type MutationStatus = "idle" | "pending" | "success" | "error";
 
 interface GuardOptions {
     cooldownMs?: number;
+    /** Optional hook invoked with the classified error before it is rethrown. */
+    onError?: (error: unknown, action: WalletErrorAction) => void;
+}
+
+export interface TransactionGuardError {
+    /** The original error thrown by the wrapped fn. */
+    cause: unknown;
+    category: WalletErrorCategory;
+    action: WalletErrorAction;
+    /** Human-readable, safe-to-display message. */
+    message: string;
 }
 
 interface UseTransactionGuardReturn {
     isSubmitting: boolean;
     isCoolingDown: boolean;
     isGuardActive: boolean;
+    /** Classified failure from the most recent run, cleared on the next run. */
+    lastError: TransactionGuardError | null;
+    /** Safe action recommended for the most recent failure. */
+    errorAction: WalletErrorAction | null;
+    /** Clears the stored error without touching form state. */
+    clearError: () => void;
     runWithGuard: <T>(fn: () => Promise<T>, options?: GuardOptions) => Promise<T | undefined>;
 }
 
@@ -37,6 +59,7 @@ export function useTransactionGuard(
 ): UseTransactionGuardReturn {
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [isCoolingDown, setIsCoolingDown] = useState(false);
+    const [lastError, setLastError] = useState<TransactionGuardError | null>(null);
     const cooldownRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const lockRef = useRef(false);
     const prevStatusRef = useRef<MutationStatus | undefined>(mutationStatus);
@@ -87,6 +110,10 @@ export function useTransactionGuard(
         }
     }, [mutationStatus, isMutationTracked, defaultCooldownMs]);
 
+    const clearError = useCallback(() => {
+        setLastError(null);
+    }, []);
+
     const runWithGuard = useCallback(
         async <T,>(fn: () => Promise<T>, options?: GuardOptions): Promise<T | undefined> => {
             if (isGuardActive) {
@@ -94,6 +121,7 @@ export function useTransactionGuard(
             }
             lockRef.current = true;
             setIsSubmitting(true);
+            setLastError(null);
             cooldownOverrideRef.current = options?.cooldownMs;
             try {
                 const result = await fn();
@@ -113,6 +141,20 @@ export function useTransactionGuard(
                     }
                 }
                 return result;
+            } catch (error) {
+                // Map the raw failure to a safe, actionable category. The guard
+                // never mutates caller-owned form state, so inputs are preserved
+                // for retry / network switch / reconnect flows.
+                const classified = classifyWalletError(error);
+                const guardError: TransactionGuardError = {
+                    cause: error,
+                    category: classified.category,
+                    action: classified.action,
+                    message: classified.message,
+                };
+                setLastError(guardError);
+                options?.onError?.(error, classified.action);
+                throw guardError;
             } finally {
                 lockRef.current = false;
                 setIsSubmitting(false);
@@ -125,6 +167,9 @@ export function useTransactionGuard(
         isSubmitting,
         isCoolingDown,
         isGuardActive,
+        lastError,
+        errorAction: lastError?.action ?? null,
+        clearError,
         runWithGuard,
     };
 }
