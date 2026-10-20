@@ -60,6 +60,44 @@ metadata-only differences, hash mismatch, and empty/missing artifacts) that run
 without network access or live funds. Update those tests alongside any change to
 the normalization rules.
 
+## Publishing wasm artifacts with source provenance
+
+Release artifacts attach the built wasm together with metadata that ties the
+deployed code back to a specific commit, so anyone can trace and rebuild it.
+`pnpm publish:wasm` (run by the release workflow) produces, for each contract:
+
+- the normalized wasm artifact, named `<contract>.wasm`;
+- a `<contract>.wasm.sha256` checksum file (SHA-256 of the normalized bytes —
+  the same normalization used by `pnpm verify:reproducible`);
+- a `<contract>.provenance.json` metadata file.
+
+The provenance metadata is **network-independent** (no RPC/horizon URLs, no
+account or ledger data) and records only build inputs:
+
+- `commit` — the full git commit SHA the artifact was built from;
+- `contract` — the contract package name;
+- `wasmSha256` — the checksum, matching the `.sha256` file;
+- `compiler` — the pinned Rust channel and `wasm32-unknown-unknown` target from
+  `rust-toolchain.toml`;
+- `schemaVersion` — the metadata schema version (currently `1`).
+
+Compatibility and migration notes:
+
+- The checksum algorithm is SHA-256 over the **normalized** wasm, so it stays
+  stable across machines and matches the reproducible-build hash. Changing the
+  normalization rules changes every checksum — treat that as a breaking change
+  and bump `schemaVersion`.
+- Artifact names are part of the contract with downstream verifiers. Renaming
+  `<contract>.wasm` / `.sha256` / `.provenance.json` is a breaking change; add a
+  new name alongside the old one for a deprecation window instead of renaming.
+- Adding fields to the provenance JSON is additive and safe; removing or
+  re-typing existing fields requires a `schemaVersion` bump.
+
+The publish tooling is covered by automated tests (success, missing wasm,
+checksum mismatch, and malformed metadata) that run without network access or
+live funds. Update those tests alongside any change to the artifact layout or
+metadata schema.
+
 ## CI dependency caches
 
 CI caches pnpm and Cargo dependencies to keep warm runs fast. Cache keys are
@@ -94,6 +132,7 @@ Implications for contributors:
    - `pnpm --filter @fundable/web lint` (same-repo; fork PRs skip repo-wide lint)
    - `pnpm test:contracts` / `pnpm build:contracts` when touching `contracts/`
    - `pnpm verify:reproducible` when touching `contracts/` (reproducible build check)
+   - `pnpm publish:wasm` when touching release/artifact tooling (provenance check)
    - offline-layer changes: `pnpm --filter @fundable/mobile test`
 4. Open one PR per issue against upstream `main` using the PR template
    (`.github/PULL_REQUEST_TEMPLATE.md`). Fill every section: affected packages,
@@ -114,5 +153,8 @@ Implications for contributors:
 - Contract changes need `cargo test` evidence plus SDK/web impact notes.
 - Contract changes must pass the reproducible-build check; include the
   normalized wasm hash in the PR validation evidence.
+- Release/artifact changes must include the published `.sha256` and
+  `.provenance.json` for each contract and confirm the checksum matches the
+  reproducible-build hash.
 - Security-sensitive changes (auth, signing, rate limits, uploads) name the
   threat considered and why the change is safe.

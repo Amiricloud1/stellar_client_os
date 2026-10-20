@@ -157,3 +157,128 @@ PY
           fi
 
           exit $status
+
+      - name: Generate provenance metadata and checksums
+        run: |
+          set -euo pipefail
+          # Produce a checksummed artifact bundle plus a provenance manifest that
+          # ties each wasm to the source commit, toolchain, and build inputs.
+          # The manifest is network-independent: it records only values derived
+          # from the checked-out tree and the pinned toolchain.
+          out=/tmp/artifacts
+          mkdir -p "$out"
+
+          if [ -z "$(ls -A /tmp/build-pass-1/*.wasm 2>/dev/null)" ]; then
+            echo "::error::No wasm artifacts to publish"
+            exit 1
+          fi
+
+          # Copy wasm artifacts and compute sha256 checksums.
+          for wasm in /tmp/build-pass-1/*.wasm; do
+            name=$(basename "$wasm")
+            cp "$wasm" "$out/$name"
+          done
+          ( cd "$out" && sha256sum ./*.wasm > SHA256SUMS )
+
+          # Capture pinned toolchain and compiler versions.
+          rustc_version=$(rustc --version)
+          cargo_version=$(cargo --version)
+          stellar_version=$(stellar --version 2>/dev/null | head -n1 || echo "unknown")
+          toolchain=$(cat rust-toolchain.toml 2>/dev/null || echo "unspecified")
+
+          # Build the provenance manifest. Schema is versioned so consumers can
+          # evolve; fields are stable and network-independent.
+          python3 - "$out" "$rustc_version" "$cargo_version" "$stellar_version" "$toolchain" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+out, rustc_version, cargo_version, stellar_version, toolchain = sys.argv[1:6]
+
+artifacts = []
+for name in sorted(os.listdir(out)):
+    if not name.endswith('.wasm'):
+        continue
+    path = os.path.join(out, name)
+    with open(path, 'rb') as f:
+        data = f.read()
+    artifacts.append({
+        'name': name,
+        'sha256': hashlib.sha256(data).hexdigest(),
+        'size': len(data),
+    })
+
+if not artifacts:
+    print('::error::No wasm artifacts found for provenance manifest', file=sys.stderr)
+    sys.exit(1)
+
+manifest = {
+    'schema_version': 1,
+    'commit': os.environ.get('GITHUB_SHA', ''),
+    'ref': os.environ.get('GITHUB_REF', ''),
+    'repository': os.environ.get('GITHUB_REPOSITORY', ''),
+    'checksum_algorithm': 'sha256',
+    'compiler': {
+        'rustc': rustc_version,
+        'cargo': cargo_version,
+        'stellar_cli': stellar_version,
+        'toolchain': toolchain,
+    },
+    'artifacts': artifacts,
+}
+
+with open(os.path.join(out, 'provenance.json'), 'w') as f:
+    json.dump(manifest, f, indent=2, sort_keys=True)
+    f.write('\n')
+PY
+
+          # Validate the manifest against the on-disk artifacts so a checksum
+          # mismatch or malformed manifest fails the build.
+          python3 - "$out" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+out = sys.argv[1]
+manifest_path = os.path.join(out, 'provenance.json')
+with open(manifest_path) as f:
+    manifest = json.load(f)
+
+if manifest.get('schema_version') != 1:
+    print('::error::Unexpected provenance schema_version', file=sys.stderr)
+    sys.exit(1)
+if manifest.get('checksum_algorithm') != 'sha256':
+    print('::error::Unexpected checksum algorithm', file=sys.stderr)
+    sys.exit(1)
+
+listed = {a['name']: a for a in manifest.get('artifacts', [])}
+if not listed:
+    print('::error::Provenance manifest lists no artifacts', file=sys.stderr)
+    sys.exit(1)
+
+for name, entry in listed.items():
+    path = os.path.join(out, name)
+    if not os.path.isfile(path):
+        print(f'::error::Manifest references missing artifact {name}', file=sys.stderr)
+        sys.exit(1)
+    with open(path, 'rb') as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    if digest != entry['sha256']:
+        print(f'::error::Checksum mismatch for {name}', file=sys.stderr)
+        sys.exit(1)
+
+print(f'Provenance verified for {len(listed)} artifact(s)')
+PY
+
+      - name: Upload wasm artifacts with provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: contracts-wasm-${{ github.sha }}
+          path: |
+            /tmp/artifacts/*.wasm
+            /tmp/artifacts/SHA256SUMS
+            /tmp/artifacts/provenance.json
+          if-no-files-found: error
+          retention-days: 90
