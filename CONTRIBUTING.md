@@ -23,6 +23,28 @@ local contract builds both consume that file, so the versions always match.
   in the same PR and note the migration impact (e.g. minimum rustup version) in
   the PR description.
 
+## CI dependency caches
+
+CI caches pnpm and Cargo dependencies to keep warm runs fast. Cache keys are
+derived from the lockfile hash, toolchain version, build target, and runner OS,
+so a cache is only reused when all of those match:
+
+- **pnpm** — keyed by `pnpm-lock.yaml` hash + Node version + runner OS. The
+  pnpm store is cached, not `node_modules`.
+- **Cargo** — keyed by `Cargo.lock` hash + `rust-toolchain.toml` channel +
+  build target + runner OS. The Cargo registry and `target/` are cached.
+
+Implications for contributors:
+
+- A cache miss (new lockfile, bumped toolchain, different OS/target) is always
+  safe: CI falls back to a cold install/build and still succeeds. Never rely on
+  a warm cache for correctness.
+- Changing `pnpm-lock.yaml`, `Cargo.lock`, or `rust-toolchain.toml` invalidates
+  the relevant cache; expect the first run after such a change to be slower.
+- Cache key derivation is covered by automated tests (success, failure, and
+  boundary cases such as a missing lockfile or differing OS/target/toolchain).
+  Update those tests alongside any change to the caching logic.
+
 ## Workflow
 
 1. Pick an issue, then create a branch from an up-to-date `main`:
