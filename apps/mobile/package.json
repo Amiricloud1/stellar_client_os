@@ -20,6 +20,7 @@
     "update": "eas update --auto",
     "test": "vitest run",
     "test:watch": "vitest",
+    "lint": "pnpm --filter @fundable/web exec eslint --config eslint.config.mjs ../mobile/src",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

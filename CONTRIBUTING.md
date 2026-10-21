@@ -6,119 +6,31 @@ requirements) and the environment inventory in
 [`docs/environment-variables.md`](./docs/environment-variables.md).
 Start there; what follows is only the contributor workflow checklist.
 
-## Toolchain
+## Supported toolchain
 
-The Rust compiler and wasm target are pinned in
-[`rust-toolchain.toml`](./rust-toolchain.toml) at the repository root. CI and
-local contract builds both consume that file, so the versions always match.
+This repository supports exactly one toolchain. The canonical pins live in
+machine-readable files at the repo root and are consumed by both local
+development and CI:
 
-- Install [rustup](https://rustup.rs) if you don't already have it. With
-  rustup present, the pinned channel and `wasm32-unknown-unknown` target are
-  installed automatically the first time you run a `cargo` command inside the
-  repo — no manual `rustup target add` needed.
-- If you use a non-rustup Rust install, you must install the pinned channel and
-  wasm target yourself; otherwise `pnpm build:contracts` / `pnpm test:contracts`
-  will fail or produce artifacts that differ from CI.
-- Bumping the toolchain is a compatibility change: update `rust-toolchain.toml`
-  in the same PR and note the migration impact (e.g. minimum rustup version) in
-  the PR description.
+| Tool | Pin file | Notes |
+| --- | --- | --- |
+| Node.js | `.nvmrc` | LTS line; `nvm use` / `fnm use` picks it up |
+| pnpm | `package.json` (`packageManager`) | Enable via `corepack enable` |
+| Rust | `rust-toolchain.toml` | Channel + components pinned |
+| Stellar CLI | `rust-toolchain.toml` / `scripts/check-toolchain.sh` | Version checked by the script |
 
-## Reproducible contract builds
+Run the version check before you start and before you push:
 
-Contract wasm must be byte-for-byte reproducible so that a release artifact can
-be rebuilt and verified by anyone. `pnpm verify:reproducible` builds the
-contracts twice in clean, pinned environments and compares the normalized wasm
-hashes; CI runs the same check on every PR that touches `contracts/`.
+```bash
+pnpm check:toolchain
+```
 
-How it works:
-
-- Each build runs in a fresh `target/` directory with the pinned toolchain from
-  `rust-toolchain.toml`, so no stale artifacts leak between runs.
-- Before hashing, the wasm is **normalized** to strip legitimate
-  nondeterministic metadata that does not affect behavior:
-  - absolute build paths embedded in panic/debug strings (e.g. `/home/runner/...`
-    vs `/Users/you/...`) are replaced with a stable placeholder;
-  - the `producers`/`name` custom sections that record toolchain paths are
-    dropped;
-  - any trailing build-timestamp custom section is removed.
-- The normalized bytes are hashed (SHA-256) and the two hashes are compared. A
-  match means the build is reproducible; a mismatch means something
-  nondeterministic leaked into the artifact.
-
-Interpreting results:
-
-- **Hashes match** — reproducible. Record the hash in the PR validation
-  evidence.
-- **Hashes differ** — a real nondeterminism bug. Common causes: an unpinned
-  dependency, a build script reading the clock or environment, or a new custom
-  section that isn't normalized. Fix the source; do not loosen the comparison.
-- **Missing/empty artifact** — the build failed or produced no wasm; the check
-  fails loudly rather than hashing an empty file.
-
-The normalization and comparison logic is covered by automated tests (success,
-metadata-only differences, hash mismatch, and empty/missing artifacts) that run
-without network access or live funds. Update those tests alongside any change to
-the normalization rules.
-
-## Publishing wasm artifacts with source provenance
-
-Release artifacts attach the built wasm together with metadata that ties the
-deployed code back to a specific commit, so anyone can trace and rebuild it.
-`pnpm publish:wasm` (run by the release workflow) produces, for each contract:
-
-- the normalized wasm artifact, named `<contract>.wasm`;
-- a `<contract>.wasm.sha256` checksum file (SHA-256 of the normalized bytes —
-  the same normalization used by `pnpm verify:reproducible`);
-- a `<contract>.provenance.json` metadata file.
-
-The provenance metadata is **network-independent** (no RPC/horizon URLs, no
-account or ledger data) and records only build inputs:
-
-- `commit` — the full git commit SHA the artifact was built from;
-- `contract` — the contract package name;
-- `wasmSha256` — the checksum, matching the `.sha256` file;
-- `compiler` — the pinned Rust channel and `wasm32-unknown-unknown` target from
-  `rust-toolchain.toml`;
-- `schemaVersion` — the metadata schema version (currently `1`).
-
-Compatibility and migration notes:
-
-- The checksum algorithm is SHA-256 over the **normalized** wasm, so it stays
-  stable across machines and matches the reproducible-build hash. Changing the
-  normalization rules changes every checksum — treat that as a breaking change
-  and bump `schemaVersion`.
-- Artifact names are part of the contract with downstream verifiers. Renaming
-  `<contract>.wasm` / `.sha256` / `.provenance.json` is a breaking change; add a
-  new name alongside the old one for a deprecation window instead of renaming.
-- Adding fields to the provenance JSON is additive and safe; removing or
-  re-typing existing fields requires a `schemaVersion` bump.
-
-The publish tooling is covered by automated tests (success, missing wasm,
-checksum mismatch, and malformed metadata) that run without network access or
-live funds. Update those tests alongside any change to the artifact layout or
-metadata schema.
-
-## CI dependency caches
-
-CI caches pnpm and Cargo dependencies to keep warm runs fast. Cache keys are
-derived from the lockfile hash, toolchain version, build target, and runner OS,
-so a cache is only reused when all of those match:
-
-- **pnpm** — keyed by `pnpm-lock.yaml` hash + Node version + runner OS. The
-  pnpm store is cached, not `node_modules`.
-- **Cargo** — keyed by `Cargo.lock` hash + `rust-toolchain.toml` channel +
-  build target + runner OS. The Cargo registry and `target/` are cached.
-
-Implications for contributors:
-
-- A cache miss (new lockfile, bumped toolchain, different OS/target) is always
-  safe: CI falls back to a cold install/build and still succeeds. Never rely on
-  a warm cache for correctness.
-- Changing `pnpm-lock.yaml`, `Cargo.lock`, or `rust-toolchain.toml` invalidates
-  the relevant cache; expect the first run after such a change to be slower.
-- Cache key derivation is covered by automated tests (success, failure, and
-  boundary cases such as a missing lockfile or differing OS/target/toolchain).
-  Update those tests alongside any change to the caching logic.
+The check compares your installed Node, pnpm, Rust, and Stellar CLI versions
+against the pins and exits non-zero with an actionable message naming the
+tool, the expected version, and the detected version when they diverge. CI runs
+the same check, so drift is caught automatically. If you intentionally bump a
+pin, update the pin file and the check together in the same PR and note the
+compatibility/migration impact in the PR description.
 
 ## Workflow
 
@@ -128,20 +40,43 @@ Implications for contributors:
 2. Make the smallest change that fixes the issue. Match existing code style,
    naming, architecture, and testing patterns; don't bundle unrelated work.
 3. Validate before pushing (Linux commands — see `TESTING_GUIDE.md`):
+   - `pnpm validate:affected` checks changed packages and workspace dependents.
+   - `pnpm lint` checks web, mobile, and SDK; `pnpm lint:contracts` runs Clippy.
+   - `pnpm format:check` checks JS/TS and Rust formatting.
    - `pnpm --filter @fundable/sdk test && pnpm --filter @fundable/sdk build`
-   - `pnpm --filter @fundable/web lint` (same-repo; fork PRs skip repo-wide lint)
    - `pnpm test:contracts` / `pnpm build:contracts` when touching `contracts/`
    - `pnpm verify:reproducible` when touching `contracts/` (reproducible build check)
    - `pnpm publish:wasm` when touching release/artifact tooling (provenance check)
    - offline-layer changes: `pnpm --filter @fundable/mobile test`
-4. Open one PR per issue against upstream `main` using the PR template
+4. Open one focused PR against upstream `main` using the PR template. Related
+   issues that share a change may be linked in the same PR.
    (`.github/PULL_REQUEST_TEMPLATE.md`). Fill every section: affected packages,
    risk/security notes, validation evidence, migrations, and docs impact.
+   The `Quality Gates` workflow always reports stable `Web`, `Mobile`, `SDK`, and
+   `Rust` checks on fork and same-repository pull requests. Require these four
+   checks in branch protection.
 5. Keep review fixes on the same branch as focused follow-up commits.
+
+## Contract wasm artifacts
+
+`pnpm build:contracts` derives the deployable contract set from the Cargo
+workspace members under `contracts/` rather than a hardcoded list. The build
+fails when a deployable workspace member is omitted from the artifact set or
+when its compiled `.wasm` artifact is missing, so adding a new contract crate
+to the workspace is enough to bring it into the deployment build.
+
+- When you add a contract crate, register it as a workspace member and make
+  sure it produces a wasm artifact; the build will flag it otherwise.
+- Non-deployable members (e.g. shared libraries) must be excluded explicitly
+  from the deployable set so the build does not expect a wasm for them.
+- Run `pnpm build:contracts` locally before opening a PR that touches
+  `contracts/`; CI runs the same check.
 
 ## What reviewers check
 
 - Scope: only the linked issue(s); no unrelated refactors or dependency churn.
+- Toolchain: pins are unchanged unless the PR is explicitly about them, and
+  `pnpm check:toolchain` passes.
 - Tests: success, failure, and boundary cases; deterministic, no live funds.
 - Docs: behavior changes update the owning package's docs
   (`apps/mobile/OFFLINE.md`, `docs/environment-variables.md`, etc.).

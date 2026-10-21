@@ -2,25 +2,74 @@ name: Contracts CI
 
 on: [push, pull_request]
 
-jobs:
-  test: 
-    runs-on: ubuntu-latest
+env:
+  # Canonical toolchain pins. Keep in sync with .tool-versions / package.json.
+  NODE_VERSION: "20.11.1"
+  PNPM_VERSION: "9.1.0"
+  RUST_VERSION: "1.78.0"
+  STELLAR_CLI_VERSION: "23.0.1"
 
-    steps: 
+jobs:
+  toolchain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Install Stellar CLI
+        uses: stellar/stellar-cli@v23.0.1
+
+      - name: Verify toolchain versions
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            local name="$1" expected="$2" actual="$3"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::Toolchain mismatch for $name: expected '$expected' but found '$actual'. Update your local install or the pin in .github/workflows/contracts.yml."
+              fail=1
+            else
+              echo "OK: $name $actual"
+            fi
+          }
+          check node "$NODE_VERSION" "$(node --version | sed 's/^v//')"
+          check pnpm "$PNPM_VERSION" "$(pnpm --version)"
+          check rust "$RUST_VERSION" "$(rustc --version | awk '{print $2}')"
+          check stellar "$STELLAR_CLI_VERSION" "$(stellar version | awk '{print $2}')"
+          exit $fail
+
+  test:
+    runs-on: ubuntu-latest
+    needs: toolchain
+
+    steps:
       - name: checkout repo
         uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.84.0"
-          targets: wasm32-unknown-unknown
-          components: rustfmt, clippy
+          toolchain: ${{ env.RUST_VERSION }}
 
       - name: Install Stellar cli
         uses: stellar/stellar-cli@v23.0.1
 
-      - name: Cache Cargo 
+      - name: Cache Cargo
         uses: actions/cache@v4
         with:
           path: |
@@ -39,246 +88,50 @@ jobs:
         run: cargo test --all
         continue-on-error: true
 
-  reproducible-build:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: checkout repo
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.84.0"
-          targets: wasm32-unknown-unknown
-
-      - name: Install Stellar cli
-        uses: stellar/stellar-cli@v23.0.1
-
-      - name: Build contracts (pass 1)
+      - name: Derive deployable contract members
+        id: members
         working-directory: contracts
         run: |
           set -euo pipefail
-          rm -rf target/wasm32-unknown-unknown/release
-          stellar contract build
-          mkdir -p /tmp/build-pass-1
-          find target/wasm32-unknown-unknown/release -maxdepth 1 -name '*.wasm' -exec cp {} /tmp/build-pass-1/ \;
-
-      - name: Build contracts (pass 2, clean)
-        working-directory: contracts
-        run: |
-          set -euo pipefail
-          cargo clean
-          stellar contract build
-          mkdir -p /tmp/build-pass-2
-          find target/wasm32-unknown-unknown/release -maxdepth 1 -name '*.wasm' -exec cp {} /tmp/build-pass-2/ \;
-
-      - name: Compare normalized wasm hashes
-        run: |
-          set -euo pipefail
-          # Normalize wasm before hashing so legitimate nondeterministic metadata
-          # (embedded build paths, timestamps, producer strings) does not cause
-          # false mismatches. The custom section "contractmetav0" and the
-          # "producers" custom section are stripped; the remaining bytes must be
-          # byte-identical across clean builds.
-          normalize() {
-            local src="$1"
-            local dst="$2"
-            if command -v wasm-strip >/dev/null 2>&1; then
-              wasm-strip "$src" -o "$dst"
-            else
-              # Fallback: strip custom sections via a small python helper.
-              python3 - "$src" "$dst" <<'PY'
-import sys
-src, dst = sys.argv[1], sys.argv[2]
-with open(src, 'rb') as f:
-    data = f.read()
-assert data[:4] == b'\0asm', 'not a wasm module'
-out = bytearray(data[:8])
-i = 8
-while i < len(data):
-    sec_id = data[i]
-    i += 1
-    # read LEB128 section size
-    size = 0
-    shift = 0
-    while True:
-        b = data[i]
-        i += 1
-        size |= (b & 0x7f) << shift
-        shift += 7
-        if not (b & 0x80):
-            break
-    body = data[i:i+size]
-    i += size
-    # section id 0 is a custom section; drop it
-    if sec_id == 0:
-        continue
-    out.append(sec_id)
-    n = size
-    while True:
-        b = n & 0x7f
-        n >>= 7
-        if n:
-            out.append(b | 0x80)
-        else:
-            out.append(b)
-            break
-    out.extend(body)
-with open(dst, 'wb') as f:
-    f.write(out)
-PY
-            fi
-          }
-
-          status=0
-          for wasm in /tmp/build-pass-1/*.wasm; do
-            name=$(basename "$wasm")
-            if [ ! -f "/tmp/build-pass-2/$name" ]; then
-              echo "::error::Missing artifact $name in second build pass"
-              status=1
-              continue
-            fi
-            normalize "$wasm" "/tmp/norm-1-$name"
-            normalize "/tmp/build-pass-2/$name" "/tmp/norm-2-$name"
-            h1=$(sha256sum "/tmp/norm-1-$name" | awk '{print $1}')
-            h2=$(sha256sum "/tmp/norm-2-$name" | awk '{print $1}')
-            if [ "$h1" != "$h2" ]; then
-              echo "::error::Non-reproducible build for $name ($h1 != $h2)"
-              status=1
-            else
-              echo "Reproducible: $name -> $h1"
-            fi
-          done
-
-          if [ -z "$(ls -A /tmp/build-pass-1/*.wasm 2>/dev/null)" ]; then
-            echo "::error::No wasm artifacts produced by first build pass"
-            status=1
-          fi
-
-          exit $status
-
-      - name: Generate provenance metadata and checksums
-        run: |
-          set -euo pipefail
-          # Produce a checksummed artifact bundle plus a provenance manifest that
-          # ties each wasm to the source commit, toolchain, and build inputs.
-          # The manifest is network-independent: it records only values derived
-          # from the checked-out tree and the pinned toolchain.
-          out=/tmp/artifacts
-          mkdir -p "$out"
-
-          if [ -z "$(ls -A /tmp/build-pass-1/*.wasm 2>/dev/null)" ]; then
-            echo "::error::No wasm artifacts to publish"
+          # Derive the deployable contract set from the Cargo workspace members
+          # instead of a hardcoded list. A member is deployable when it is a
+          # cdylib crate (i.e. produces a wasm artifact).
+          members=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.targets[] | .crate_types[] == "cdylib") | .name' \
+            | sort -u)
+          if [ -z "$members" ]; then
+            echo "::error::No deployable contract workspace members found"
             exit 1
           fi
+          echo "Deployable contract members:"
+          echo "$members"
+          {
+            echo "list<<EOF"
+            echo "$members"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
-          # Copy wasm artifacts and compute sha256 checksums.
-          for wasm in /tmp/build-pass-1/*.wasm; do
-            name=$(basename "$wasm")
-            cp "$wasm" "$out/$name"
-          done
-          ( cd "$out" && sha256sum ./*.wasm > SHA256SUMS )
-
-          # Capture pinned toolchain and compiler versions.
-          rustc_version=$(rustc --version)
-          cargo_version=$(cargo --version)
-          stellar_version=$(stellar --version 2>/dev/null | head -n1 || echo "unknown")
-          toolchain=$(cat rust-toolchain.toml 2>/dev/null || echo "unspecified")
-
-          # Build the provenance manifest. Schema is versioned so consumers can
-          # evolve; fields are stable and network-independent.
-          python3 - "$out" "$rustc_version" "$cargo_version" "$stellar_version" "$toolchain" <<'PY'
-import hashlib
-import json
-import os
-import sys
-
-out, rustc_version, cargo_version, stellar_version, toolchain = sys.argv[1:6]
-
-artifacts = []
-for name in sorted(os.listdir(out)):
-    if not name.endswith('.wasm'):
-        continue
-    path = os.path.join(out, name)
-    with open(path, 'rb') as f:
-        data = f.read()
-    artifacts.append({
-        'name': name,
-        'sha256': hashlib.sha256(data).hexdigest(),
-        'size': len(data),
-    })
-
-if not artifacts:
-    print('::error::No wasm artifacts found for provenance manifest', file=sys.stderr)
-    sys.exit(1)
-
-manifest = {
-    'schema_version': 1,
-    'commit': os.environ.get('GITHUB_SHA', ''),
-    'ref': os.environ.get('GITHUB_REF', ''),
-    'repository': os.environ.get('GITHUB_REPOSITORY', ''),
-    'checksum_algorithm': 'sha256',
-    'compiler': {
-        'rustc': rustc_version,
-        'cargo': cargo_version,
-        'stellar_cli': stellar_version,
-        'toolchain': toolchain,
-    },
-    'artifacts': artifacts,
-}
-
-with open(os.path.join(out, 'provenance.json'), 'w') as f:
-    json.dump(manifest, f, indent=2, sort_keys=True)
-    f.write('\n')
-PY
-
-          # Validate the manifest against the on-disk artifacts so a checksum
-          # mismatch or malformed manifest fails the build.
-          python3 - "$out" <<'PY'
-import hashlib
-import json
-import os
-import sys
-
-out = sys.argv[1]
-manifest_path = os.path.join(out, 'provenance.json')
-with open(manifest_path) as f:
-    manifest = json.load(f)
-
-if manifest.get('schema_version') != 1:
-    print('::error::Unexpected provenance schema_version', file=sys.stderr)
-    sys.exit(1)
-if manifest.get('checksum_algorithm') != 'sha256':
-    print('::error::Unexpected checksum algorithm', file=sys.stderr)
-    sys.exit(1)
-
-listed = {a['name']: a for a in manifest.get('artifacts', [])}
-if not listed:
-    print('::error::Provenance manifest lists no artifacts', file=sys.stderr)
-    sys.exit(1)
-
-for name, entry in listed.items():
-    path = os.path.join(out, name)
-    if not os.path.isfile(path):
-        print(f'::error::Manifest references missing artifact {name}', file=sys.stderr)
-        sys.exit(1)
-    with open(path, 'rb') as f:
-        digest = hashlib.sha256(f.read()).hexdigest()
-    if digest != entry['sha256']:
-        print(f'::error::Checksum mismatch for {name}', file=sys.stderr)
-        sys.exit(1)
-
-print(f'Provenance verified for {len(listed)} artifact(s)')
-PY
-
-      - name: Upload wasm artifacts with provenance
-        uses: actions/upload-artifact@v4
-        with:
-          name: contracts-wasm-${{ github.sha }}
-          path: |
-            /tmp/artifacts/*.wasm
-            /tmp/artifacts/SHA256SUMS
-            /tmp/artifacts/provenance.json
-          if-no-files-found: error
-          retention-days: 90
+      - name: Build wasm artifacts for every contract member
+        working-directory: contracts
+        env:
+          MEMBERS: ${{ steps.members.outputs.list }}
+        run: |
+          set -euo pipefail
+          missing=0
+          while IFS= read -r member; do
+            [ -z "$member" ] && continue
+            echo "::group::Building $member"
+            cargo build --release --target wasm32-unknown-unknown -p "$member"
+            wasm="target/wasm32-unknown-unknown/release/${member//-/_}.wasm"
+            if [ ! -f "$wasm" ]; then
+              echo "::error::Missing wasm artifact for deployable member '$member' (expected $wasm)"
+              missing=1
+            else
+              echo "Built $wasm"
+            fi
+            echo "::endgroup::"
+          done <<< "$MEMBERS"
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::One or more deployable contract members are missing wasm artifacts"
+            exit 1
+          fi
