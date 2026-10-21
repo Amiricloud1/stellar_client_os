@@ -42,6 +42,7 @@ function restorePreviousStreams(
 export function useCreateStream() {
     const queryClient = useQueryClient();
     const { address, signTransaction } = useWallet();
+    const transactionGuard = useTransactionGuard();
 
     return useMutation<Awaited<ReturnType<typeof createStream>>, unknown, CreateStreamInput, CreateStreamMutationContext>({
         mutationFn: (params: CreateStreamInput) => {
@@ -50,10 +51,17 @@ export function useCreateStream() {
                 throw new Error('Wallet not connected');
             }
 
+            // Bind the flow to the chain identity at start; abort if the network
+            // switches before signing/confirmation completes.
+            const guard = transactionGuard.begin('create-stream');
+
             return createStream({
                 ...params,
                 sender,
-                signTransaction,
+                signTransaction: guard.wrapSignTransaction(signTransaction),
+                assertChainUnchanged: guard.assertChainUnchanged,
+            }).finally(() => {
+                guard.finish();
             });
         },
         onMutate: async (newStream): Promise<CreateStreamMutationContext> => {

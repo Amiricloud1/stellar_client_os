@@ -21,6 +21,15 @@ import {
   demoImpactCampaigns,
   type CampaignImpactRecord,
 } from "@/services/campaign-impact-leaderboard.service";
+import {
+  DEFAULT_PAGE_LIMIT,
+  MAX_PAGE_LIMIT,
+  buildPageInfo,
+  normalizePageLimit,
+  normalizeSortDirection,
+  type PageInfo,
+  type SortDirection,
+} from "@/services/pagination.service";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -111,6 +120,49 @@ export interface AdminAnalyticsQuery {
   windowDays?: number;
 }
 
+/** Sortable fields for the admin analytics campaign list. */
+export const ADMIN_ANALYTICS_SORT_FIELDS = [
+  "createdAt",
+  "totalRaised",
+  "trees",
+  "sponsorCount",
+  "id",
+] as const;
+
+export type AdminAnalyticsSortField = (typeof ADMIN_ANALYTICS_SORT_FIELDS)[number];
+
+export const DEFAULT_ADMIN_ANALYTICS_SORT_FIELD: AdminAnalyticsSortField = "createdAt";
+export const DEFAULT_ADMIN_ANALYTICS_SORT_DIRECTION: SortDirection = "desc";
+
+export interface AdminAnalyticsListQuery extends AdminAnalyticsQuery {
+  /** 1-based page number; defaults to 1. */
+  page?: number;
+  /** Page size, clamped to 1…{@link MAX_PAGE_LIMIT}; defaults to {@link DEFAULT_PAGE_LIMIT}. */
+  limit?: number;
+  sortBy?: AdminAnalyticsSortField;
+  sortDir?: SortDirection;
+}
+
+/** One campaign row in the paginated admin analytics list. */
+export interface AdminAnalyticsCampaignRow {
+  id: string;
+  status: CampaignImpactRecord["status"];
+  createdAt: number;
+  totalRaisedStroops: string;
+  totalRaisedXlm: number;
+  trees: number;
+  co2PerYearKg: number;
+  sponsorCount: number;
+}
+
+export interface AdminAnalyticsCampaignList {
+  items: AdminAnalyticsCampaignRow[];
+  pageInfo: PageInfo;
+  sort: { field: AdminAnalyticsSortField; direction: SortDirection };
+  network: string;
+  generatedAt: number;
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
@@ -139,6 +191,103 @@ const utcDate = (unixSeconds: number) => new Date(unixSeconds * 1000).toISOStrin
 export function normalizeWindowDays(days: number | undefined): number {
   if (days === undefined || !Number.isFinite(days)) return DEFAULT_ANALYTICS_WINDOW_DAYS;
   return Math.min(Math.max(Math.floor(days), 1), MAX_ANALYTICS_WINDOW_DAYS);
+}
+
+/** Clamp a requested page number to a positive integer. */
+export function normalizePage(page: number | undefined): number {
+  if (page === undefined || !Number.isFinite(page)) return 1;
+  return Math.max(Math.floor(page), 1);
+}
+
+/** Resolve a requested sort field, falling back to the default. */
+export function normalizeSortField(
+  field: string | undefined,
+): AdminAnalyticsSortField {
+  return (ADMIN_ANALYTICS_SORT_FIELDS as readonly string[]).includes(field ?? "")
+    ? (field as AdminAnalyticsSortField)
+    : DEFAULT_ADMIN_ANALYTICS_SORT_FIELD;
+}
+
+function compareRows(
+  a: AdminAnalyticsCampaignRow,
+  b: AdminAnalyticsCampaignRow,
+  field: AdminAnalyticsSortField,
+): number {
+  switch (field) {
+    case "totalRaised":
+      return compareBigInt(
+        BigInt(a.totalRaisedStroops),
+        BigInt(b.totalRaisedStroops),
+      );
+    case "trees":
+      return a.trees - b.trees;
+    case "sponsorCount":
+      return a.sponsorCount - b.sponsorCount;
+    case "createdAt":
+      return a.createdAt - b.createdAt;
+    case "id":
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  }
+}
+
+function compareBigInt(a: bigint, b: bigint): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * Build the paginated, stably ordered campaign list for the admin analytics
+ * dashboard. Ordering is total: the requested field, then `id` ascending as a
+ * tie-breaker, so pages never overlap or skip rows.
+ */
+export function computeAdminAnalyticsCampaignList(
+  campaigns: readonly CampaignImpactRecord[],
+  options: {
+    now: number;
+    network?: string;
+    page?: number;
+    limit?: number;
+    sortBy?: string;
+    sortDir?: SortDirection;
+  },
+): AdminAnalyticsCampaignList {
+  const page = normalizePage(options.page);
+  const limit = normalizePageLimit(options.limit);
+  const field = normalizeSortField(options.sortBy);
+  const direction = normalizeSortDirection(options.sortDir, DEFAULT_ADMIN_ANALYTICS_SORT_DIRECTION);
+
+  const rows: AdminAnalyticsCampaignRow[] = campaigns.map((campaign) => {
+    const metrics = computeCampaignImpactMetrics(campaign);
+    const stroops = toStroops(campaign.totalRaised);
+    return {
+      id: campaign.id,
+      status: campaign.status,
+      createdAt: campaign.createdAt,
+      totalRaisedStroops: stroops.toString(),
+      totalRaisedXlm: stroopsToXlm(stroops),
+      trees: metrics.trees,
+      co2PerYearKg: metrics.co2PerYearKg,
+      sponsorCount: Math.max(0, Math.floor(campaign.sponsorCount)),
+    };
+  });
+
+  rows.sort((a, b) => {
+    const primary = compareRows(a, b, field);
+    const directed = direction === "asc" ? primary : -primary;
+    if (directed !== 0) return directed;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+
+  const totalItems = rows.length;
+  const startIndex = (page - 1) * limit;
+  const items = rows.slice(startIndex, startIndex + limit);
+
+  return {
+    items,
+    pageInfo: buildPageInfo({ page, limit, totalItems }),
+    sort: { field, direction },
+    network: options.network ?? "testnet",
+    generatedAt: Math.floor(options.now),
+  };
 }
 
 /**
@@ -315,6 +464,26 @@ export class AdminCampaignAnalyticsService {
       network,
     });
   }
+
+  /**
+   * Paginated campaign list for the admin analytics dashboard. Uses the shared
+   * pagination contract: clamped `limit`, 1-based `page`, stable total ordering
+   * and `PageInfo` metadata.
+   */
+  async getCampaignList(
+    query: AdminAnalyticsListQuery = {},
+  ): Promise<AdminAnalyticsCampaignList> {
+    const network = query.network ?? "testnet";
+    const campaigns = await this.dataSource.getCampaigns(network);
+    return computeAdminAnalyticsCampaignList(campaigns, {
+      now: this.clock(),
+      network,
+      page: query.page,
+      limit: query.limit,
+      sortBy: query.sortBy,
+      sortDir: query.sortDir,
+    });
+  }
 }
 
 let _defaultService: AdminCampaignAnalyticsService | null = null;
@@ -330,3 +499,5 @@ export function setAdminCampaignAnalyticsService(
 ): void {
   _defaultService = service;
 }
+
+export { DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT };

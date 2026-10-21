@@ -33,6 +33,10 @@ function readFixture(): CampaignsFixture | null {
 // currently-visible cards are in the DOM.  We fetch up to 500 at a time and
 // append on scroll (infinite load pattern) to support 10k+ campaign lists
 // without a single blocking request.
+//
+// Issue #59: pagination and sorting are standardized across list endpoints.
+// The API enforces a maximum page size (see shared pagination contract), so
+// this value is clamped to the server-advertised limit when one is returned.
 // ---------------------------------------------------------------------------
 
 /** Query key namespace for campaign list data. */
@@ -206,7 +210,9 @@ async function fetchAllCampaigns(): Promise<CampaignItem[]> {
       }
 
       let offset = 0;
+      let pageLimit = requestedLimit;
       const accumulated: any[] = [];
+      let lastPageInfo: PageInfo | null = null;
 
       try {
         while (true) {
@@ -217,6 +223,22 @@ async function fetchAllCampaigns(): Promise<CampaignItem[]> {
           }
 
           const { data, pagination } = await res.json();
+
+          // Issue #59: the API returns shared PageInfo metadata.  Use it as
+          // the source of truth for the effective limit, total count and
+          // whether more pages exist, so ordering stays stable across pages.
+          if (pagination) {
+            lastPageInfo = {
+              limit: pagination.limit ?? pageLimit,
+              offset: pagination.offset ?? offset,
+              total: pagination.total ?? 0,
+              hasMore: Boolean(pagination.hasMore),
+              sort: pagination.sort ?? sort,
+              order: pagination.order ?? order,
+            };
+            // Respect the server-advertised max page size on subsequent pages.
+            pageLimit = lastPageInfo.limit;
+          }
 
           // Map backend records to UI format
           const formatted = (data as any[]).map((c) => ({
@@ -238,14 +260,22 @@ async function fetchAllCampaigns(): Promise<CampaignItem[]> {
           }));
 
           accumulated.push(...formatted);
-          offset += PAGE_SIZE;
+          offset += pageLimit;
 
-          // Stop when the API returns fewer items than the page size,
-          // meaning we've fetched all available campaigns.
-          if (!data || data.length < PAGE_SIZE) {
+          // Prefer the server's PageInfo to decide whether to continue; fall
+          // back to the short-page heuristic for older API responses.
+          const more = lastPageInfo
+            ? lastPageInfo.hasMore
+            : Boolean(data) && data.length >= pageLimit;
+
+          if (!more) {
             setHasMore(false);
             break;
           }
+        }
+
+        if (lastPageInfo) {
+          setPageInfo(lastPageInfo);
         }
 
         if (accumulated.length > 0) {
@@ -262,7 +292,7 @@ async function fetchAllCampaigns(): Promise<CampaignItem[]> {
     };
 
     fetchCampaigns();
-  }, [isOnline]);
+  }, [isOnline, requestedLimit, sort, order]);
 
   return { campaigns, isLoading, hasMore, error };
 }

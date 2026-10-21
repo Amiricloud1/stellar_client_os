@@ -51,6 +51,121 @@ export type TaxFormKind = "us-1099-nec" | "eu-vat-oss" | "earnings-statement";
 
 const USDC_SCALE = 1n;
 
+/**
+ * Placeholder inserted in place of a redacted tax identifier.
+ */
+export const REDACTED_TAX_ID = "[REDACTED_TAX_ID]";
+
+/**
+ * Keys whose values are treated as sensitive tax identifiers when redacting
+ * serialized payloads. Matching is case-insensitive and ignores separators
+ * (`_`, `-`, spaces), so `taxId`, `tax_id`, `TAX-ID` and `ssn` all match.
+ */
+const SENSITIVE_TAX_ID_KEYS: readonly string[] = [
+  "taxid",
+  "taxidentificationnumber",
+  "tin",
+  "ssn",
+  "socialsecuritynumber",
+  "ein",
+  "employeridentificationnumber",
+  "vatid",
+  "vatnumber",
+  "itin",
+];
+
+function normalizeKey(key: string): string {
+  return key.toLowerCase().replace(/[\s_-]/g, "");
+}
+
+function isSensitiveTaxIdKey(key: string): boolean {
+  return SENSITIVE_TAX_ID_KEYS.includes(normalizeKey(key));
+}
+
+/**
+ * Mask a single tax identifier, keeping only the last four alphanumeric
+ * characters so operators can still correlate records without exposing the
+ * full value. Values shorter than five characters are fully redacted.
+ */
+export function maskTaxId(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return REDACTED_TAX_ID;
+  const alphanumeric = trimmed.replace(/[^A-Za-z0-9]/g, "");
+  if (alphanumeric.length <= 4) return REDACTED_TAX_ID;
+  const lastFour = alphanumeric.slice(-4);
+  return `***-**-${lastFour}`;
+}
+
+/**
+ * Redact tax identifiers from an arbitrary value before it is logged or
+ * serialized. Plain strings are scanned for common tax-ID shapes (SSN, EIN,
+ * VAT) and masked in place; objects/arrays are walked recursively and any
+ * value stored under a sensitive key is masked. The input is never mutated.
+ */
+export function redactTaxIds<T>(input: T): T {
+  return redactValue(input, new Set()) as T;
+}
+
+function redactValue(value: unknown, seen: Set<object>): unknown {
+  if (typeof value === "string") {
+    return redactTaxIdsInString(value);
+  }
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+  if (seen.has(value as object)) {
+    return "[Circular]";
+  }
+  seen.add(value as object);
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => redactValue(entry, seen));
+  }
+
+  const result: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    result[key] = isSensitiveTaxIdKey(key)
+      ? typeof entry === "string"
+        ? maskTaxId(entry)
+        : REDACTED_TAX_ID
+      : redactValue(entry, seen);
+  }
+  return result;
+}
+
+const TAX_ID_PATTERNS: readonly RegExp[] = [
+  // US SSN: 123-45-6789 or 123 45 6789
+  /\b\d{3}[- ]\d{2}[- ]\d{4}\b/g,
+  // US EIN: 12-3456789
+  /\b\d{2}-\d{7}\b/g,
+  // EU VAT: two-letter country prefix followed by 8-12 alphanumerics
+  /\b[A-Z]{2}[0-9A-Z]{8,12}\b/g,
+];
+
+function redactTaxIdsInString(value: string): string {
+  let redacted = value;
+  for (const pattern of TAX_ID_PATTERNS) {
+    redacted = redacted.replace(pattern, (match) => maskTaxId(match));
+  }
+  return redacted;
+}
+
+/**
+ * Redact tax identifiers from an error before it is surfaced to logs or
+ * clients. Preserves the error name and stack while masking the message.
+ */
+export function redactTaxIdsFromError(error: unknown): Error {
+  if (error instanceof Error) {
+    const safe = new Error(redactTaxIdsInString(error.message));
+    safe.name = error.name;
+    if (error.stack) {
+      safe.stack = redactTaxIdsInString(error.stack);
+    }
+    return safe;
+  }
+  return new Error(redactTaxIdsInString(String(error)));
+}
+
 function isInTaxYear(transaction: EarningsTransaction, taxYear: number): boolean {
   return new Date(transaction.timestamp).getUTCFullYear() === taxYear;
 }
@@ -119,13 +234,18 @@ export class TaxReportingSDK {
     params: CreatorEarningsParams,
     transactions: readonly EarningsTransaction[] = [],
   ): Promise<TaxForm1099Record> {
-    const earnings = computeAnnualEarnings(transactions, params.taxYear);
-    return {
-      creatorId: params.creatorId,
-      taxYear: params.taxYear,
-      grossEarningsUSDC: earnings.grossEarningsUSDC,
-      totalTransactions: earnings.totalTransactions,
-      generatedAt: new Date().toISOString(),
-    };
+    try {
+      const earnings = computeAnnualEarnings(transactions, params.taxYear);
+      return {
+        creatorId: params.creatorId,
+        taxYear: params.taxYear,
+        grossEarningsUSDC: earnings.grossEarningsUSDC,
+        totalTransactions: earnings.totalTransactions,
+        generatedAt: new Date().toISOString(),
+      };
+    } catch (error) {
+      // Never let raw tax identifiers escape through error messages/logs.
+      throw redactTaxIdsFromError(error);
+    }
   }
 }

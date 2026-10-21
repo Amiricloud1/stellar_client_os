@@ -41,6 +41,160 @@ export const TransactionWaitStatusEnum = {
 };
 
 /**
+ * A single contract effect (event or state change) observed while simulating
+ * a transaction. Effects are derived from the simulation's diagnostic events
+ * and are intended for display in a pre-signing review UI.
+ */
+export interface TransactionSimulationEffect {
+  /** Contract ID that emitted the effect, if known. */
+  contractId?: string;
+  /** Effect topic(s), e.g. `["transfer"]`. */
+  topics: string[];
+  /** Human-readable summary of the effect. */
+  description: string;
+  /** Raw effect data (base64-encoded XDR or decoded value) when available. */
+  data?: unknown;
+}
+
+/**
+ * Structured summary of a simulated transaction, suitable for a review screen
+ * shown before the user signs.
+ */
+export interface TransactionSimulationSummary {
+  /** Whether the simulation succeeded. */
+  success: boolean;
+  /** Amount transferred or otherwise affected, as a decimal string (if any). */
+  amount?: string;
+  /** Asset identifier for the amount, e.g. `native` or `CODE:ISSUER`. */
+  asset?: string;
+  /** Destination account or contract address (if any). */
+  destination?: string;
+  /** Estimated total fee in stroops, as a decimal string. */
+  fee?: string;
+  /** Contract effects produced by the simulation. */
+  effects: TransactionSimulationEffect[];
+  /** Chain identity captured at simulation time (e.g. network passphrase). */
+  chainId?: string;
+  /** Ledger sequence the simulation was evaluated against. */
+  ledger?: number;
+  /** Latest ledger known to the RPC at simulation time. */
+  latestLedger?: number;
+  /** Error message when the simulation failed. */
+  error?: string;
+}
+
+/**
+ * Options for {@link simulateTransaction}.
+ */
+export interface SimulateTransactionOptions {
+  /** Expected chain identity; if provided, mismatches are reported as errors. */
+  expectedChainId?: string;
+  /** Expected ledger; if provided, a stale simulation is reported as an error. */
+  expectedLedger?: number;
+  /** Maximum allowed ledger drift before the simulation is considered stale. */
+  maxLedgerDrift?: number;
+}
+
+/**
+ * Simulates an AssembledTransaction and returns a structured summary of the
+ * amount, destination, fees, and contract effects, along with the chain
+ * identity and ledger the simulation was evaluated against.
+ *
+ * This does not sign or submit anything and is safe to call with no funds.
+ *
+ * @typeParam T - The result type of the contract invocation
+ * @param tx - The AssembledTransaction to simulate
+ * @param rpcUrl - The Soroban RPC URL used to simulate
+ * @param options - Simulation options
+ * @returns Promise resolving to a {@link TransactionSimulationSummary}
+ */
+export async function simulateTransaction<T = unknown>(
+  tx: AssembledTransaction<T>,
+  rpcUrl: string,
+  options: SimulateTransactionOptions = {},
+): Promise<TransactionSimulationSummary> {
+  const { expectedChainId, expectedLedger, maxLedgerDrift = 0 } = options;
+  const server = new rpc.Server(rpcUrl);
+
+  const summary: TransactionSimulationSummary = {
+    success: false,
+    effects: [],
+  };
+
+  try {
+    const simulation = await server.simulateTransaction(tx.built);
+
+    summary.latestLedger = simulation.latestLedger;
+    summary.ledger = simulation.latestLedger;
+
+    // Capture chain identity from the network passphrase when available.
+    const network = await server.getNetwork();
+    summary.chainId = network.passphrase;
+
+    if (expectedChainId && summary.chainId !== expectedChainId) {
+      summary.error =
+        `Chain identity mismatch: expected ${expectedChainId}, ` +
+        `got ${summary.chainId}`;
+      return summary;
+    }
+
+    if (
+      expectedLedger !== undefined &&
+      summary.ledger !== undefined &&
+      Math.abs(summary.ledger - expectedLedger) > maxLedgerDrift
+    ) {
+      summary.error =
+        `Stale simulation: evaluated at ledger ${summary.ledger}, ` +
+        `expected ${expectedLedger} (±${maxLedgerDrift})`;
+      return summary;
+    }
+
+    if (rpc.Api.isSimulationError(simulation)) {
+      summary.error = simulation.error;
+      return summary;
+    }
+
+    summary.success = true;
+
+    // Estimate fee from the simulation's min resource fee plus inclusion fee.
+    const minResourceFee = simulation.minResourceFee;
+    if (minResourceFee !== undefined && minResourceFee !== null) {
+      summary.fee = String(minResourceFee);
+    }
+
+    // Derive contract effects from diagnostic events.
+    const events = simulation.events ?? [];
+    for (const event of events) {
+      const topics = (event.topic ?? []).map((t) => String(t));
+      const effect: TransactionSimulationEffect = {
+        topics,
+        description: topics.length > 0 ? topics.join(":") : "event",
+      };
+      if (event.contractId) {
+        effect.contractId = String(event.contractId);
+      }
+      if (event.data !== undefined) {
+        effect.data = event.data;
+      }
+      summary.effects.push(effect);
+    }
+
+    return summary;
+  } catch (simulationError) {
+    const parsedError = parseContractError(
+      `Error simulating transaction: ${
+        simulationError instanceof Error
+          ? simulationError.message
+          : String(simulationError)
+      }`,
+      "Transaction simulation",
+    );
+    summary.error = parsedError.message;
+    return summary;
+  }
+}
+
+/**
  * Configuration options for waiting on a transaction
  */
 export interface WaitForTransactionOptions {

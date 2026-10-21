@@ -388,6 +388,54 @@ export interface CampaignQueryInput {
   network?: "testnet" | "mainnet";
 }
 
+/** Shared pagination contract (issue #59). */
+export const CAMPAIGN_DEFAULT_PAGE_SIZE = 20;
+export const CAMPAIGN_MAX_PAGE_SIZE = 100;
+
+export const CAMPAIGN_SORT_FIELDS: readonly CampaignSortField[] = [
+  "createdAt",
+  "updatedAt",
+  "name",
+  "status",
+  "goalAmount",
+  "raisedAmount",
+  "sponsorCount",
+  "treeCount",
+];
+
+/** Metadata returned alongside every paginated list response. */
+export interface PageInfo {
+  limit: number;
+  offset: number;
+  total: number;
+  hasMore: boolean;
+  sort: { field: CampaignSortField; direction: SortDirection };
+}
+
+export interface CampaignPage {
+  items: CampaignRecord[];
+  pageInfo: PageInfo;
+}
+
+export function isCampaignSortField(value: unknown): value is CampaignSortField {
+  return typeof value === "string" && (CAMPAIGN_SORT_FIELDS as readonly string[]).includes(value);
+}
+
+/**
+ * Resolve the effective page size, clamping to the shared bounds. Non-finite
+ * or missing values fall back to the default; fractional values are floored.
+ */
+export function resolveCampaignPageSize(limit?: number): number {
+  if (limit === undefined || !Number.isFinite(limit)) return CAMPAIGN_DEFAULT_PAGE_SIZE;
+  return Math.min(Math.max(Math.floor(limit), 1), CAMPAIGN_MAX_PAGE_SIZE);
+}
+
+/** Resolve the effective offset, treating negative/non-finite values as 0. */
+export function resolveCampaignOffset(offset?: number): number {
+  if (offset === undefined || !Number.isFinite(offset)) return 0;
+  return Math.max(Math.floor(offset), 0);
+}
+
 export class InMemoryCampaignDataSource implements CampaignDataSource {
   private campaigns = new Map<string, CampaignRecord>();
 
@@ -1083,7 +1131,17 @@ export async function findDuplicateCampaigns(
   });
 }
 
-export async function queryCampaigns(input: CampaignQueryInput = {}, dataSource = getCampaignDataSource()): Promise<CampaignRecord[]> {
+/**
+ * Paginate and sort campaigns using the shared list contract (issue #59):
+ * - page size is clamped to [1, CAMPAIGN_MAX_PAGE_SIZE] (default 20)
+ * - ordering is stable: the requested field, then `id` ascending as a
+ *   deterministic tie-breaker so pages never overlap or skip records
+ * - unknown sort fields fall back to `createdAt` DESC
+ */
+export async function queryCampaignsPage(
+  input: CampaignQueryInput = {},
+  dataSource = getCampaignDataSource(),
+): Promise<CampaignPage> {
   const filter = input.filter ?? {};
   let campaigns = await dataSource.getCampaigns(input.network);
   campaigns = campaigns.filter((campaign) => {
@@ -1100,12 +1158,33 @@ export async function queryCampaigns(input: CampaignQueryInput = {}, dataSource 
     return true;
   });
 
-  const field = input.sort?.field ?? "createdAt";
-  const direction = input.sort?.direction === "ASC" ? 1 : -1;
+  const field: CampaignSortField = isCampaignSortField(input.sort?.field)
+    ? input.sort!.field!
+    : "createdAt";
+  const sortDirection: SortDirection = input.sort?.direction === "ASC" ? "ASC" : "DESC";
+  const direction = sortDirection === "ASC" ? 1 : -1;
   campaigns.sort((a, b) => compareValues(a, b, field) * direction || a.id.localeCompare(b.id));
-  const offset = Math.max(input.offset ?? 0, 0);
-  const limit = Math.min(Math.max(input.limit ?? 20, 1), 100);
-  return campaigns.slice(offset, offset + limit);
+
+  const total = campaigns.length;
+  const offset = resolveCampaignOffset(input.offset);
+  const limit = resolveCampaignPageSize(input.limit);
+  const items = campaigns.slice(offset, offset + limit);
+
+  return {
+    items,
+    pageInfo: {
+      limit,
+      offset,
+      total,
+      hasMore: offset + items.length < total,
+      sort: { field, direction: sortDirection },
+    },
+  };
+}
+
+/** Backwards-compatible wrapper returning only the page items. */
+export async function queryCampaigns(input: CampaignQueryInput = {}, dataSource = getCampaignDataSource()): Promise<CampaignRecord[]> {
+  return (await queryCampaignsPage(input, dataSource)).items;
 }
 
 const allowedTransitions: Record<CampaignStatus, CampaignStatus[]> = {

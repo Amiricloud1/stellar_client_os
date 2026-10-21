@@ -3,6 +3,13 @@ import {
   getCampaignDataSource,
   type CampaignRecord,
 } from "./campaign.service";
+import {
+  normalizePagination,
+  paginateItems,
+  type PageInfo,
+  type PaginationParams,
+  type SortDirection,
+} from "./pagination.service";
 
 export interface CampaignAnalytics {
   campaignId: string;
@@ -164,6 +171,91 @@ export interface GetCampaignAnalyticsOptions {
   forceRefresh?: boolean;
 }
 
+export type CampaignAnalyticsSortField =
+  | "campaignId"
+  | "pagesViewed"
+  | "uniqueViewers"
+  | "contributions"
+  | "sponsors"
+  | "sponsorRate"
+  | "abandonmentRate"
+  | "averageContributionSize"
+  | "refunds"
+  | "refundRate"
+  | "updatedAt";
+
+export interface CampaignAnalyticsListParams extends PaginationParams {
+  sortBy?: CampaignAnalyticsSortField;
+  sortDirection?: SortDirection;
+}
+
+export interface CampaignAnalyticsListResult {
+  items: CampaignAnalytics[];
+  pageInfo: PageInfo;
+}
+
+const SORT_FIELDS: readonly CampaignAnalyticsSortField[] = [
+  "campaignId",
+  "pagesViewed",
+  "uniqueViewers",
+  "contributions",
+  "sponsors",
+  "sponsorRate",
+  "abandonmentRate",
+  "averageContributionSize",
+  "refunds",
+  "refundRate",
+  "updatedAt",
+];
+
+function compareAnalytics(
+  a: CampaignAnalytics,
+  b: CampaignAnalytics,
+  field: CampaignAnalyticsSortField,
+): number {
+  if (field === "campaignId") return a.campaignId.localeCompare(b.campaignId);
+  if (field === "averageContributionSize") {
+    const left = BigInt(a.averageContributionSize);
+    const right = BigInt(b.averageContributionSize);
+    return left < right ? -1 : left > right ? 1 : 0;
+  }
+  const left = a[field];
+  const right = b[field];
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+export async function listCampaignAnalytics(
+  campaignIds: readonly string[],
+  params: CampaignAnalyticsListParams = {},
+  dataSource = getCampaignDataSource(),
+  now = Date.now(),
+): Promise<CampaignAnalyticsListResult> {
+  const sortBy = params.sortBy ?? "campaignId";
+  if (!SORT_FIELDS.includes(sortBy)) throw new Error(`Unsupported sort field: ${sortBy}`);
+  const sortDirection = params.sortDirection ?? "asc";
+  if (sortDirection !== "asc" && sortDirection !== "desc") {
+    throw new Error(`Unsupported sort direction: ${sortDirection}`);
+  }
+
+  const uniqueIds = Array.from(new Set(campaignIds));
+  const analytics: CampaignAnalytics[] = [];
+  for (const campaignId of uniqueIds) {
+    const entry = await getCampaignAnalytics(campaignId, dataSource, now);
+    if (entry) analytics.push(entry);
+  }
+
+  analytics.sort((a, b) => {
+    const primary = compareAnalytics(a, b, sortBy);
+    const ordered = sortDirection === "asc" ? primary : -primary;
+    if (ordered !== 0) return ordered;
+    return a.campaignId.localeCompare(b.campaignId);
+  });
+
+  const pagination = normalizePagination(params);
+  const { items, pageInfo } = paginateItems(analytics, pagination);
+  return { items, pageInfo };
+}
+
 export async function getCampaignAnalytics(
   campaignId: string,
   dataSource = getCampaignDataSource(),
@@ -220,4 +312,4 @@ export function seedCampaignAnalytics(campaignId: string, state: Partial<Campaig
   invalidateCampaignAnalyticsCache(campaignId);
 }
 
-export type { CampaignRecord };
+export type { CampaignRecord, PageInfo };

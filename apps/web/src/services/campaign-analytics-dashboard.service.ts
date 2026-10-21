@@ -19,6 +19,15 @@ import {
   getCampaignDataSource,
   type CampaignDataSource,
 } from "./campaign.service";
+import {
+  DEFAULT_PAGE_SIZE,
+  MAX_PAGE_SIZE,
+  buildPageMeta,
+  normalizePage,
+  normalizePageSize,
+  type PageMeta,
+  type PaginatedResult,
+} from "./pagination";
 
 export type TrafficSourceName = "direct" | "search" | "social" | "referral" | "newsletter";
 export type FunnelStageName = "view" | "click_sponsor" | "contribute" | "confirm";
@@ -107,6 +116,29 @@ export interface CampaignAnalyticsDashboard {
     contributions: number;
     totalFunded: string;
     conversionRate: number;
+  };
+}
+
+/**
+ * Pagination options for the dashboard list sections (traffic sources,
+ * demographics, reward tiers, daily trend). Ordering is stable and
+ * deterministic; page size is clamped to `MAX_PAGE_SIZE`.
+ */
+export interface DashboardListOptions {
+  page?: number;
+  pageSize?: number;
+}
+
+export interface CampaignAnalyticsDashboardPage extends CampaignAnalyticsDashboard {
+  trafficSources: TrafficSourceStat[];
+  demographics: BackerDemographic[];
+  rewardTiers: RewardTierStat[];
+  dailyTrend: DailyFundingPoint[];
+  meta: {
+    trafficSources: PageMeta;
+    demographics: PageMeta;
+    rewardTiers: PageMeta;
+    dailyTrend: PageMeta;
   };
 }
 
@@ -261,6 +293,16 @@ function sumBigInt(values: bigint[]): bigint {
   return values.reduce((sum, value) => sum + value, 0n);
 }
 
+function paginate<T>(items: readonly T[], options: DashboardListOptions): PaginatedResult<T> {
+  const page = normalizePage(options.page);
+  const pageSize = normalizePageSize(options.pageSize);
+  const start = (page - 1) * pageSize;
+  return {
+    items: items.slice(start, start + pageSize),
+    meta: buildPageMeta({ page, pageSize, total: items.length }),
+  };
+}
+
 export async function getCampaignAnalyticsDashboard(
   campaignId: string,
   dataSource = getCampaignDataSource(),
@@ -281,7 +323,7 @@ export async function getCampaignAnalyticsDashboard(
       views: bucket.views,
       share: toRate(bucket.views, state.traffic.size === 0 ? 0 : viewTotal(state)),
     };
-  }).sort((a, b) => b.views - a.views);
+  }).sort((a, b) => b.views - a.views || a.source.localeCompare(b.source));
 
   const funnelEntries = FUNNEL_STAGES.map(({ stage }) => state.funnel.get(stage)!.size);
   const firstStage = funnelEntries[0] ?? 0;
@@ -306,7 +348,10 @@ export async function getCampaignAnalyticsDashboard(
       totalAmount: bucket.totalAmount.toString(),
       share: toRate(Number(bucket.totalAmount), Number(totalDemographicAmount || 1n)),
     }))
-    .sort((a, b) => Number(BigInt(b.totalAmount) - BigInt(a.totalAmount)));
+    .sort(
+      (a, b) =>
+        Number(BigInt(b.totalAmount) - BigInt(a.totalAmount)) || a.region.localeCompare(b.region),
+    );
 
   const tierRevenue = new Map<string, { backers: Set<string>; revenue: bigint }>();
   for (const selection of state.rewardSelections) {
@@ -327,7 +372,9 @@ export async function getCampaignAnalyticsDashboard(
       revenue: revenue.toString(),
       share: backers === 0 ? 0 : toRate(backers, state.rewardSelections.length),
     };
-  }).sort((a, b) => Number(BigInt(b.revenue) - BigInt(a.revenue)));
+  }).sort(
+    (a, b) => Number(BigInt(b.revenue) - BigInt(a.revenue)) || a.tierId.localeCompare(b.tierId),
+  );
 
   const days = Array.from(state.daily.entries()).sort(([a], [b]) => a.localeCompare(b));
   let cumulative = 0n;
@@ -360,6 +407,43 @@ export async function getCampaignAnalyticsDashboard(
     },
   };
 }
+
+/**
+ * Paginated variant of {@link getCampaignAnalyticsDashboard}. Each list section
+ * is paginated independently with the shared pagination contract (stable
+ * ordering, clamped page size, shared metadata). Totals and funnel remain
+ * unpaginated aggregates.
+ */
+export async function getCampaignAnalyticsDashboardPage(
+  campaignId: string,
+  options: DashboardListOptions = {},
+  dataSource = getCampaignDataSource(),
+  now = Date.now(),
+): Promise<CampaignAnalyticsDashboardPage | null> {
+  const dashboard = await getCampaignAnalyticsDashboard(campaignId, dataSource, now);
+  if (!dashboard) return null;
+
+  const trafficSources = paginate(dashboard.trafficSources, options);
+  const demographics = paginate(dashboard.demographics, options);
+  const rewardTiers = paginate(dashboard.rewardTiers, options);
+  const dailyTrend = paginate(dashboard.dailyTrend, options);
+
+  return {
+    ...dashboard,
+    trafficSources: trafficSources.items,
+    demographics: demographics.items,
+    rewardTiers: rewardTiers.items,
+    dailyTrend: dailyTrend.items,
+    meta: {
+      trafficSources: trafficSources.meta,
+      demographics: demographics.meta,
+      rewardTiers: rewardTiers.meta,
+      dailyTrend: dailyTrend.meta,
+    },
+  };
+}
+
+export { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE };
 
 function viewTotal(state: DashboardState): number {
   let total = 0;

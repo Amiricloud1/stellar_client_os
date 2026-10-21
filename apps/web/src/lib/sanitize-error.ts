@@ -197,6 +197,52 @@ const PRESIGNED_URL_QUERY_PARAMS = new Set([
 ]);
 
 /**
+ * Replacement marker for redacted tax identifiers
+ */
+export const TAX_ID_REDACTED = '[TAX_ID_REDACTED]';
+
+/**
+ * Pattern to match US-style Taxpayer Identification Numbers (SSN / ITIN / EIN).
+ * Matches both dashed (123-45-6789) and undashed (123456789) forms.
+ */
+const TAX_ID_PATTERN = /\b\d{3}-?\d{2}-?\d{4}\b|\b\d{2}-?\d{7}\b/g;
+
+/**
+ * Object keys whose values are considered tax identifiers and must be redacted
+ * regardless of the value's shape (e.g. non-US formats, alphanumeric IDs).
+ */
+const TAX_ID_KEY_PATTERN = /(tax.?id|tin|ssn|itin|ein|vat|taxpayer)/i;
+
+/**
+ * Redact tax identifiers from a string.
+ *
+ * Masks US-style TINs (SSN/ITIN/EIN) in both dashed and undashed forms.
+ * Non-string input is returned unchanged.
+ *
+ * @param input - The string to redact
+ * @returns The string with tax identifiers replaced by {@link TAX_ID_REDACTED}
+ *
+ * @example
+ * redactTaxIds('ssn 123-45-6789') // 'ssn [TAX_ID_REDACTED]'
+ */
+export function redactTaxIds(input: string): string {
+  if (!input || typeof input !== 'string') {
+    return input;
+  }
+  return input.replace(TAX_ID_PATTERN, TAX_ID_REDACTED);
+}
+
+/**
+ * Determine whether an object key refers to a tax identifier.
+ *
+ * @param key - The property name to check
+ * @returns True when the key denotes a tax identifier field
+ */
+export function isTaxIdKey(key: string): boolean {
+  return typeof key === 'string' && TAX_ID_KEY_PATTERN.test(key);
+}
+
+/**
  * Options for sanitization
  */
 export type SanitizeOptions = {

@@ -8,6 +8,7 @@ import {
   TopBackersResult,
 } from "@/types/campaign-backers";
 import { backersService, seedDemoBackers } from "@/services/campaign-backers.service";
+import type { PageInfo, PaginationParams, SortParams } from "@/types/pagination";
 
 export interface UseTopBackersOptions {
   campaignId: string;
@@ -15,7 +16,12 @@ export interface UseTopBackersOptions {
   viewerAddress?: string;
   /** Campaign creator address — creators may feature backers. */
   creatorAddress?: string;
+  /** Page size. Defaults to TOP_BACKERS_LIMIT and is clamped by the service. */
   limit?: number;
+  /** 1-based page number. Defaults to 1. */
+  page?: number;
+  /** Sort field/direction; defaults to the leaderboard's stable ranking. */
+  sort?: SortParams;
   /** Seed the mock campaign's demo backers (campaign detail page demo data). */
   seedDemoData?: boolean;
 }
@@ -33,6 +39,8 @@ export function useTopBackers({
   viewerAddress,
   creatorAddress,
   limit = TOP_BACKERS_LIMIT,
+  page = 1,
+  sort,
   seedDemoData = true,
 }: UseTopBackersOptions) {
   const [prevCampaignId, setPrevCampaignId] = useState(campaignId);
@@ -40,8 +48,14 @@ export function useTopBackers({
 
   const loadResult = useCallback((): TopBackersResult => {
     if (seedDemoData) seedDemoBackers(campaignId);
-    return backersService.getTopBackers(campaignId, { limit, viewerAddress, creatorAddress });
-  }, [campaignId, limit, viewerAddress, creatorAddress, seedDemoData]);
+    const pagination: PaginationParams = { page, limit };
+    return backersService.getTopBackers(campaignId, {
+      pagination,
+      sort,
+      viewerAddress,
+      creatorAddress,
+    });
+  }, [campaignId, page, limit, sort, viewerAddress, creatorAddress, seedDemoData]);
 
   const [result, setResult] = useState<TopBackersResult>(loadResult);
 
@@ -114,6 +128,18 @@ export function useTopBackers({
     ? backersService.getPrivacyPreference(campaignId, viewerAddress)
     : undefined;
 
+  // Shared pagination metadata (issue #59). Falls back to a single-page
+  // descriptor when the service omits it so callers can rely on it always
+  // being present.
+  const pageInfo: PageInfo = result.pageInfo ?? {
+    page,
+    limit,
+    total: result.totalBackers,
+    totalPages: Math.max(1, Math.ceil(result.totalBackers / Math.max(1, limit))),
+    hasNextPage: false,
+    hasPreviousPage: page > 1,
+  };
+
   return {
     result,
     backers: result.backers,
@@ -121,6 +147,7 @@ export function useTopBackers({
     privateBackers: result.privateBackers,
     totalAmount: result.totalAmount,
     featuredCount: result.featuredCount,
+    pageInfo,
     isCreator,
     creatorAddress: creator,
     myEntry,

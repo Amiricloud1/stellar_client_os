@@ -9,6 +9,13 @@ import { PaymentStreamClient } from '../../../../packages/sdk/src/PaymentStreamC
 import { DistributorClient } from '../../../../packages/sdk/src/DistributorClient';
 import { createBatches } from '../../../../packages/sdk/src/utils/batchDistribution';
 import { Stream, StreamStatus } from '../types';
+import {
+    DEFAULT_PAGE_LIMIT,
+    MAX_PAGE_LIMIT,
+    type PageInfo,
+    type PaginationInput,
+    type SortInput,
+} from '../../../../packages/shared/src/pagination';
 
 type WalletSigner = (xdr: string) => Promise<string>;
 
@@ -244,6 +251,25 @@ export async function fetchUserStreams(address: string, signal?: AbortSignal): P
     const streams = await stellarService.getStreams(address);
     throwIfAborted(signal);
     return streams.map(mapServiceStream);
+}
+
+/**
+ * Paginated variant of {@link fetchUserStreams}. Sends shared pagination and
+ * sort parameters and returns the shared `PageInfo` metadata envelope.
+ */
+export async function fetchUserStreamsPage(
+    address: string,
+    pagination?: PaginationInput,
+    sort?: SortInput,
+    signal?: AbortSignal
+): Promise<PaginatedResponse<Stream>> {
+    const page = await fetchPaginated<ServiceStream>(
+        `/api/streams/${encodeURIComponent(address)}`,
+        pagination,
+        sort,
+        signal
+    );
+    return { items: page.items.map(mapServiceStream), pageInfo: page.pageInfo };
 }
 
 export async function createStream(params: {

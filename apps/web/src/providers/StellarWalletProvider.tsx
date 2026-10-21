@@ -21,6 +21,7 @@ import { isValidStellarAddress } from "@/utils/stellar-validation";
 import { offrampService } from "@/services/offramp.service";
 import { notify } from "@/utils/notification";
 import { NETWORK_PASSPHRASE } from "@/lib/constants";
+import { transactionGuard } from "@/lib/transaction-guard";
 
 import {
   Dialog,
@@ -73,6 +74,12 @@ interface WalletContextType {
   connectionStatus: ConnectionStatus;
   selectedWalletId: string | null;
   network: WalletNetwork;
+  /**
+   * Active chain identity (network passphrase) that simulation, signing and
+   * confirmation are bound to. In-flight wallet flows capture this value and
+   * abort if it changes before they complete.
+   */
+  chainId: string;
   setNetwork: (network: WalletNetwork) => Promise<void>;
   signTransaction: (xdr: string) => Promise<string>;
   openModal: () => void;
@@ -175,6 +182,11 @@ export const StellarWalletProvider = ({
   // Remember the last wallet the user attempted to connect so retry/reconnect
   // can re-run the same flow without the caller having to pass it again.
   const lastAttemptedWalletRef = useRef<WalletId | null>(null);
+
+  // The chain identity every wallet flow is bound to. Derived from the
+  // configured network passphrase so it always reflects the chain the kit
+  // will actually sign for.
+  const chainId = NETWORK_PASSPHRASE ?? network;
 
   // Network mismatch modal state
   const [networkMismatchOpen, setNetworkMismatchOpen] = useState(false);
@@ -321,6 +333,11 @@ export const StellarWalletProvider = ({
   const setNetwork = useCallback(
     async (newNetwork: WalletNetwork) => {
       if (newNetwork === network) return;
+
+      // Invalidate any in-flight wallet flow before the chain identity changes.
+      // This aborts stale simulation/signing/confirmation and forces a renewed
+      // confirmation for subsequent transactions.
+      transactionGuard.invalidate("network-changed");
 
       // Block network switch while a connection is in progress — abort it first
       if (connectionAbortRef.current) {
@@ -531,6 +548,11 @@ export const StellarWalletProvider = ({
     async (xdr: string) => {
       if (!kit || !address) throw new Error("Wallet not connected");
 
+      // Bind this signing request to the chain identity active at call time.
+      // If the network switches mid-flight the guard aborts and we discard the
+      // signed XDR rather than returning a signature for a stale chain.
+      const flow = transactionGuard.begin("sign", chainId);
+
       let timeoutId: ReturnType<typeof setTimeout>;
       const timeoutPromise = new Promise<never>((_, reject) => {
         timeoutId = setTimeout(() => {
@@ -543,6 +565,14 @@ export const StellarWalletProvider = ({
           kit.signTransaction(xdr),
           timeoutPromise,
         ]);
+
+        // The network may have changed while the wallet was signing.
+        if (!transactionGuard.isCurrent(flow)) {
+          throw new Error(
+            "Network changed while signing. Please review and confirm the transaction again.",
+          );
+        }
+
         return signedTxXdr;
       } catch (error: unknown) {
         // Classify signing failures so callers can offer retry / reconnect.
@@ -552,6 +582,7 @@ export const StellarWalletProvider = ({
         throw error;
       } finally {
         clearTimeout(timeoutId!);
+        transactionGuard.end(flow);
       }
     },
     [kit, address, surfaceWalletError],
@@ -572,6 +603,7 @@ export const StellarWalletProvider = ({
         connectionStatus,
         selectedWalletId,
         network,
+        chainId,
         setNetwork,
         signTransaction,
         openModal,
