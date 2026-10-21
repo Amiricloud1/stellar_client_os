@@ -45,6 +45,8 @@ compatibility/migration impact in the PR description.
    - `pnpm format:check` checks JS/TS and Rust formatting.
    - `pnpm --filter @fundable/sdk test && pnpm --filter @fundable/sdk build`
    - `pnpm test:contracts` / `pnpm build:contracts` when touching `contracts/`
+   - `pnpm verify:reproducible` when touching `contracts/` (reproducible build check)
+   - `pnpm publish:wasm` when touching release/artifact tooling (provenance check)
    - offline-layer changes: `pnpm --filter @fundable/mobile test`
 4. Open one focused PR against upstream `main` using the PR template. Related
    issues that share a change may be linked in the same PR.
@@ -84,5 +86,10 @@ to the workspace is enough to bring it into the deployment build.
 
 - State compatibility explicitly: additive vs breaking, and the migration path.
 - Contract changes need `cargo test` evidence plus SDK/web impact notes.
+- Contract changes must pass the reproducible-build check; include the
+  normalized wasm hash in the PR validation evidence.
+- Release/artifact changes must include the published `.sha256` and
+  `.provenance.json` for each contract and confirm the checksum matches the
+  reproducible-build hash.
 - Security-sensitive changes (auth, signing, rate limits, uploads) name the
   threat considered and why the change is safe.
