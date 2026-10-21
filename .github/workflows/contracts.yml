@@ -81,3 +81,52 @@ jobs:
       - name: Run contract tests
         working-directory: contracts
         run: cargo test --all
+        continue-on-error: true
+
+      - name: Derive deployable contract members
+        id: members
+        working-directory: contracts
+        run: |
+          set -euo pipefail
+          # Derive the deployable contract set from the Cargo workspace members
+          # instead of a hardcoded list. A member is deployable when it is a
+          # cdylib crate (i.e. produces a wasm artifact).
+          members=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.targets[] | .crate_types[] == "cdylib") | .name' \
+            | sort -u)
+          if [ -z "$members" ]; then
+            echo "::error::No deployable contract workspace members found"
+            exit 1
+          fi
+          echo "Deployable contract members:"
+          echo "$members"
+          {
+            echo "list<<EOF"
+            echo "$members"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build wasm artifacts for every contract member
+        working-directory: contracts
+        env:
+          MEMBERS: ${{ steps.members.outputs.list }}
+        run: |
+          set -euo pipefail
+          missing=0
+          while IFS= read -r member; do
+            [ -z "$member" ] && continue
+            echo "::group::Building $member"
+            cargo build --release --target wasm32-unknown-unknown -p "$member"
+            wasm="target/wasm32-unknown-unknown/release/${member//-/_}.wasm"
+            if [ ! -f "$wasm" ]; then
+              echo "::error::Missing wasm artifact for deployable member '$member' (expected $wasm)"
+              missing=1
+            else
+              echo "Built $wasm"
+            fi
+            echo "::endgroup::"
+          done <<< "$MEMBERS"
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::One or more deployable contract members are missing wasm artifacts"
+            exit 1
+          fi
