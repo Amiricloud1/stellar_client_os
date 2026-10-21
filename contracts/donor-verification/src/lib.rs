@@ -49,6 +49,10 @@ pub enum Error {
     NullifierAlreadyUsed = 6,
     /// The enrollment set is full (tree depth exhausted).
     TreeFull = 7,
+    /// The nullifier has already been revoked.
+    AlreadyRevoked = 8,
+    /// The nullifier was revoked and can no longer be used.
+    NullifierRevoked = 9,
 }
 
 #[contracttype]
@@ -58,6 +62,9 @@ enum DataKey {
     Root,
     LeafCount,
     Nullifier(BytesN<32>),
+    /// Revocation marker: stores only a hash of the off-chain revocation
+    /// evidence, never identity data.
+    Revoked(BytesN<32>),
 }
 
 #[contract]
@@ -132,6 +139,13 @@ impl DonorVerificationContract {
         }
 
         let nullifier_key = DataKey::Nullifier(nullifier.clone());
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Revoked(nullifier.clone()))
+        {
+            return Err(Error::NullifierRevoked);
+        }
         if env.storage().persistent().has(&nullifier_key) {
             return Err(Error::NullifierAlreadyUsed);
         }
@@ -161,6 +175,44 @@ impl DonorVerificationContract {
         env.storage()
             .persistent()
             .has(&DataKey::Nullifier(nullifier))
+    }
+
+    /// Admin-only: revoke an enrolled identity by its nullifier.
+    ///
+    /// Only `evidence_hash` (a digest of the off-chain revocation record)
+    /// is stored; the event carries the nullifier alone so no identity
+    /// payload or evidence content is disclosed on-chain.
+    pub fn revoke_nullifier(
+        env: Env,
+        admin: Address,
+        nullifier: BytesN<32>,
+        evidence_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        let stored_admin = Self::get_admin(&env)?;
+        if admin != stored_admin {
+            return Err(Error::NotAdmin);
+        }
+        admin.require_auth();
+
+        let key = DataKey::Revoked(nullifier.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyRevoked);
+        }
+        env.storage().persistent().set(&key, &evidence_hash);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, STORAGE_TTL_THRESHOLD, STORAGE_TTL_EXTEND_TO);
+
+        env.events().publish((symbol_short!("revoked"),), nullifier);
+        Ok(())
+    }
+
+    /// Returns whether a nullifier has been revoked. Deliberately exposes
+    /// only a boolean, not the stored evidence hash.
+    pub fn is_nullifier_revoked(env: Env, nullifier: BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::Revoked(nullifier))
     }
 
     /// Returns the current Merkle root.

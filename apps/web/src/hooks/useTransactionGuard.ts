@@ -1,10 +1,26 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+    classifyWalletError,
+    type WalletErrorAction,
+    type WalletErrorCategory,
+} from "../lib/walletErrorClassifier";
 
 export type MutationStatus = "idle" | "pending" | "success" | "error";
 
 interface GuardOptions {
     cooldownMs?: number;
+    /** Optional hook invoked with the classified error before it is rethrown. */
+    onError?: (error: unknown, action: WalletErrorAction) => void;
+}
+
+export interface TransactionGuardError {
+    /** The original error thrown by the wrapped fn. */
+    cause: unknown;
+    category: WalletErrorCategory;
+    action: WalletErrorAction;
+    /** Human-readable, safe-to-display message. */
+    message: string;
 }
 
 /**
@@ -35,6 +51,12 @@ interface UseTransactionGuardReturn {
     isSubmitting: boolean;
     isCoolingDown: boolean;
     isGuardActive: boolean;
+    /** Classified failure from the most recent run, cleared on the next run. */
+    lastError: TransactionGuardError | null;
+    /** Safe action recommended for the most recent failure. */
+    errorAction: WalletErrorAction | null;
+    /** Clears the stored error without touching form state. */
+    clearError: () => void;
     runWithGuard: <T>(fn: () => Promise<T>, options?: GuardOptions) => Promise<T | undefined>;
     /** Chain-bound state for in-flight wallet transactions. */
     chainGuard: ChainGuardState;
@@ -90,12 +112,7 @@ export function useTransactionGuard(
 ): UseTransactionGuardReturn {
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [isCoolingDown, setIsCoolingDown] = useState(false);
-    const [chainGuard, setChainGuard] = useState<ChainGuardState>({
-        simulatedChain: null,
-        phase: "idle",
-        abortReason: null,
-        requiresReconfirmation: false,
-    });
+    const [lastError, setLastError] = useState<TransactionGuardError | null>(null);
     const cooldownRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const lockRef = useRef(false);
     const prevStatusRef = useRef<MutationStatus | undefined>(mutationStatus);
@@ -148,72 +165,8 @@ export function useTransactionGuard(
         }
     }, [mutationStatus, isMutationTracked, defaultCooldownMs]);
 
-    const beginChainFlow = useCallback(
-        (chain: ChainIdentity): ChainFlowContext | null => {
-            if (lockRef.current || isSubmitting) {
-                return null;
-            }
-            lockRef.current = true;
-            setIsSubmitting(true);
-            setChainGuard({
-                simulatedChain: { ...chain },
-                phase: "simulating",
-                abortReason: null,
-                requiresReconfirmation: false,
-            });
-
-            let aborted = false;
-
-            const abort = (reason: ChainGuardAbortReason) => {
-                aborted = true;
-                lockRef.current = false;
-                setIsSubmitting(false);
-                setChainGuard({
-                    // Invalidate the simulation: the captured identity is cleared
-                    // so it cannot be reused for signing/confirmation.
-                    simulatedChain: null,
-                    phase: "idle",
-                    abortReason: reason,
-                    requiresReconfirmation: true,
-                });
-            };
-
-            return {
-                simulatedChain: { ...chain },
-                setPhase: (phase: ChainGuardPhase) => {
-                    if (aborted) return;
-                    setChainGuard((prev) => ({ ...prev, phase }));
-                },
-                assertChain: (current: ChainIdentity) => {
-                    if (aborted) return false;
-                    if (!chainIdentitiesEqual(chain, current)) {
-                        abort("network-changed");
-                        return false;
-                    }
-                    return true;
-                },
-                finish: () => {
-                    if (aborted) return;
-                    lockRef.current = false;
-                    setIsSubmitting(false);
-                    setChainGuard({
-                        simulatedChain: null,
-                        phase: "idle",
-                        abortReason: null,
-                        requiresReconfirmation: false,
-                    });
-                },
-            };
-        },
-        [isSubmitting]
-    );
-
-    const acknowledgeReconfirmation = useCallback(() => {
-        setChainGuard((prev) => ({
-            ...prev,
-            abortReason: null,
-            requiresReconfirmation: false,
-        }));
+    const clearError = useCallback(() => {
+        setLastError(null);
     }, []);
 
     const runWithGuard = useCallback(
@@ -223,6 +176,7 @@ export function useTransactionGuard(
             }
             lockRef.current = true;
             setIsSubmitting(true);
+            setLastError(null);
             cooldownOverrideRef.current = options?.cooldownMs;
             try {
                 const result = await fn();
@@ -242,6 +196,20 @@ export function useTransactionGuard(
                     }
                 }
                 return result;
+            } catch (error) {
+                // Map the raw failure to a safe, actionable category. The guard
+                // never mutates caller-owned form state, so inputs are preserved
+                // for retry / network switch / reconnect flows.
+                const classified = classifyWalletError(error);
+                const guardError: TransactionGuardError = {
+                    cause: error,
+                    category: classified.category,
+                    action: classified.action,
+                    message: classified.message,
+                };
+                setLastError(guardError);
+                options?.onError?.(error, classified.action);
+                throw guardError;
             } finally {
                 lockRef.current = false;
                 setIsSubmitting(false);
@@ -254,6 +222,9 @@ export function useTransactionGuard(
         isSubmitting,
         isCoolingDown,
         isGuardActive,
+        lastError,
+        errorAction: lastError?.action ?? null,
+        clearError,
         runWithGuard,
         chainGuard,
         beginChainFlow,

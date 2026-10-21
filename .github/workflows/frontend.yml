@@ -34,6 +34,34 @@ jobs:
         with:
           version: 9
 
+      - name: Derive pnpm cache key
+        id: pnpm-cache-key
+        run: |
+          # Key by lockfile hash, pnpm version, Node version, and runner OS so
+          # a cache miss (cold run) never breaks the build and warm runs reuse
+          # the exact store that produced the lockfile.
+          LOCKFILE_HASH=$(sha256sum pnpm-lock.yaml 2>/dev/null | cut -d' ' -f1 || echo "no-lockfile")
+          KEY="pnpm-store-${RUNNER_OS}-node20-pnpm9-${LOCKFILE_HASH}"
+          echo "key=${KEY}" >> "$GITHUB_OUTPUT"
+          echo "Resolved pnpm cache key: ${KEY}"
+
+      - name: Restore pnpm store cache
+        id: pnpm-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: ${{ steps.pnpm-cache-key.outputs.key }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-node20-pnpm9-
+
+      - name: Report pnpm cache status
+        run: |
+          if [ "${{ steps.pnpm-cache.outputs.cache-hit }}" = "true" ]; then
+            echo "pnpm store cache hit — warm run"
+          else
+            echo "pnpm store cache miss — cold run, installing from registry"
+          fi
+
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
@@ -52,4 +80,17 @@ jobs:
       - name: Lint frontend
         run: pnpm lint
 
-  
+      - name: Run frontend unit and component workflow tests
+        run: |
+          pnpm --filter @fundable/web exec vitest run \
+            src/services/admin-analytics-dashboard.service.test.ts \
+            analytics/page.test.tsx \
+            src/graphql/analytics.service.test.ts \
+            src/lib/__tests__/sanitize-error.test.ts \
+            src/lib/error-reporting.test.ts \
+            src/components/__tests__/responsive-workflows.test.tsx \
+            src/components/organisms/SyncQueueBanner.test.tsx \
+            src/stories/__tests__/storybook.test.tsx
+
+      - name: Build and verify Storybook static assets
+        run: pnpm --filter @fundable/web build-storybook

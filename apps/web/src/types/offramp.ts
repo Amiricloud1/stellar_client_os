@@ -174,7 +174,9 @@ export type PayoutStatus =
     | "confirmed"
     | "completed"
     | "failed"
-    | "expired";
+    | "expired"
+    | "timeout"
+    | "delayed";
 
 export interface QuoteStatusData {
     id: string;
@@ -184,6 +186,8 @@ export interface QuoteStatusData {
     providerMessage: string | null;
     providerId: string;
     payoutCompletedAt: string | null;
+    failureCategory?: SettlementFailureCategory | null;
+    reconciledAt?: string | null;
 }
 
 export interface QuoteStatusResponse {
@@ -191,6 +195,87 @@ export interface QuoteStatusResponse {
     data?: QuoteStatusData;
     error?: string;
 }
+
+// ==================== SETTLEMENT & TRUST BOUNDARY TYPES ====================
+
+export type SettlementTrustBoundary =
+    | "client_to_system"
+    | "system_to_bridge"
+    | "system_to_provider";
+
+export type SettlementFailureCategory =
+    | "quote_expired"
+    | "bridge_timeout"
+    | "provider_rejected"
+    | "provider_transient_error"
+    | "compliance_hold"
+    | "insufficient_liquidity"
+    | "invalid_bank_details"
+    | "system_timeout";
+
+export interface ProviderCallbackPayload {
+    callbackId: string;
+    transactionReference: string;
+    providerId: OfframpProviderId | string;
+    status: PayoutStatus;
+    providerStatus?: string;
+    message?: string;
+    failureCategory?: SettlementFailureCategory;
+    timestamp: string;
+    signature?: string;
+    metadata?: Record<string, unknown>;
+}
+
+export interface SettlementRecord {
+    id: string;
+    transactionReference: string;
+    providerId: string;
+    walletAddress: string;
+    token: string;
+    amount: number;
+    fiatAmount: number;
+    currency: string;
+    bankCode: string;
+    accountNumber: string;
+    bridgeTxHash?: string | null;
+    status: PayoutStatus;
+    failureCategory?: SettlementFailureCategory | null;
+    failureReason?: string | null;
+    quoteExpiresAt: string;
+    createdAt: string;
+    updatedAt: string;
+    completedAt?: string | null;
+    reconciledAt?: string | null;
+    processedCallbacks: string[];
+}
+
+export interface ReconciliationResult {
+    transactionReference: string;
+    previousStatus: PayoutStatus;
+    currentStatus: PayoutStatus;
+    actionTaken: "none" | "transitioned" | "reconciled" | "duplicate_ignored" | "timeout_applied";
+    isDuplicate: boolean;
+    auditTimestamp: string;
+    notes?: string;
+}
+
+export interface DelayedSettlementRecord {
+    transactionReference: string;
+    providerId: string;
+    status: PayoutStatus;
+    createdAt: string;
+    delayedDurationMs: number;
+    attemptCount: number;
+    lastReconciledAt?: string | null;
+}
+
+export const SETTLEMENT_CONFIG = {
+    QUOTE_TTL_MS: 30 * 1000, // 30 seconds for live rate preview
+    OFFRAMP_QUOTE_TTL_MS: 10 * 60 * 1000, // 10 minutes for active offramp order
+    BRIDGE_TIMEOUT_MS: 15 * 60 * 1000, // 15 minutes max for cross-chain bridge
+    SETTLEMENT_POLL_TIMEOUT_MS: 10 * 60 * 1000, // 10 minutes active client polling
+    DELAYED_SETTLEMENT_THRESHOLD_MS: 5 * 60 * 1000, // 5 minutes before flagged as delayed
+} as const;
 
 // ==================== USER LIMITS TYPES ====================
 

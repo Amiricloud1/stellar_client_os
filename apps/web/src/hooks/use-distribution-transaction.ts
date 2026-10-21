@@ -10,10 +10,10 @@ import { SOROBAN_RPC_URL, NETWORK_PASSPHRASE } from '@/lib/constants';
 import { amountToStroops } from '@/utils/amount-validation';
 import { getStellarServerOptions } from '@/utils/rpc-connection-options';
 import {
-  createChainBoundGuard,
-  NetworkChangedError,
-  StaleConfirmationError,
-} from '@/utils/chain-bound-transaction';
+  classifyWalletError,
+  type WalletErrorAction,
+  type WalletErrorClass,
+} from '@/utils/wallet-error-classifier';
 import type { DistributionState } from '@/types/distribution';
 
 const IS_MAINNET = process.env.NEXT_PUBLIC_STELLAR_NETWORK === 'public';
@@ -102,16 +102,74 @@ async function checkSenderBalance(
 }
 
 /**
+ * Recovery state surfaced to the UI after a failed submission.
+ * `state` is the exact form snapshot that failed so callers can preserve
+ * user input and retry without re-entering data.
+ */
+export interface DistributionTransactionError {
+  errorClass: WalletErrorClass;
+  message: string;
+  action: WalletErrorAction;
+  /** Form snapshot captured at submission time; never mutated. */
+  state: DistributionState;
+  tokenAddress: string;
+}
+
+/**
  * Hook for executing a distribution transaction against the Distributor contract.
  * Handles validation, balance checks, wallet signing, and toast notifications.
+ *
+ * On failure the hook classifies the error (wallet / RPC / simulation /
+ * contract) and exposes a recovery action (retry, switch network, reconnect).
+ * Form values are preserved via `lastError.state` so the UI can retry.
  */
 export function useDistributionTransaction() {
-  const { address, signTransaction, networkPassphrase } = useWallet();
+  const { address, signTransaction, connect } = useWallet();
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [lastError, setLastError] = useState<DistributionTransactionError | null>(null);
+
+  const clearError = useCallback(() => setLastError(null), []);
+
+  /**
+   * Runs the recovery action associated with a classified error.
+   * Returns true when the caller should retry the transaction.
+   */
+  const recover = useCallback(
+    async (error: DistributionTransactionError): Promise<boolean> => {
+      switch (error.action) {
+        case 'retry':
+          return true;
+        case 'switch-network':
+          notify.error('Switch your wallet to the correct network, then retry');
+          return false;
+        case 'reconnect':
+          try {
+            await connect();
+            return true;
+          } catch {
+            notify.error('Reconnect failed. Please reconnect your wallet manually.');
+            return false;
+          }
+        default:
+          return false;
+      }
+    },
+    [connect]
+  );
 
   const execute = useCallback(
     async (state: DistributionState, tokenAddress: string): Promise<boolean> => {
+      setLastError(null);
+
       if (!address) {
+        const classified = classifyWalletError(new Error('Wallet not connected'));
+        setLastError({
+          errorClass: classified.errorClass,
+          message: 'Connect your wallet first',
+          action: 'reconnect',
+          state,
+          tokenAddress,
+        });
         notify.error('Connect your wallet first');
         return false;
       }
@@ -252,28 +310,24 @@ export function useDistributionTransaction() {
 
         return true;
       } catch (err) {
-        if (err instanceof NetworkChangedError) {
-          notify.error(
-            'Network changed during the transaction. The flow was aborted — please review and confirm again.'
-          );
-          return false;
-        }
-        if (err instanceof StaleConfirmationError) {
-          notify.error('This confirmation is stale. Please review and confirm the transaction again.');
-          return false;
-        }
+        const classified = classifyWalletError(err);
+        const failure: DistributionTransactionError = {
+          errorClass: classified.errorClass,
+          message: classified.message,
+          action: classified.action,
+          state,
+          tokenAddress,
+        };
+        setLastError(failure);
 
-        const message = err instanceof Error ? err.message : 'Transaction failed';
+        const retry = () => {
+          void execute(state, tokenAddress);
+        };
 
-        // Surface friendly messages for known contract errors
-        if (message.includes('insufficient balance') || message.includes('InsufficientBalance')) {
-          notify.error('Insufficient balance to complete the distribution');
-        } else if (message.includes('no trust') || message.includes('TrustlineMissing')) {
-          notify.error('A recipient is missing a trustline for this token');
-        } else if (message.includes('User declined') || message.includes('rejected')) {
-          notify.error('Transaction rejected by wallet');
+        if (classified.action === 'retry') {
+          notify.error(classified.message, retry);
         } else {
-          notify.error(message, () => execute(state, tokenAddress));
+          notify.error(classified.message);
         }
 
         return false;
@@ -284,5 +338,5 @@ export function useDistributionTransaction() {
     [address, signTransaction, networkPassphrase]
   );
 
-  return { execute, isSubmitting };
+  return { execute, isSubmitting, lastError, clearError, recover };
 }

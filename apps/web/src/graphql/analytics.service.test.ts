@@ -430,3 +430,76 @@ describe("AnalyticsService.getSponsorImpact", () => {
     expect(b.rankingBand).toBe("top_1");
   });
 });
+
+// ── authoritative ledger validation (#82) ────────────────────────────────────
+
+describe("AnalyticsService.getGlobalMetricsWithAuthority (#82)", () => {
+  const fixedNow = 1700005000000;
+
+  it("exposes metric definitions with documented sources and formulas", () => {
+    const svc = new AnalyticsService(makeSource());
+    const defs = svc.getMetricDefinitions();
+    expect(defs.totalStreams.formula).toContain("count(s in streams)");
+    expect(defs.totalVolumeUsd.dataSource).toContain("payment_stream");
+    expect(defs.sponsorImpact.knownFixtureExample.expected).toBe(67);
+  });
+
+  it("returns fresh state when authoritative stream ledger matches computed metrics", async () => {
+    const source: StreamDataSource = {
+      getStreams: async () => STREAMS,
+      getLedgerSnapshot: async () => ({
+        ledgerSequence: 4900100,
+        ledgerClosedAt: fixedNow - 10_000,
+        network: "testnet",
+        streams: {
+          totalStreams: 5,
+          activeStreams: 2,
+          totalVolumeUsd: "455",
+          uniqueAssets: 2,
+        },
+      }),
+    };
+    const svc = new AnalyticsService(source);
+    const result = await svc.getGlobalMetricsWithAuthority("testnet", { now: fixedNow });
+
+    expect(result.authority.state).toBe("fresh");
+    expect(result.authority.isAuthoritative).toBe(true);
+    expect(result.authority.discrepancies).toHaveLength(0);
+  });
+
+  it("returns unavailable when data source does not provide an authoritative ledger snapshot", async () => {
+    const svc = new AnalyticsService(makeSource());
+    const result = await svc.getGlobalMetricsWithAuthority("testnet", { now: fixedNow });
+
+    expect(result.authority.state).toBe("unavailable");
+    expect(result.authority.isAuthoritative).toBe(false);
+    expect(result.authority.reason).toBe("missing_authority");
+  });
+
+  it("returns mismatch when authoritative stream ledger disagrees with computed metrics", async () => {
+    const source: StreamDataSource = {
+      getStreams: async () => STREAMS,
+      getLedgerSnapshot: async () => ({
+        ledgerSequence: 4900101,
+        ledgerClosedAt: fixedNow - 5_000,
+        network: "testnet",
+        streams: {
+          totalStreams: 5,
+          activeStreams: 1, // mismatch: computed is 2
+          totalVolumeUsd: "500", // mismatch: computed is 455
+          uniqueAssets: 2,
+        },
+      }),
+    };
+    const svc = new AnalyticsService(source);
+    const result = await svc.getGlobalMetricsWithAuthority("testnet", { now: fixedNow });
+
+    expect(result.authority.state).toBe("mismatch");
+    expect(result.authority.isAuthoritative).toBe(false);
+    expect(result.authority.discrepancies).toMatchObject([
+      { metric: "activeStreams", actual: 2, expected: 1 },
+      { metric: "totalVolumeUsd", actual: "455", expected: "500" },
+    ]);
+  });
+});
+

@@ -14,66 +14,93 @@ export interface NetworkInfo {
 }
 
 /**
- * Chain identity used to bind wallet flows (simulation, signing,
- * confirmation) to a specific network. Two identities are considered
- * equal only when their chain ids / passphrases match exactly.
+ * Stable, machine-readable signal describing a wallet/RPC network mismatch.
+ *
+ * Consumers (e.g. the web wallet's switch-network recovery action) should
+ * branch on `code` rather than parsing human-readable messages, so the
+ * mismatch can be detected reliably across wallet flows.
  */
-export interface ChainIdentity {
-  /** Stellar network passphrase (the canonical chain id for Stellar). */
-  chainId: string;
-  /** Human readable network name, when known. */
-  friendlyName?: string;
+export const NETWORK_MISMATCH_CODE = "NETWORK_MISMATCH" as const;
+
+export interface NetworkMismatch {
+  code: typeof NETWORK_MISMATCH_CODE;
+  /** Passphrase the wallet is currently configured with. */
+  expectedPassphrase: string;
+  /** Passphrase reported by the RPC server. */
+  actualPassphrase: string;
+  /** Friendly name for the expected network, when known. */
+  expectedFriendlyName?: string;
+  /** Friendly name for the actual network, when known. */
+  actualFriendlyName?: string;
+  /** Human-readable message suitable for display. */
+  message: string;
 }
 
 /**
- * Normalize a raw passphrase into a chain identity.
- * @param passphrase The Stellar network passphrase
- * @param friendlyName Optional friendly name to attach
+ * Resolve a friendly network name from a passphrase.
+ * @param passphrase The network passphrase
+ * @returns Friendly name when the passphrase is recognized
  */
-export function toChainIdentity(
-  passphrase: string,
-  friendlyName?: string
-): ChainIdentity {
-  if (!passphrase || typeof passphrase !== "string") {
-    throw new Error("Cannot build chain identity from empty passphrase");
+export function getFriendlyNetworkName(
+  passphrase: string
+): string | undefined {
+  if (passphrase === Networks.PUBLIC) {
+    return "Mainnet";
   }
-  return { chainId: passphrase, friendlyName };
+  if (passphrase === Networks.TESTNET) {
+    return "Testnet";
+  }
+  if (passphrase === Networks.FUTURENET) {
+    return "Futurenet";
+  }
+  if (passphrase.includes("Standalone")) {
+    return "Standalone";
+  }
+  return undefined;
 }
 
 /**
- * Resolve the active chain identity for an RPC endpoint.
- * Uses the provided passphrase when available, otherwise detects it
- * from the RPC server.
- * @param rpcUrl The Stellar RPC server URL
- * @param providedPassphrase Optional manually provided passphrase
+ * Compare a wallet's configured passphrase against an RPC-reported passphrase.
+ * @param expectedPassphrase Passphrase the wallet is configured with
+ * @param actualPassphrase Passphrase reported by the RPC server
+ * @returns A NetworkMismatch when the passphrases differ, otherwise null
  */
-export async function getChainIdentity(
-  rpcUrl: string,
-  providedPassphrase?: string
-): Promise<ChainIdentity> {
-  if (providedPassphrase) {
-    return toChainIdentity(providedPassphrase);
+export function detectNetworkMismatch(
+  expectedPassphrase: string,
+  actualPassphrase: string
+): NetworkMismatch | null {
+  if (expectedPassphrase === actualPassphrase) {
+    return null;
   }
-  const info = await detectNetworkPassphrase(rpcUrl);
-  return toChainIdentity(info.passphrase, info.friendlyName);
+
+  const expectedFriendlyName = getFriendlyNetworkName(expectedPassphrase);
+  const actualFriendlyName = getFriendlyNetworkName(actualPassphrase);
+
+  return {
+    code: NETWORK_MISMATCH_CODE,
+    expectedPassphrase,
+    actualPassphrase,
+    expectedFriendlyName,
+    actualFriendlyName,
+    message: `Wallet is on ${
+      expectedFriendlyName ?? expectedPassphrase
+    } but the RPC server is on ${
+      actualFriendlyName ?? actualPassphrase
+    }. Switch networks to continue.`,
+  };
 }
 
 /**
- * Compare two chain identities for equality.
- * Missing identities never match, so callers can safely treat a
- * missing baseline as "network changed / unknown".
- * @param a First identity
- * @param b Second identity
- * @returns true when both identities exist and refer to the same chain
+ * Type guard for a NetworkMismatch signal.
+ * @param value Any value to test
+ * @returns True when the value is a NetworkMismatch
  */
-export function isSameChain(
-  a: ChainIdentity | null | undefined,
-  b: ChainIdentity | null | undefined
-): boolean {
-  if (!a || !b) {
-    return false;
-  }
-  return a.chainId === b.chainId;
+export function isNetworkMismatch(value: unknown): value is NetworkMismatch {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as { code?: unknown }).code === NETWORK_MISMATCH_CODE
+  );
 }
 
 /**
@@ -95,22 +122,10 @@ export async function detectNetworkPassphrase(
     const network = await server.getNetwork();
     
     const passphrase = network.passphrase;
-    
-    // Determine friendly name based on known passphrases
-    let friendlyName: string | undefined;
-    if (passphrase === Networks.PUBLIC) {
-      friendlyName = "Mainnet";
-    } else if (passphrase === Networks.TESTNET) {
-      friendlyName = "Testnet";
-    } else if (passphrase === Networks.FUTURENET) {
-      friendlyName = "Futurenet";
-    } else if (passphrase.includes("Standalone")) {
-      friendlyName = "Standalone";
-    }
 
     return {
       passphrase,
-      friendlyName,
+      friendlyName: getFriendlyNetworkName(passphrase),
       protocolVersion: Number(network.protocolVersion),
     };
   } catch (error) {
@@ -152,4 +167,21 @@ export async function checkRpcConnection(
   } catch (error) {
     return null;
   }
+}
+
+/**
+ * Detect the RPC network and compare it against the wallet's passphrase.
+ * @param rpcUrl The Stellar RPC server URL
+ * @param expectedPassphrase Passphrase the wallet is configured with
+ * @returns The detected network info and any mismatch signal
+ */
+export async function checkNetworkMatch(
+  rpcUrl: string,
+  expectedPassphrase: string
+): Promise<{ network: NetworkInfo; mismatch: NetworkMismatch | null }> {
+  const network = await detectNetworkPassphrase(rpcUrl);
+  return {
+    network,
+    mismatch: detectNetworkMismatch(expectedPassphrase, network.passphrase),
+  };
 }

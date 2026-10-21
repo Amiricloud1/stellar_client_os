@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "description": "Fundable Protocol - Stellar blockchain client and smart contracts",
+  "engines": {
+    "node": ">=20.11.0 <21",
+    "pnpm": ">=9.0.0 <10"
+  },
+  "packageManager": "pnpm@9.12.0",
   "scripts": {
     "dev": "pnpm --filter @fundable/web dev",
     "build": "pnpm --filter @fundable/web build",
@@ -14,10 +19,28 @@
     "test:sdk": "pnpm --filter @fundable/sdk test",
     "test:sdk:coverage": "pnpm --filter @fundable/sdk test:coverage",
     "test:sdk:integration": "pnpm --filter @fundable/sdk test:integration",
-    "lint": "pnpm --filter @fundable/web lint",
+    "test:sdk:integration:local": "pnpm --filter @fundable/sdk test:integration:local",
+    "lint": "pnpm run lint:web && pnpm run lint:mobile && pnpm run lint:sdk",
+    "lint:web": "pnpm --filter @fundable/web lint",
+    "lint:mobile": "pnpm --filter @fundable/mobile lint",
+    "lint:sdk": "pnpm --filter @fundable/sdk lint",
+    "lint:contracts": "cargo clippy --manifest-path contracts/Cargo.toml --workspace --all-targets -- -D warnings",
+    "format:check": "pnpm --filter @fundable/sdk exec prettier --check --config .prettierrc.json \"../../apps/web/**/*.{js,jsx,ts,tsx,json,mjs}\" \"../../apps/mobile/**/*.{js,jsx,ts,tsx,json,mjs}\" \"src/**/*.{js,jsx,ts,tsx,json,mjs}\" && cargo fmt --manifest-path contracts/Cargo.toml --all -- --check",
+    "validate:affected": "node scripts/validate-affected.mjs",
+    "test:validation": "node --test scripts/validate-affected.test.mjs",
+    "validate:workspace": "tsx scripts/validate-workspace.ts",
+    "validate:toolchain": "tsx scripts/validate-toolchain.ts",
+    "test:toolchain": "tsx --test scripts/validate-toolchain.test.ts",
     "changeset": "changeset",
+    "changeset:dry-run": "tsx scripts/release-dry-run.ts",
     "changeset:version": "changeset version",
     "changeset:publish": "pnpm --filter @fundable/sdk build && changeset publish"
+  },
+  "toolchain": {
+    "node": ">=20.11.0 <21",
+    "pnpm": ">=9.0.0 <10",
+    "rust": ">=1.79.0 <2",
+    "stellarCli": ">=21.0.0 <22"
   },
   "keywords": [
     "stellar",
@@ -31,6 +54,6 @@
     "url": "https://github.com/Fundable-Protocol/stellar_client.git"
   },
   "devDependencies": {
-    "@changesets/cli": "^2.31.0"
+    "@changesets/cli": "^3.0.3"
   }
 }

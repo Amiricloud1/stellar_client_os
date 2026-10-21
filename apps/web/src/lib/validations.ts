@@ -192,82 +192,113 @@ export const updateCampaignSchema = z.object({
 export type UpdateCampaignFormData = z.infer<typeof updateCampaignSchema>
 
 /**
- * Shared pagination and sorting contract for list endpoints (issue #59).
+ * Upload presign validation (issue #62).
  *
- * Every list endpoint (campaigns, backers, audit, analytics) validates its
- * query parameters through these schemas so ordering is stable, page sizes are
- * bounded, and invalid sort fields are rejected with a typed error.
+ * Presigned upload requests must be bound to an explicit content type, a byte
+ * size ceiling, a safe object-key prefix, and the owning campaign/milestone.
+ * These schemas are shared by the API route and the client so that tampered or
+ * unauthorized payloads are rejected before a signature is ever produced.
  */
-export const DEFAULT_PAGE = 1
-export const DEFAULT_PAGE_SIZE = 20
-export const MAX_PAGE_SIZE = 100
 
-/** Allowlisted sort fields per list resource. Unknown fields are rejected. */
-export const SORT_FIELDS = {
-  campaigns: ["createdAt", "deadline", "goalAmount", "name", "updatedAt"],
-  backers: ["contributedAt", "amount", "backerAddress"],
-  audit: ["timestamp", "action", "actor"],
-  analytics: ["date", "totalRaised", "backerCount", "campaignCount"],
-} as const
+/** MIME types that may be uploaded. Anything else is rejected outright. */
+export const UPLOAD_ALLOWED_MIME_TYPES = [
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+  "application/pdf",
+] as const
 
-export type SortResource = keyof typeof SORT_FIELDS
+export type UploadMimeType = (typeof UPLOAD_ALLOWED_MIME_TYPES)[number]
 
-export const sortDirectionSchema = z.enum(["asc", "desc"])
+/** Hard ceiling for a single upload, in bytes (10 MiB). */
+export const UPLOAD_MAX_BYTES = 10 * 1024 * 1024
 
-export const paginationSchema = z.object({
-  page: z.coerce.number().int().min(1).default(DEFAULT_PAGE),
-  pageSize: z.coerce
-    .number()
-    .int()
-    .min(1)
-    .max(MAX_PAGE_SIZE, `pageSize cannot exceed ${MAX_PAGE_SIZE}`)
-    .default(DEFAULT_PAGE_SIZE),
-})
+/** Minimum accepted declared size; zero-byte uploads are rejected. */
+export const UPLOAD_MIN_BYTES = 1
 
-export type PaginationParams = z.infer<typeof paginationSchema>
+/** Presign URLs may not be requested for longer than this (seconds). */
+export const UPLOAD_MAX_EXPIRY_SECONDS = 15 * 60
 
-/** Typed error raised when a sort field is not in the resource allowlist. */
-export class InvalidSortFieldError extends Error {
-  readonly code = "INVALID_SORT_FIELD"
-  constructor(
-    readonly resource: SortResource,
-    readonly field: string,
-  ) {
-    super(`Invalid sort field "${field}" for ${resource}`)
-    this.name = "InvalidSortFieldError"
-  }
-}
+/** Presign URLs must be valid for at least this long (seconds). */
+export const UPLOAD_MIN_EXPIRY_SECONDS = 30
 
 /**
- * Build a schema that validates pagination plus a resource-scoped sort field
- * and direction. `sortField` defaults to the first allowlisted field.
+ * Object keys must live under a known, non-traversable prefix. The owning
+ * campaign id is appended by the server, never supplied verbatim by clients.
  */
-export function createListQuerySchema<R extends SortResource>(resource: R) {
-  const fields = SORT_FIELDS[resource] as readonly string[]
-  return paginationSchema.extend({
-    sortField: z.enum(fields as [string, ...string[]]).default(fields[0]),
-    sortDirection: sortDirectionSchema.default("desc"),
+export const UPLOAD_KEY_PREFIXES = ["campaigns", "milestones", "evidence"] as const
+
+export type UploadKeyPrefix = (typeof UPLOAD_KEY_PREFIXES)[number]
+
+/** Campaign and milestone identifiers are positive integers. */
+export const uploadOwnerIdSchema = z
+  .number({ invalid_type_error: "Owner id must be a number" })
+  .int("Owner id must be an integer")
+  .positive("Owner id must be positive")
+  .max(Number.MAX_SAFE_INTEGER, "Owner id is out of range")
+
+/** A single path segment: no slashes, dots-only names, or control characters. */
+const SAFE_KEY_SEGMENT_REGEX = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+
+export const uploadKeySegmentSchema = z
+  .string()
+  .min(1, "File name is required")
+  .max(128, "File name cannot exceed 128 characters")
+  .refine((segment) => SAFE_KEY_SEGMENT_REGEX.test(segment), "File name contains unsafe characters")
+  .refine((segment) => segment !== "." && segment !== "..", "File name cannot be a relative path")
+
+export const uploadPresignSchema = z
+  .object({
+    campaignId: uploadOwnerIdSchema,
+    milestoneId: uploadOwnerIdSchema.optional(),
+    prefix: z.enum(UPLOAD_KEY_PREFIXES),
+    fileName: uploadKeySegmentSchema,
+    contentType: z.enum(UPLOAD_ALLOWED_MIME_TYPES, {
+      errorMap: () => ({ message: "Unsupported content type" }),
+    }),
+    size: z
+      .number({ invalid_type_error: "Size must be a number" })
+      .int("Size must be an integer number of bytes")
+      .min(UPLOAD_MIN_BYTES, "File must not be empty")
+      .max(UPLOAD_MAX_BYTES, `File cannot exceed ${UPLOAD_MAX_BYTES} bytes`),
+    expiresIn: z
+      .number({ invalid_type_error: "Expiry must be a number of seconds" })
+      .int("Expiry must be an integer number of seconds")
+      .min(UPLOAD_MIN_EXPIRY_SECONDS, `Expiry must be at least ${UPLOAD_MIN_EXPIRY_SECONDS} seconds`)
+      .max(UPLOAD_MAX_EXPIRY_SECONDS, `Expiry cannot exceed ${UPLOAD_MAX_EXPIRY_SECONDS} seconds`)
+      .default(UPLOAD_MAX_EXPIRY_SECONDS),
   })
-}
+  .strict()
 
-export type ListQueryParams<R extends SortResource> = z.infer<
-  ReturnType<typeof createListQuerySchema<R>>
->
+export type UploadPresignInput = z.infer<typeof uploadPresignSchema>
 
 /**
- * Parse and default list query parameters for a resource. Throws
- * `InvalidSortFieldError` for unknown sort fields and a `ZodError` for other
- * invalid input (e.g. pageSize above the maximum).
+ * Server-side authorization envelope. `ownerAddress` is the authenticated
+ * caller and must match the campaign owner; it is never trusted from the body.
  */
-export function parseListQuery<R extends SortResource>(
-  resource: R,
-  input: unknown,
-): ListQueryParams<R> {
-  const raw = (input ?? {}) as Record<string, unknown>
-  const fields = SORT_FIELDS[resource] as readonly string[]
-  if (raw.sortField !== undefined && !fields.includes(String(raw.sortField))) {
-    throw new InvalidSortFieldError(resource, String(raw.sortField))
-  }
-  return createListQuerySchema(resource).parse(raw) as ListQueryParams<R>
+export const uploadPresignAuthorizationSchema = z
+  .object({
+    ownerAddress: z
+      .string()
+      .min(1, "Owner address is required")
+      .refine((address) => StellarService.validateStellarAddress(address), "Invalid owner address"),
+  })
+  .strict()
+
+export type UploadPresignAuthorization = z.infer<typeof uploadPresignAuthorizationSchema>
+
+/**
+ * Build the canonical object key for a validated presign request. The campaign
+ * id is always injected by the server so a client cannot target another
+ * campaign's namespace.
+ */
+export function buildUploadObjectKey(
+  input: Pick<UploadPresignInput, "prefix" | "campaignId" | "milestoneId" | "fileName">,
+): string {
+  const parts: string[] = [input.prefix, String(input.campaignId)]
+  if (input.milestoneId !== undefined) parts.push(String(input.milestoneId))
+  parts.push(input.fileName)
+  return parts.join("/")
 }
 

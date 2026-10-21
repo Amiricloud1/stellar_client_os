@@ -68,6 +68,41 @@ export type TransactionFetcher = (
   transactionHash: string,
 ) => Promise<ChainTransactionRecord | null>;
 
+/**
+ * Coarse receipt state used by the UI and by E2E specs (issue #72).
+ *
+ * - `issued`: the receipt exists but no payment hash has been supplied yet.
+ * - `pending`: a transaction hash was supplied but Horizon has not seen it.
+ * - `verified`: the transaction exists and matches the receipt commitment.
+ * - `failed`: the transaction exists but does not match (wrong memo, failed tx, …).
+ */
+export type SponsorshipReceiptState = "issued" | "pending" | "verified" | "failed";
+
+/** A receipt plus its current verification state, as rendered by the receipt view. */
+export interface SponsorshipReceiptStatus {
+  state: SponsorshipReceiptState;
+  receipt: SponsorshipReceipt;
+  summary: SponsorshipReceiptSummary;
+  /** Present once a transaction hash has been supplied. */
+  transactionHash?: string;
+  /** Present once verification has run. */
+  verification?: ReceiptVerification;
+}
+
+/** Map a verification result onto the coarse state the UI renders. */
+export function toSponsorshipReceiptState(
+  verification: ReceiptVerification | undefined,
+): SponsorshipReceiptState {
+  if (verification === undefined) {
+    return "issued";
+  }
+  if (verification.verified) {
+    return "verified";
+  }
+  // A missing transaction is not a failure — it may simply not be on-ledger yet.
+  return verification.reason === "transaction_not_found" ? "pending" : "failed";
+}
+
 function isNotFound(error: unknown): boolean {
   if (error === null || typeof error !== "object") {
     return false;
@@ -164,4 +199,49 @@ export async function verifyCampaignSponsorshipReceipt(
   const hash = assertTransactionHash(transactionHash);
   const transaction = await fetchTransaction(hash);
   return verifySponsorshipReceipt(receipt, transaction, hash);
+}
+
+/**
+ * Verify a receipt and return the coarse state the UI renders (issue #72).
+ *
+ * This is the entry point the receipt view and the E2E specs use: it never
+ * throws for a missing transaction, and it reports `pending` rather than
+ * `failed` so a sponsor is not told their payment failed while Horizon is
+ * simply behind.
+ */
+export async function getCampaignSponsorshipReceiptStatus(
+  receipt: SponsorshipReceipt,
+  transactionHash: string | undefined,
+  fetchTransaction: TransactionFetcher = defaultTransactionFetcher(),
+): Promise<SponsorshipReceiptStatus> {
+  const summary = summarizeSponsorshipReceipt(receipt);
+  if (transactionHash === undefined) {
+    return { state: "issued", receipt, summary };
+  }
+  const verification = await verifyCampaignSponsorshipReceipt(
+    receipt,
+    transactionHash,
+    fetchTransaction,
+  );
+  return {
+    state: toSponsorshipReceiptState(verification),
+    receipt,
+    summary,
+    transactionHash,
+    verification,
+  };
+}
+
+/**
+ * Build a deterministic transaction fetcher from a fixed set of records.
+ *
+ * E2E specs and unit tests use this so verification never depends on live
+ * funds or network state: a hash present in `records` resolves to that record,
+ * anything else resolves to `null` (i.e. `pending`).
+ */
+export function createFixtureTransactionFetcher(
+  records: readonly ChainTransactionRecord[],
+): TransactionFetcher {
+  const byHash = new Map(records.map((record) => [record.hash, record]));
+  return async (transactionHash: string) => byHash.get(transactionHash) ?? null;
 }

@@ -2,33 +2,136 @@ name: Contracts CI
 
 on: [push, pull_request]
 
-jobs:
-  test: 
-    runs-on: ubuntu-latest
+env:
+  # Canonical toolchain pins. Keep in sync with .tool-versions / package.json.
+  NODE_VERSION: "20.11.1"
+  PNPM_VERSION: "9.1.0"
+  RUST_VERSION: "1.78.0"
+  STELLAR_CLI_VERSION: "23.0.1"
 
-    steps: 
+jobs:
+  toolchain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Install Stellar CLI
+        uses: stellar/stellar-cli@v23.0.1
+
+      - name: Verify toolchain versions
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            local name="$1" expected="$2" actual="$3"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::Toolchain mismatch for $name: expected '$expected' but found '$actual'. Update your local install or the pin in .github/workflows/contracts.yml."
+              fail=1
+            else
+              echo "OK: $name $actual"
+            fi
+          }
+          check node "$NODE_VERSION" "$(node --version | sed 's/^v//')"
+          check pnpm "$PNPM_VERSION" "$(pnpm --version)"
+          check rust "$RUST_VERSION" "$(rustc --version | awk '{print $2}')"
+          check stellar "$STELLAR_CLI_VERSION" "$(stellar version | awk '{print $2}')"
+          exit $fail
+
+  test:
+    runs-on: ubuntu-latest
+    needs: toolchain
+
+    steps:
       - name: checkout repo
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
 
       - name: Install Stellar cli
         uses: stellar/stellar-cli@v23.0.1
 
-      - name: Cache Cargo 
+      - name: Cache Cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('contracts/**/Cargo.toml') }}-wasm32-unknown-unknown
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml') }}-wasm32-unknown-unknown-
+            cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml') }}-
+            cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
+            cargo-${{ runner.os }}-
 
       - name: Run contract tests
         working-directory: contracts
         run: cargo test --all
         continue-on-error: true
 
+      - name: Derive deployable contract members
+        id: members
+        working-directory: contracts
+        run: |
+          set -euo pipefail
+          # Derive the deployable contract set from the Cargo workspace members
+          # instead of a hardcoded list. A member is deployable when it is a
+          # cdylib crate (i.e. produces a wasm artifact).
+          members=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.targets[] | .crate_types[] == "cdylib") | .name' \
+            | sort -u)
+          if [ -z "$members" ]; then
+            echo "::error::No deployable contract workspace members found"
+            exit 1
+          fi
+          echo "Deployable contract members:"
+          echo "$members"
+          {
+            echo "list<<EOF"
+            echo "$members"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build wasm artifacts for every contract member
+        working-directory: contracts
+        env:
+          MEMBERS: ${{ steps.members.outputs.list }}
+        run: |
+          set -euo pipefail
+          missing=0
+          while IFS= read -r member; do
+            [ -z "$member" ] && continue
+            echo "::group::Building $member"
+            cargo build --release --target wasm32-unknown-unknown -p "$member"
+            wasm="target/wasm32-unknown-unknown/release/${member//-/_}.wasm"
+            if [ ! -f "$wasm" ]; then
+              echo "::error::Missing wasm artifact for deployable member '$member' (expected $wasm)"
+              missing=1
+            else
+              echo "Built $wasm"
+            fi
+            echo "::endgroup::"
+          done <<< "$MEMBERS"
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::One or more deployable contract members are missing wasm artifacts"
+            exit 1
+          fi

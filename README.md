@@ -59,7 +59,8 @@ pnpm dev
 
 The web app starts at http://localhost:3000. Connect a wallet (e.g. Freighter) to interact with the contracts on testnet.
 
-> Need more detail? See [docs/getting-started.md](docs/getting-started.md) and [scripts/README.md](scripts/README.md).
+> For the unified setup guide, step-by-step outputs, and troubleshooting, see [QUICKSTART.md](QUICKSTART.md) and [docs/getting-started.md](docs/getting-started.md).  
+> For the 15-contract inventory and trust boundaries, see [docs/architecture.md](docs/architecture.md).
 
 Stellar client and smart contracts for the Fundable Protocol – a decentralized payment platform enabling seamless Web3 payments, streaming, and subscriptions on the Stellar blockchain.
 
@@ -189,6 +190,23 @@ pnpm build:contracts
 pnpm test:contracts
 ```
 
+### Contract Artifact Builds
+
+`pnpm build:contracts` derives the deployable contract set directly from the
+Cargo workspace members declared in `contracts/Cargo.toml` — there is no
+hardcoded two-contract list. Every workspace member that produces a deployable
+wasm is built and its artifact is verified.
+
+The build **fails** when:
+
+- a deployable workspace member is omitted from the artifact set, or
+- a deployable member's `.wasm` artifact is missing after the build.
+
+When you add a new contract crate to the workspace, it is picked up
+automatically; no build-script edit is required. If a member is intentionally
+non-deployable (e.g. a shared library crate), mark it as such in the workspace
+metadata so the build does not expect a wasm for it.
+
 ## 💡 Usage Examples
 
 ### 🌌 Horizon Client (Classic Stellar)
@@ -232,129 +250,6 @@ const client = new PaymentStreamClient({
 
 async function createNewStream() {
   // 1. Prepare the stream creation transaction
-  const tx = await client.createStream({
-    sender: 'GAAA...',
-    recipient: 'GBBB...',
-    token: 'CDDD...', // Token contract address
-    total_amount: 1000000000n, // 100 tokens (assuming 7 decimals)
-    initial_amount: 0n,
-    start_time: BigInt(Math.floor(Date.now() / 1000)),
-    end_time: BigInt(Math.floor(Date.now() / 1000) + 86400 * 30), // 30 days duration
-  });
+  const tx = a
 
-  // 2. Sign, send, and wait for confirmation
-  const result = await signAndWait(
-    tx,
-    'https://soroban-testnet.stellar.org',
-    async (xdr) => {
-      // Logic to sign XDR with wallet (e.g., Freighter)
-      // return wallet.signTransaction(xdr);
-      return 'signed_xdr_here';
-    }
-  );
-
-  console.log(`Stream created successfully! Hash: ${result.hash}`);
-  console.log(`Stream ID: ${result.result}`);
-}
-```
-
-### 🔐 S3 Presigned Uploads (Milestone Proof Photos)
-
-`POST /api/presign-upload` generates a short-lived AWS S3 pre-signed PUT URL so clients can upload milestone proof photos directly to a **private** evidence bucket without exposing credentials. Signing uses AWS Signature V4 and is implemented dependency-free in `apps/web/src/lib/s3`.
-
-Request:
-
-```bash
-curl -X POST http://localhost:3000/api/presign-upload \
-  -H "Content-Type: application/json" \
-  -d '{"campaignId":"42","milestoneId":"1","contentType":"image/jpeg"}'
-```
-
-Response (`200`):
-
-```json
-{
-  "url": "https://fundable-evidence.s3.us-east-1.amazonaws.com/evidence/42/1/<uuid>.jpg?X-Amz-Algorithm=...&X-Amz-Signature=...",
-  "key": "evidence/42/1/<uuid>.jpg",
-  "contentType": "image/jpeg",
-  "expiresAt": 1712000000,
-  "requestId": "..."
-}
-```
-
-Then `PUT` the file bytes to `url` with `Content-Type: image/jpeg`. URLs expire after `S3_PRESIGN_EXPIRES_SECONDS` (default `300`).
-
-Allowed content types: `image/jpeg`, `image/png`, `image/webp`, `image/heic`, `application/pdf`.
-
-Required environment variables (see `.env.example`): `AWS_REGION`, `AWS_S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`; optional `AWS_SESSION_TOKEN` (temporary STS credentials) and `S3_PRESIGN_EXPIRES_SECONDS` (60–900). The IAM user needs only `s3:PutObject` on the evidence bucket.
-
-### 🌿 Planter Profile & Referral Commission (5 XLM Bonus)
-
-Planters can access their profile at `/profile` to view their personal identity, track metrics, and manage their unique embedded referral link (`https://fundable.network/?ref=<address>`).
-
-- **Commission:** Planters earn an instant **5 XLM bonus** (`50,000,000` stroops) for every new sponsor who joins via their referral link and completes their first tree sponsorship.
-- **Sharing & Tracking:** Includes 1-click copy with feedback, dynamic QR code generation, direct social sharing (X/Twitter, Telegram, WhatsApp), and real-time monthly quota tracking (up to 10 rewards/month).
-
-### ⚡ Public API Rate Limits & Tier-Based Pricing
-
-Fundable enforces a sliding-window rate limiter backed by Redis to protect public endpoints while offering scalable tiers:
-
-| Tier | Daily Limit | Monthly Price (USD) | Burst Limit | Recommended For |
-|---|---|---|---|---|
-| **Free Tier** | **100 req / day** | **$0.00** | 10 req / min | Development, indie planters, testing |
-| **Paid Tier 1** | **1,000 req / day** | **$10.00 / mo** | 60 req / min | Production dApps, community bots |
-| **Paid Tier 2** | **10,000 req / day** | **$50.00 / mo** | 300 req / min | High-volume indexers, analytics, enterprise |
-| **Enterprise** | **100,000+ req / day** | **Custom ($250+)** | 1,000+ req / min | Institutional partners, registries |
-
-- For complete integration guides, authentication headers (`Authorization: Bearer <key>` or `X-API-Key`), standard response headers (`RateLimit-*`), and 429 error handling, see **[docs/rate-limits.md](docs/rate-limits.md)** and the **[OpenAPI Specification](docs/openapi.yaml)**.
-
-## 📦 Packages
-
-### `apps/web`
-Next.js frontend application for interacting with Fundable on Stellar.
-
-### `contracts/payment-stream`
-Soroban contract for creating and managing payment streams with:
-- Stream creation with linear vesting
-- Withdraw, pause, resume, cancel functionality
-- Multi-token support
-
-### `contracts/distributor`
-Soroban contract for token distributions:
-- Equal distribution across recipients
-- Weighted distribution with custom amounts
-
-### `contracts/campaign`
-Soroban contract for on-chain fundraising campaigns:
-- Campaign creation with funding goals and expiration
-- Milestone-based payout approvals
-- Emergency pause and refund flows
-- Multi-token contribution support
-
-### `contracts/campaign-diversity`
-Soroban contract that scores a campaign's tree planting for biodiversity:
-- `0 .. 10000` diversity score from verified species coverage and evenness
-- Simpson-index evenness factor, so a monoculture scores `0`
-- Pending/verified planting lifecycle, and carbon-credit screening
-- See [docs/contracts/campaign-diversity.md](docs/contracts/campaign-diversity.md)
-
-### `packages/sdk`
-TypeScript SDK for interacting with the deployed contracts.
-
-## 🔗 Related Repositories
-
-- [fundable](https://github.com/Fundable-Protocol/fundable) - Starknet smart contracts
-- [evm_client](https://github.com/Fundable-Protocol/evm_client) - EVM client
-- [backend-main](https://github.com/Fundable-Protocol/backend-main) - Backend API
-
-## Workflow badges
-- ![Contracts CI](https://github.com/Fundable-Protocol/stellar_client/actions/workflows/contracts.yml/badge.svg)
-
-- ![Frontend CI](https://github.com/Fundable-Protocol/stellar_client/actions/workflows/frontend.yml/badge.svg)
-
-- ![Testnet Deploy](https://github.com/Fundable-Protocol/stellar_client/actions/workflows/deploy-testnet.yml/badge.svg)
-
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) for details.
+/* … truncated 5660 chars — edit only what you need near the top … */

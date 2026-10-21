@@ -2,7 +2,11 @@ import { QueryClient, QueryKey, useMutation, useQueryClient } from '@tanstack/re
 import toast from 'react-hot-toast';
 import { createStream } from '@/lib/api';
 import { useWallet } from '@/providers/StellarWalletProvider';
-import { useTransactionGuard } from '@/hooks/use-transaction-guard';
+import {
+    classifyWalletError,
+    getWalletErrorRecovery,
+    type WalletErrorRecovery,
+} from '@/lib/wallet-errors';
 
 type CreateStreamInput = Omit<Parameters<typeof createStream>[0], 'sender' | 'signTransaction'> & {
     sender?: string;
@@ -10,6 +14,14 @@ type CreateStreamInput = Omit<Parameters<typeof createStream>[0], 'sender' | 'si
 
 interface CreateStreamMutationContext {
     previousStreams: Array<[QueryKey, unknown]>;
+    recovery: WalletErrorRecovery;
+}
+
+export interface CreateStreamErrorState {
+    message: string;
+    recovery: WalletErrorRecovery;
+    /** The input that failed, preserved so the form can be repopulated on retry. */
+    input: CreateStreamInput;
 }
 
 function restorePreviousStreams(
@@ -32,7 +44,7 @@ export function useCreateStream() {
     const { address, signTransaction } = useWallet();
     const transactionGuard = useTransactionGuard();
 
-    return useMutation({
+    return useMutation<Awaited<ReturnType<typeof createStream>>, unknown, CreateStreamInput, CreateStreamMutationContext>({
         mutationFn: (params: CreateStreamInput) => {
             const sender = params.sender || address;
             if (!sender) {
@@ -70,22 +82,33 @@ export function useCreateStream() {
                 // Silently fail optimistic update
             }
 
-            return { previousStreams };
+            return {
+                previousStreams,
+                recovery: getWalletErrorRecovery(classifyWalletError(undefined)),
+            };
         },
-        onError: (error, _newStream, context) => {
+        onError: (error, newStream, context) => {
             const restored = restorePreviousStreams(queryClient, context?.previousStreams);
             if (!restored) {
                 queryClient.invalidateQueries({ queryKey: ['streams'] });
             }
 
-            if (transactionGuard.isChainChangedError(error)) {
-                toast.error('Network changed. Please review and confirm the stream again.');
-                return;
-            }
+            const recovery = getWalletErrorRecovery(classifyWalletError(error));
+            const errorState: CreateStreamErrorState = {
+                message: recovery.message,
+                recovery,
+                input: newStream,
+            };
 
-            toast.error('Failed to create stream. Refreshing latest data.');
+            // Preserve the failed input so callers can repopulate the form and retry.
+            queryClient.setQueryData(['create-stream', 'error'], errorState);
+
+            toast.error(recovery.message);
         },
-        onSettled: () => {
+        onSettled: (_data, error) => {
+            if (!error) {
+                queryClient.removeQueries({ queryKey: ['create-stream', 'error'] });
+            }
             queryClient.invalidateQueries({ queryKey: ['streams'] });
         },
     });

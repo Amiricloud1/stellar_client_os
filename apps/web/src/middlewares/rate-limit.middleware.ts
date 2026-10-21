@@ -37,8 +37,16 @@ import {
   createRateLimiter,
   buildRateLimitHeaders,
   resolveCampaignApiTier,
+  resolveRouteClassPolicy,
   type RateLimitOptions,
+  type RouteSensitivityClass,
 } from "@/lib/rate-limit";
+import {
+  REQUEST_ID_HEADER,
+  resolveRequestId,
+  buildErrorResponse,
+  logWithRequestId,
+} from "@/lib/api/errors";
 
 // ── IP extraction ─────────────────────────────────────────────────────────────
 
@@ -77,7 +85,8 @@ function getSkipIps(): Set<string> {
 
 /**
  * Check whether a request should be rate-limited.
- * Returns `null` if allowed, or a `NextResponse` (429) if rejected.
+ * Returns `null` if allowed, or a `NextResponse` (429 when rate-limited,
+ * 503 when a fail-closed sensitive route rejects due to a Redis outage).
  */
 export async function checkRateLimit(
   req: NextRequest,
@@ -92,17 +101,19 @@ export async function checkRateLimit(
   const headers = buildRateLimitHeaders(result);
 
   if (!result.allowed) {
-    return NextResponse.json(
-      {
-        error: "Too many requests",
-        code: "RATE_LIMIT_EXCEEDED",
-        retryAfter: headers["Retry-After"],
-      },
-      {
-        status: 429,
-        headers,
-      }
-    );
+    const requestId = resolveRequestId(req);
+    logWithRequestId(requestId, "warn", "rate_limit_exceeded", {
+      ip,
+      retryAfter: headers["Retry-After"],
+    });
+    return buildErrorResponse({
+      code: "RATE_LIMIT_EXCEEDED",
+      message: "Too many requests",
+      status: 429,
+      requestId,
+      headers,
+      details: { retryAfter: headers["Retry-After"] },
+    });
   }
 
   return null;
@@ -128,49 +139,101 @@ export function withRateLimit(
   return async (req: NextRequest): Promise<NextResponse> => {
     const limited = await checkRateLimit(req, limiter);
     if (limited) return limited;
-    return handler(req);
+    const response = await handler(req);
+    // Propagate the correlation ID on successful responses as well.
+    const requestId = resolveRequestId(req);
+    response.headers.set(REQUEST_ID_HEADER, requestId);
+    return response;
   };
 }
 
-type CampaignRouteHandler = (req: Request, ...args: any[]) => Promise<Response> | Response;
+type CampaignRouteHandler = (req: Request, ...args: unknown[]) => Promise<Response> | Response;
 export function withCampaignApiRateLimit(handler: CampaignRouteHandler): CampaignRouteHandler {
   const redis = getRedisClient();
-  return async (req: Request, ...args: any[]): Promise<Response> => {
+  return async (req: Request, ...args: unknown[]): Promise<Response> => {
     const nextReq = req as NextRequest;
     const { identity, tier } = extractCampaignApiIdentity(req);
     if (getSkipIps().has(extractIp(nextReq))) return handler(req, ...args);
-    const result = await new RateLimiter(redis, { limit: tier.hourlyLimit, windowMs: tier.windowMs, keyPrefix: "rl:campaign-api" }).check(identity);
+    const isMutation = req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS";
+    const result = await new RateLimiter(redis, {
+      limit: tier.hourlyLimit,
+      windowMs: tier.windowMs,
+      keyPrefix: "rl:campaign-api",
+      routeClass: isMutation ? "standard-write" : "public-read",
+    }).check(identity);
     const headers = buildRateLimitHeaders(result);
-    if (!result.allowed) return NextResponse.json({ error: "Too many requests", code: "RATE_LIMIT_EXCEEDED", tier: tier.id, retryAfter: headers["Retry-After"] }, { status: 429, headers });
-    return handler(req, ...args);
+    if (!result.allowed) {
+      const requestId = resolveRequestId(req);
+      logWithRequestId(requestId, "warn", "rate_limit_exceeded", {
+        identity,
+        tier: tier.id,
+        retryAfter: headers["Retry-After"],
+      });
+      return buildErrorResponse({
+        code: "RATE_LIMIT_EXCEEDED",
+        message: "Too many requests",
+        status: 429,
+        requestId,
+        headers,
+        details: { tier: tier.id, retryAfter: headers["Retry-After"] },
+      });
+    }
+    const response = await handler(req, ...args);
+    response.headers.set(REQUEST_ID_HEADER, resolveRequestId(req));
+    return response;
   };
 }
 
-// ── Default limiters for public submission endpoints ─────────────────────────
+// ── Default limiters for public submission & sensitive endpoints ─────────────
 
 let _streamLimiter: RateLimiter | null = null;
 let _submitLimiter: RateLimiter | null = null;
 
-/** 30 stream-creation requests per minute per IP */
+/** 30 stream-creation requests per minute per IP (fallback-memory on Redis outage) */
 export function getStreamLimiter(): RateLimiter {
   if (!_streamLimiter) {
     _streamLimiter = new RateLimiter(getRedisClient(), {
       limit: Number(process.env.RATE_LIMIT_STREAM_MAX ?? 30),
       windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS ?? 60_000),
       keyPrefix: "rl:stream",
+      routeClass: "standard-write",
     });
   }
   return _streamLimiter;
 }
 
-/** 10 payment-submission requests per minute per IP */
+/** 10 payment-submission requests per minute per IP (fail-closed on Redis outage) */
 export function getSubmitLimiter(): RateLimiter {
   if (!_submitLimiter) {
     _submitLimiter = new RateLimiter(getRedisClient(), {
       limit: Number(process.env.RATE_LIMIT_SUBMIT_MAX ?? 10),
       windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS ?? 60_000),
       keyPrefix: "rl:submit",
+      routeClass: "financial-submission",
     });
   }
   return _submitLimiter;
 }
+
+/** Create a rate limiter pre-configured for a specific route sensitivity class. */
+export function createRouteClassLimiter(
+  routeClass: RouteSensitivityClass,
+  redis = getRedisClient(),
+  overrides?: Partial<RateLimitOptions>
+): RateLimiter {
+  const policy = resolveRouteClassPolicy(routeClass);
+  return new RateLimiter(redis, {
+    limit: policy.defaultLimit,
+    windowMs: policy.defaultWindowMs,
+    keyPrefix: policy.keyPrefix,
+    routeClass,
+    failurePolicy: policy.failurePolicy,
+    ...overrides,
+  });
+}
+
+export function resetMiddlewareLimitersForTests(): void {
+  _streamLimiter = null;
+  _submitLimiter = null;
+}
+

@@ -1,0 +1,99 @@
+name: Quality Gates
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  web:
+    name: Web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 9
+      - run: pnpm install --frozen-lockfile
+      - name: Configure frontend environment
+        run: |
+          node -e "
+            const fs = require('fs');
+            const deployments = JSON.parse(fs.readFileSync('deployments/testnet.json', 'utf8'));
+            fs.writeFileSync('apps/web/.env.local', [
+              'NEXT_PUBLIC_PAYMENT_STREAM_CONTRACT_ID=' + deployments.payment_stream,
+              'NEXT_PUBLIC_DISTRIBUTOR_CONTRACT_ID=' + deployments.distributor,
+            ].join('\n'));
+          "
+      - run: pnpm validate:affected --area web
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_EVENT_BEFORE_SHA: ${{ github.event.before }}
+
+  mobile:
+    name: Mobile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 9
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm validate:affected --area mobile
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_EVENT_BEFORE_SHA: ${{ github.event.before }}
+
+  sdk:
+    name: SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 9
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:validation
+      - run: pnpm validate:affected --area sdk
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_EVENT_BEFORE_SHA: ${{ github.event.before }}
+
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contracts/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('contracts/Cargo.toml', 'contracts/**/Cargo.toml') }}
+      - run: node scripts/validate-affected.mjs --area rust
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_EVENT_BEFORE_SHA: ${{ github.event.before }}

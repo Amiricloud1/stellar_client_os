@@ -2,13 +2,20 @@ import { QueryClient, QueryKey, useMutation, useQueryClient } from '@tanstack/re
 import toast from 'react-hot-toast';
 import { distribute } from '@/lib/api';
 import { useWallet } from '@/providers/StellarWalletProvider';
-import { useChainGuard } from '@/hooks/use-chain-guard';
+import {
+    classifyWalletError,
+    type WalletErrorAction,
+} from '@/lib/wallet-error-classifier';
 import { createBatches } from '../../../../packages/sdk/src/utils/batchDistribution';
 
 type DistributeInput = Parameters<typeof distribute>[0];
 
 interface DistributeMutationContext {
     previousStreams: Array<[QueryKey, unknown]>;
+    /** Snapshot of the submitted form values so the form can be restored on failure. */
+    formValues: DistributeInput;
+    /** Classified failure action, populated in onError for consumers (e.g. retry UI). */
+    errorAction?: WalletErrorAction;
 }
 
 function isChainChangedError(error: unknown): boolean {
@@ -94,7 +101,7 @@ export function useDistribute() {
                 signTransaction,
             });
         },
-        onMutate: async (): Promise<DistributeMutationContext> => {
+        onMutate: async (variables: DistributeInput): Promise<DistributeMutationContext> => {
             const previousStreams = queryClient.getQueriesData({
                 queryKey: ['streams'],
             });
@@ -105,21 +112,44 @@ export function useDistribute() {
                 // Silently fail cache snapshot
             }
 
-            return { previousStreams };
+            return { previousStreams, formValues: variables };
         },
         onError: (error, _variables, context) => {
             const restored = restorePreviousStreams(queryClient, context?.previousStreams);
             if (!restored) {
                 queryClient.invalidateQueries({ queryKey: ['streams'] });
             }
-            if (isChainChangedError(error)) {
-                toast.error('Network changed. Distribution aborted; please review and confirm again.');
-                return;
+
+            const action = classifyWalletError(error);
+            if (context) {
+                context.errorAction = action;
             }
-            toast.error('Distribution failed. Refreshing latest data.');
+
+            switch (action.kind) {
+                case 'wallet_disconnected':
+                    toast.error('Wallet disconnected. Reconnect your wallet and retry.');
+                    break;
+                case 'wrong_network':
+                    toast.error('Wrong network selected. Switch networks and retry.');
+                    break;
+                case 'user_rejected':
+                    toast.error('Transaction rejected in wallet. Your form values were kept.');
+                    break;
+                case 'insufficient_funds':
+                    toast.error('Insufficient funds. Adjust the amounts and retry.');
+                    break;
+                case 'simulation_failed':
+                    toast.error('Simulation failed. Review the transaction and retry.');
+                    break;
+                default:
+                    toast.error('Distribution failed. Refreshing latest data.');
+                    break;
+            }
         },
         onSettled: () => {
             queryClient.invalidateQueries({ queryKey: ['streams'] });
         },
     });
 }
+
+export type { DistributeMutationContext };

@@ -3,9 +3,10 @@ import toast from 'react-hot-toast';
 import { withdraw } from '@/lib/api';
 import { useWallet } from '@/providers/StellarWalletProvider';
 import {
-    ChainIdentityMismatchError,
-    useChainBoundTransaction,
-} from '@/hooks/use-chain-bound-transaction';
+    classifyWalletError,
+    getWalletErrorRecovery,
+    type WalletErrorRecovery,
+} from '@/lib/wallet-errors';
 
 type WithdrawInput = Parameters<typeof withdraw>[0];
 
@@ -14,6 +15,13 @@ interface WithdrawMutationContext {
     streamQueryKey?: QueryKey;
     previousStream?: unknown;
     chainGuard?: { assertCurrentChain: () => void };
+}
+
+export interface WithdrawErrorState {
+    message: string;
+    recovery: WalletErrorRecovery;
+    /** Form values captured at failure time so the UI can restore them. */
+    formValues?: WithdrawInput;
 }
 
 function restorePreviousStreams(
@@ -73,7 +81,7 @@ export function useWithdraw() {
 
             return { previousStreams, streamQueryKey, previousStream };
         },
-        onError: (_error, variables, context) => {
+        onError: (error, variables, context) => {
             const restoredStreams = restorePreviousStreams(queryClient, context?.previousStreams);
             let restoredStreamDetails = false;
 
@@ -89,22 +97,35 @@ export function useWithdraw() {
                 }
             }
 
-            if (_error instanceof ChainIdentityMismatchError) {
-                // Network switched mid-flight: the flow is stale and must be
-                // re-confirmed against the new chain before retrying.
-                toast.error('Network changed. Please review and confirm the withdrawal again.');
-            }
+            // Classify the failure and surface a safe, actionable message. Form
+            // values are preserved via the mutation's `variables` so the caller
+            // can repopulate the form without losing user input.
+            const classified = classifyWalletError(error);
+            const recovery = getWalletErrorRecovery(classified);
+            toast.error(recovery.message);
         },
         onSettled: (_data, _error, variables) => {
-            // Only show error toast on final failure (after all retries)
-            if (_error && !(_error instanceof ChainIdentityMismatchError)) {
-                toast.error('Withdraw failed. Refreshing latest data.');
-            }
-
             queryClient.invalidateQueries({ queryKey: ['streams'] });
             if (typeof variables?.streamId === 'number') {
                 queryClient.invalidateQueries({ queryKey: ['stream', variables.streamId] });
             }
         },
     });
+}
+
+/**
+ * Derive a recoverable error state from a withdraw mutation error, including
+ * the form values that should be restored so retries don't lose user input.
+ */
+export function getWithdrawErrorState(
+    error: unknown,
+    variables?: WithdrawInput
+): WithdrawErrorState {
+    const classified = classifyWalletError(error);
+    const recovery = getWalletErrorRecovery(classified);
+    return {
+        message: recovery.message,
+        recovery,
+        formValues: variables,
+    };
 }
