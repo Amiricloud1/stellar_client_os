@@ -70,12 +70,119 @@ export interface TaxDocumentResult {
 export class TaxDocumentError extends Error {
   constructor(
     message: string,
-    public readonly code: "INVALID_INPUT" | "PDF_GENERATION_FAILED",
+    public readonly code:
+      | "INVALID_INPUT"
+      | "PDF_GENERATION_FAILED"
+      | "UNAUTHENTICATED"
+      | "FORBIDDEN"
+      | "IDENTITY_NOT_VERIFIED",
   ) {
     super(message);
     this.name = "TaxDocumentError";
     Object.setPrototypeOf(this, TaxDocumentError.prototype);
   }
+}
+
+// ── Identity / ownership guards (issue #61) ───────────────────────────────────
+
+/**
+ * The authenticated caller requesting a tax document. In production this is
+ * derived from the verified session/JWT — never from client-supplied body
+ * fields. `creatorId` is the wallet public key bound to the session.
+ */
+export interface TaxDocumentRequester {
+  /** Wallet public key of the authenticated caller (G…/C…). */
+  creatorId: string;
+  /** Whether the caller's identity/profile has been verified. */
+  identityVerified: boolean;
+}
+
+/**
+ * Verified profile attributes used to populate the tax form. These must come
+ * from the persisted, verified profile record — not from request input.
+ */
+export interface VerifiedCreatorProfile {
+  creatorId: string;
+  identityVerified: boolean;
+  legalName?: string;
+  taxId?: string;
+}
+
+/** Redact a tax identifier for safe logging (never log the raw value). */
+export function redactTaxId(taxId: string | undefined | null): string {
+  if (!taxId) return "[redacted]";
+  const trimmed = taxId.trim();
+  if (trimmed.length === 0) return "[redacted]";
+  const last4 = trimmed.slice(-4);
+  return `***-**-${last4}`;
+}
+
+/** Redact any tax-ID-like substrings that may leak into free-form messages. */
+export function redactTaxIdsInText(text: string): string {
+  // US SSN/EIN style: 123-45-6789 or 12-3456789, and long digit runs.
+  return text
+    .replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[redacted]")
+    .replace(/\b\d{2}-\d{7}\b/g, "[redacted]")
+    .replace(/\b\d{9,}\b/g, "[redacted]");
+}
+
+/**
+ * Assert the authenticated requester owns the requested creator account and
+ * that their identity is verified. Throws `TaxDocumentError` otherwise.
+ *
+ * Cross-account access (requester.creatorId !== input.creatorId) is rejected
+ * with FORBIDDEN; unverified identities are rejected with
+ * IDENTITY_NOT_VERIFIED. Error messages never include tax identifiers.
+ */
+export function assertTaxDocumentAccess(
+  requester: TaxDocumentRequester | null | undefined,
+  input: Pick<TaxDocumentInput, "creatorId">,
+): void {
+  if (!requester || !requester.creatorId?.trim()) {
+    throw new TaxDocumentError(
+      "Authentication required to generate tax documents",
+      "UNAUTHENTICATED",
+    );
+  }
+  if (requester.creatorId !== input.creatorId) {
+    throw new TaxDocumentError(
+      "Cannot generate tax documents for another account",
+      "FORBIDDEN",
+    );
+  }
+  if (!requester.identityVerified) {
+    throw new TaxDocumentError(
+      "Identity verification is required before generating tax documents",
+      "IDENTITY_NOT_VERIFIED",
+    );
+  }
+}
+
+/**
+ * Build a `TaxDocumentInput` from verified profile data, ignoring any
+ * client-supplied taxId/creatorName. The verified profile is authoritative.
+ */
+export function applyVerifiedProfile(
+  input: TaxDocumentInput,
+  profile: VerifiedCreatorProfile,
+): TaxDocumentInput {
+  if (profile.creatorId !== input.creatorId) {
+    throw new TaxDocumentError(
+      "Verified profile does not match the requested creator",
+      "FORBIDDEN",
+    );
+  }
+  if (!profile.identityVerified) {
+    throw new TaxDocumentError(
+      "Identity verification is required before generating tax documents",
+      "IDENTITY_NOT_VERIFIED",
+    );
+  }
+  return {
+    ...input,
+    creatorName: profile.legalName ?? input.creatorName,
+    taxId: profile.taxId,
+  };
 }
 
 // ── Registry ──────────────────────────────────────────────────────────────────
@@ -419,12 +526,27 @@ export function validateTaxDocumentInput(input: TaxDocumentInput): void {
 
 /**
  * Validate then build a tax-document PDF for a campaign creator.
- * @throws `TaxDocumentError` on invalid input or generation failure.
+ *
+ * When `requester` is supplied (production path), the caller must be the
+ * authenticated owner of `input.creatorId` with a verified identity, and the
+ * verified `profile` (if provided) is authoritative for name/taxId. Tax IDs
+ * are never included in thrown error messages.
+ *
+ * @throws `TaxDocumentError` on invalid input, access denial, or generation failure.
  */
 export async function generateTaxDocument(
   input: TaxDocumentInput,
+  requester?: TaxDocumentRequester,
+  profile?: VerifiedCreatorProfile,
 ): Promise<TaxDocumentResult> {
   validateTaxDocumentInput(input);
+
+  if (requester !== undefined) {
+    assertTaxDocumentAccess(requester, input);
+  }
+  if (profile !== undefined) {
+    input = applyVerifiedProfile(input, profile);
+  }
 
   const documentId = uuid();
   const generatedAt = new Date().toISOString();
@@ -434,8 +556,9 @@ export async function generateTaxDocument(
     return { pdfBytes, documentId, generatedAt };
   } catch (err) {
     if (err instanceof TaxDocumentError) throw err;
+    const raw = err instanceof Error ? err.message : String(err);
     throw new TaxDocumentError(
-      `PDF generation failed: ${err instanceof Error ? err.message : String(err)}`,
+      `PDF generation failed: ${redactTaxIdsInText(raw)}`,
       "PDF_GENERATION_FAILED",
     );
   }

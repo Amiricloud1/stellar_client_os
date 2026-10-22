@@ -1,0 +1,48 @@
+name: Security CI
+
+on:
+  push:
+    paths:
+      - '.github/workflows/security.yml'
+      - '.gitleaks.toml'
+      - 'scripts/security/**'
+      - 'docs/security/**'
+  pull_request:
+    paths:
+      - '.github/workflows/security.yml'
+      - '.gitleaks.toml'
+      - 'scripts/security/**'
+      - 'docs/security/**'
+
+jobs:
+  secret-scan:
+    name: Secret scanning (gitleaks + repo scanner)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gitleaks needs full history to scan commits
+
+      - name: Gitleaks (representative rules from .gitleaks.toml)
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
+            detect --source /repo -c /repo/.gitleaks.toml --redact --no-banner
+
+      - name: Repo-native scanner (scripts/security/scan-secrets.mjs)
+        run: node scripts/security/scan-secrets.mjs
+
+      - name: Scanner unit tests (deterministic, offline)
+        run: node --test 'scripts/security/*.test.mjs'
+
+  threat-model:
+    name: Threat model validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate docs/security/threat-model.md
+        run: node scripts/security/validate-threat-model.mjs

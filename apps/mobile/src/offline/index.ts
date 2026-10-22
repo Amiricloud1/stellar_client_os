@@ -13,18 +13,23 @@ import { type KeyValueStorage, getOfflineStorage } from "./storage";
 import type { CampaignDetail, CampaignSummary } from "./types";
 import { OfflineWishlist } from "./wishlist";
 import { WishlistSyncQueue } from "./sync";
+import { IdempotentActionQueue } from "./actionQueue";
 
 export * from "./storage";
 export * from "./types";
 export * from "./campaignCache";
 export * from "./wishlist";
 export * from "./sync";
+export * from "./encryptedStorage";
+export * from "./actionQueue";
+export * from "./conflictResolution";
 
 export interface OfflineServices {
   cache: CampaignCache<CampaignSummary[], CampaignDetail>;
   repository: CampaignRepository<CampaignSummary[], CampaignDetail>;
   wishlist: OfflineWishlist;
   queue: WishlistSyncQueue;
+  actionQueue: IdempotentActionQueue;
 }
 
 let services: OfflineServices | null = null;
@@ -39,14 +44,21 @@ let services: OfflineServices | null = null;
 export function getOfflineServices(storage?: KeyValueStorage): OfflineServices {
   if (!services) {
     const resolved = storage ?? getOfflineStorage();
+    const wishlist = new OfflineWishlist(resolved);
+    // The cache is bounded (issue #94): it evicts the least-recently-used
+    // details above `maxDetailEntries`, but never a wishlisted campaign.
     const cache = new CampaignCache<CampaignSummary[], CampaignDetail>(
       resolved,
+      {
+        protectedIds: () => wishlist.list(),
+      },
     );
     services = {
       cache,
       repository: new CampaignRepository(cache),
-      wishlist: new OfflineWishlist(resolved),
+      wishlist,
       queue: new WishlistSyncQueue(resolved),
+      actionQueue: new IdempotentActionQueue(resolved),
     };
   }
   return services;

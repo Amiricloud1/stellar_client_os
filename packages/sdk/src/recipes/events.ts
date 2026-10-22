@@ -1,5 +1,5 @@
 /**
- * @module @fundable/sdk/recipes/events
+ * @module @fundable/sdk
  *
  * Event consumption recipes for the Fundable Stellar SDK.
  *
@@ -43,7 +43,7 @@ export interface EventConsumptionResult {
  *
  * @example
  * ```typescript
- * import { consumeContractEvents } from "@fundable/sdk/recipes/events";
+ * import { consumeContractEvents } from "@fundable/sdk";
  *
  * const rawEvents = await server.getEvents({ contractIds: [contractId] });
  * const result = consumeContractEvents(rawEvents);
@@ -91,7 +91,7 @@ export function consumeContractEvents(
  *
  * @example
  * ```typescript
- * import { filterEventsByType } from "@fundable/sdk/recipes/events";
+ * import { filterEventsByType } from "@fundable/sdk";
  *
  * const deposits = filterEventsByType(result.parsedEvents, "StreamDeposit");
  * for (const deposit of deposits) {
@@ -115,7 +115,7 @@ export function filterEventsByType(
  *
  * @example
  * ```typescript
- * import { groupEventsByContract } from "@fundable/sdk/recipes/events";
+ * import { groupEventsByContract } from "@fundable/sdk";
  *
  * const byContract = groupEventsByContract(result.parsedEvents);
  * for (const [contractId, events] of byContract) {
@@ -144,7 +144,7 @@ export function groupEventsByContract(
  *
  * @example
  * ```typescript
- * import { getStreamDeposits } from "@fundable/sdk/recipes/events";
+ * import { getStreamDeposits } from "@fundable/sdk";
  *
  * const deposits = getStreamDeposits(result.parsedEvents);
  * const totalDeposited = deposits.reduce(
@@ -167,7 +167,7 @@ export function getStreamDeposits(
  *
  * @example
  * ```typescript
- * import { getStreamPauses } from "@fundable/sdk/recipes/events";
+ * import { getStreamPauses } from "@fundable/sdk";
  *
  * const pauses = getStreamPauses(result.parsedEvents);
  * for (const pause of pauses) {

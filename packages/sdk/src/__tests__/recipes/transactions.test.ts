@@ -15,7 +15,7 @@ function createMockAssembledTx<T = unknown>(
 ): AssembledTransaction<T> {
   return {
     signed: {
-      hash: () => ({ toString: () => hash || "abc123def456" }),
+      hash: () => Buffer.from(hash || "abc123def456", "hex"),
     },
     result,
     signAndSend: vi.fn(async ({ signTransaction }: { signTransaction?: (xdr: string) => Promise<unknown> } = {}) => {
@@ -34,9 +34,9 @@ vi.mock("@stellar/stellar-sdk", async () => {
     ...actual,
     rpc: {
       ...actual.rpc,
-      Server: vi.fn().mockImplementation(() => ({
-        getTransaction: mockGetTransaction,
-      })),
+      Server: vi.fn().mockImplementation(function () {
+        return { getTransaction: mockGetTransaction };
+      }),
       Api: {
         ...actual.rpc.Api,
         GetTransactionStatus: {
@@ -60,7 +60,7 @@ describe("executeTransaction", () => {
   });
 
   it("returns success outcome when transaction confirms", async () => {
-    const tx = createMockAssembledTx(42n, "txhash123");
+    const tx = createMockAssembledTx(42n, "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1");
     mockGetTransaction.mockResolvedValue({
       status: rpc.Api.GetTransactionStatus.SUCCESS,
       ledger: 12345,
@@ -75,14 +75,14 @@ describe("executeTransaction", () => {
     );
 
     expect(outcome.success).toBe(true);
-    expect(outcome.hash).toBe("txhash123");
+    expect(outcome.hash).toBe("a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1");
     expect(outcome.ledger).toBe(12345);
     expect(outcome.result).toBe(42n);
     expect(outcome.error).toBeUndefined();
   });
 
   it("returns failure outcome when transaction fails", async () => {
-    const tx = createMockAssembledTx(null, "txhashfail");
+    const tx = createMockAssembledTx(null, "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2");
     mockGetTransaction.mockResolvedValue({
       status: rpc.Api.GetTransactionStatus.FAILED,
       ledger: 99999,
@@ -98,13 +98,28 @@ describe("executeTransaction", () => {
     );
 
     expect(outcome.success).toBe(false);
-    expect(outcome.hash).toBe("txhashfail");
+    expect(outcome.hash).toBe("b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2");
     expect(outcome.error).toBeDefined();
     expect(outcome.error?.message).toBeDefined();
   });
 
+  it("encodes Uint8Array transaction hashes as hex on failure", async () => {
+    const tx = createMockAssembledTx();
+    vi.spyOn(tx.signed!, "hash").mockReturnValue(new Uint8Array([0, 171, 255]));
+    const signer = vi.fn().mockRejectedValue(new Error("Wallet rejected transaction"));
+
+    const outcome = await executeTransaction(
+      tx,
+      "https://soroban-testnet.stellar.org",
+      signer,
+    );
+
+    expect(outcome.success).toBe(false);
+    expect(outcome.hash).toBe("00abff");
+  });
+
   it("returns failure outcome when signer throws", async () => {
-    const tx = createMockAssembledTx(null, "txsignfail");
+    const tx = createMockAssembledTx(null, "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3");
     const signer = vi.fn().mockRejectedValue(new Error("Wallet rejected transaction"));
 
     const outcome = await executeTransaction(
@@ -129,7 +144,7 @@ describe("waitForTransactionWithRetry", () => {
   });
 
   it("delegates to waitForTransaction and returns result", async () => {
-    const tx = createMockAssembledTx(100n, "txretry");
+    const tx = createMockAssembledTx(100n, "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4");
     mockGetTransaction.mockResolvedValue({
       status: rpc.Api.GetTransactionStatus.SUCCESS,
       ledger: 54321,
@@ -156,7 +171,7 @@ describe("cancelStreamSafely", () => {
   });
 
   it("returns success outcome for cancellation", async () => {
-    const cancelTx = createMockAssembledTx(true, "txcancel");
+    const cancelTx = createMockAssembledTx(true, "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5");
     mockGetTransaction.mockResolvedValue({
       status: rpc.Api.GetTransactionStatus.SUCCESS,
       ledger: 77777,
@@ -171,7 +186,7 @@ describe("cancelStreamSafely", () => {
     );
 
     expect(outcome.success).toBe(true);
-    expect(outcome.hash).toBe("txcancel");
+    expect(outcome.hash).toBe("e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5");
     expect(outcome.ledger).toBe(77777);
   });
 });

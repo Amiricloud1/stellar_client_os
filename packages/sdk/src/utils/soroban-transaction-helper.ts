@@ -11,6 +11,102 @@ import { xdr } from '@stellar/stellar-sdk';
 import type { SorobanDataBuilder, Transaction } from '@stellar/stellar-sdk';
 
 /**
+ * Identity of the chain a transaction flow is bound to.
+ *
+ * A wallet flow captures the chain identity (network passphrase and, when
+ * available, the RPC chain id / latest ledger sequence) before simulating.
+ * Every subsequent step (simulation, signing, confirmation) re-checks the
+ * identity and aborts if the wallet has switched networks in the meantime.
+ */
+export interface ChainIdentity {
+  /** Stellar network passphrase, e.g. `Networks.TESTNET`. */
+  networkPassphrase: string;
+  /** Optional RPC `getNetwork().passphrase`/chain id observed at capture time. */
+  chainId?: string;
+  /** Optional latest ledger sequence observed at capture time. */
+  latestLedger?: number;
+}
+
+/**
+ * Error thrown when an in-flight transaction flow is aborted because the
+ * current chain no longer matches the captured {@link ChainIdentity}.
+ */
+export class ChainIdentityMismatchError extends Error {
+  /** The identity captured when the flow started. */
+  readonly expected: ChainIdentity;
+  /** The identity observed when the mismatch was detected. */
+  readonly actual: ChainIdentity;
+
+  constructor(expected: ChainIdentity, actual: ChainIdentity, context?: string) {
+    super(
+      `Aborted${context ? ` ${context}` : ''}: chain identity changed ` +
+        `(expected ${expected.networkPassphrase}${expected.chainId ? `/${expected.chainId}` : ''}, ` +
+        `got ${actual.networkPassphrase}${actual.chainId ? `/${actual.chainId}` : ''}). ` +
+        'Renew confirmation before retrying.',
+    );
+    this.name = 'ChainIdentityMismatchError';
+    this.expected = expected;
+    this.actual = actual;
+  }
+}
+
+/**
+ * Returns true when two chain identities refer to the same chain.
+ *
+ * The network passphrase is always compared. `chainId` and `latestLedger`
+ * are only compared when both sides provide them, so callers that cannot
+ * observe a value are not spuriously aborted.
+ */
+export function isSameChain(expected: ChainIdentity, actual: ChainIdentity): boolean {
+  if (expected.networkPassphrase !== actual.networkPassphrase) {
+    return false;
+  }
+  if (expected.chainId !== undefined && actual.chainId !== undefined && expected.chainId !== actual.chainId) {
+    return false;
+  }
+  if (
+    expected.latestLedger !== undefined &&
+    actual.latestLedger !== undefined &&
+    expected.latestLedger !== actual.latestLedger
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Throw a {@link ChainIdentityMismatchError} when the current chain differs
+ * from the captured identity.
+ *
+ * @param expected - Identity captured when the flow started.
+ * @param actual - Identity observed right now.
+ * @param context - Optional label describing the step being guarded.
+ */
+export function assertChainIdentity(
+  expected: ChainIdentity,
+  actual: ChainIdentity,
+  context?: string,
+): void {
+  if (!isSameChain(expected, actual)) {
+    throw new ChainIdentityMismatchError(expected, actual, context);
+  }
+}
+
+/**
+ * Capture the current chain identity from an RPC server.
+ *
+ * @param rpc - Soroban RPC server instance.
+ * @returns Chain identity including the network passphrase and chain id.
+ */
+export async function captureChainIdentity(rpc: Server): Promise<ChainIdentity> {
+  const network = await rpc.getNetwork();
+  return {
+    networkPassphrase: network.passphrase,
+    chainId: network.passphrase,
+  };
+}
+
+/**
  * Resource usage metrics for a Soroban transaction.
  */
 export interface ResourceUsage {
@@ -27,6 +123,38 @@ export interface ResourceUsage {
 }
 
 /**
+ * Classification of a Soroban simulation or contract failure.
+ *
+ * These categories are intentionally coarse so that the unified wallet
+ * recovery layer can map them to safe user actions (retry, switch network,
+ * reconnect, or surface the contract error) without re-parsing raw RPC
+ * payloads.
+ *
+ * - `simulation_error`: the RPC returned a simulation error result.
+ * - `contract_error`: the simulation succeeded at the RPC level but the
+ *   contract invocation trapped (e.g. `HostError` / `invokeHostFunction`).
+ * - `network_error`: transient transport/RPC failure (retryable).
+ * - `unknown`: anything we could not classify.
+ */
+export type SorobanFailureKind =
+  | 'simulation_error'
+  | 'contract_error'
+  | 'network_error'
+  | 'unknown';
+
+/**
+ * Structured failure descriptor exposed for the unified recovery layer.
+ */
+export interface SorobanFailure {
+  /** Coarse failure category. */
+  kind: SorobanFailureKind;
+  /** Human-readable message safe to surface to operators/logs. */
+  message: string;
+  /** Whether retrying the same request may succeed. */
+  retryable: boolean;
+}
+
+/**
  * Fee and resource estimate for a Soroban transaction.
  */
 export interface TransactionEstimate {
@@ -40,12 +168,20 @@ export interface TransactionEstimate {
   success: boolean;
   /** Error message if simulation failed. */
   error?: string;
+  /** Structured failure descriptor when `success` is false. */
+  failure?: SorobanFailure;
 }
 
 /**
  * Configuration options for transaction estimation.
  */
 export interface EstimationOptions {
+  /**
+   * Chain identity the flow is bound to. When provided, the simulation is
+   * aborted with a {@link ChainIdentityMismatchError} if the RPC server
+   * reports a different network before or after simulating.
+   */
+  chainIdentity?: ChainIdentity;
   /**
    * Safety multiplier applied on top of the simulated minimum resource fee.
    * Higher values provide more buffer against network congestion.
@@ -93,12 +229,100 @@ export interface NetworkMetrics {
 /**
  * Default estimation options.
  */
-const DEFAULT_OPTIONS: Required<EstimationOptions> = {
+const DEFAULT_OPTIONS: Required<Omit<EstimationOptions, 'chainIdentity'>> = {
   feeBufferMultiplier: 1.2,
   baseFee: '100',
   maxRetries: 3,
   retryDelayMs: 1000,
 };
+
+/**
+ * Patterns that indicate a contract-level trap surfaced by simulation.
+ * These are matched case-insensitively against the simulation error string.
+ */
+const CONTRACT_ERROR_PATTERNS = [
+  'hosterror',
+  'invokehostfunction',
+  'contract error',
+  'wasm trap',
+  'unreachable',
+  'vm error',
+];
+
+/**
+ * Patterns that indicate a transient network/RPC failure (retryable).
+ */
+const NETWORK_ERROR_PATTERNS = [
+  'timeout',
+  'timed out',
+  'econnreset',
+  'econnrefused',
+  'enotfound',
+  'network',
+  'fetch failed',
+  'socket hang up',
+  '503',
+  '502',
+  '504',
+  '429',
+];
+
+/**
+ * Classify a raw simulation error string into a structured failure.
+ *
+ * @param error - Raw error message from the RPC simulation result.
+ * @returns Structured failure descriptor.
+ */
+export function classifySimulationError(error: string): SorobanFailure {
+  const normalized = (error ?? '').toLowerCase();
+
+  if (CONTRACT_ERROR_PATTERNS.some((pattern) => normalized.includes(pattern))) {
+    return {
+      kind: 'contract_error',
+      message: error,
+      retryable: false,
+    };
+  }
+
+  if (NETWORK_ERROR_PATTERNS.some((pattern) => normalized.includes(pattern))) {
+    return {
+      kind: 'network_error',
+      message: error,
+      retryable: true,
+    };
+  }
+
+  return {
+    kind: 'simulation_error',
+    message: error,
+    retryable: false,
+  };
+}
+
+/**
+ * Classify a thrown error (transport/RPC failure) into a structured failure.
+ *
+ * @param error - The thrown error.
+ * @returns Structured failure descriptor.
+ */
+export function classifyThrownError(error: unknown): SorobanFailure {
+  const message = error instanceof Error ? error.message : String(error ?? 'Unknown error');
+  const normalized = message.toLowerCase();
+
+  if (NETWORK_ERROR_PATTERNS.some((pattern) => normalized.includes(pattern))) {
+    return {
+      kind: 'network_error',
+      message,
+      retryable: true,
+    };
+  }
+
+  return {
+    kind: 'unknown',
+    message,
+    retryable: false,
+  };
+}
 
 /**
  * Simulate a Soroban transaction and return fee/resource estimates.
@@ -128,12 +352,27 @@ export async function estimateTransactionFee(
 ): Promise<TransactionEstimate> {
   const opts = { ...DEFAULT_OPTIONS, ...options };
 
+  // Guard the simulation against a network switch that happened before we
+  // started. A mismatch is terminal: retrying cannot fix a wrong chain.
+  if (opts.chainIdentity) {
+    const current = await captureChainIdentity(rpc);
+    assertChainIdentity(opts.chainIdentity, current, 'simulation');
+  }
+
   let lastError: Error | undefined;
   for (let attempt = 0; attempt < opts.maxRetries; attempt++) {
     try {
       const simulation = await rpc.simulateTransaction(transaction);
 
+      // Re-check after simulation: the wallet may have switched networks
+      // while the simulation was in flight.
+      if (opts.chainIdentity) {
+        const current = await captureChainIdentity(rpc);
+        assertChainIdentity(opts.chainIdentity, current, 'simulation');
+      }
+
       if (Api.isSimulationError(simulation)) {
+        const failure = classifySimulationError(simulation.error);
         return {
           recommendedFee: opts.baseFee,
           minResourceFee: '0',
@@ -146,6 +385,7 @@ export async function estimateTransactionFee(
           },
           success: false,
           error: simulation.error,
+          failure,
         };
       }
 
@@ -168,12 +408,23 @@ export async function estimateTransactionFee(
         success: true,
       };
     } catch (err) {
+      if (err instanceof ChainIdentityMismatchError) {
+        throw err;
+      }
       lastError = err as Error;
       if (attempt < opts.maxRetries - 1) {
         await sleep(opts.retryDelayMs);
       }
     }
   }
+
+  const failure = lastError
+    ? classifyThrownError(lastError)
+    : {
+        kind: 'unknown' as const,
+        message: 'Simulation failed after retries',
+        retryable: true,
+      };
 
   return {
     recommendedFee: opts.baseFee,
@@ -186,7 +437,8 @@ export async function estimateTransactionFee(
       writeEntries: 0,
     },
     success: false,
-    error: lastError?.message ?? 'Simulation failed after retries',
+    error: failure.message,
+    failure,
   };
 }
 
@@ -412,6 +664,40 @@ export function suggestResourceLimits(
     readEntries: Math.ceil(estimate.resources.readEntries * buffer),
     writeEntries: Math.ceil(estimate.resources.writeEntries * buffer),
   };
+}
+
+/**
+ * Guard a signing step against a network switch.
+ *
+ * Call this immediately before handing the transaction to the signer. If the
+ * current chain differs from the captured identity the flow is aborted and
+ * the user must renew confirmation.
+ *
+ * @param rpc - Soroban RPC server instance.
+ * @param expected - Identity captured when the flow started.
+ * @throws {ChainIdentityMismatchError} When the chain has changed.
+ */
+export async function assertChainBeforeSigning(rpc: Server, expected: ChainIdentity): Promise<void> {
+  const current = await captureChainIdentity(rpc);
+  assertChainIdentity(expected, current, 'signing');
+}
+
+/**
+ * Guard a confirmation step against a network switch.
+ *
+ * Call this before polling for the transaction result. If the current chain
+ * differs from the captured identity the flow is aborted.
+ *
+ * @param rpc - Soroban RPC server instance.
+ * @param expected - Identity captured when the flow started.
+ * @throws {ChainIdentityMismatchError} When the chain has changed.
+ */
+export async function assertChainBeforeConfirmation(
+  rpc: Server,
+  expected: ChainIdentity,
+): Promise<void> {
+  const current = await captureChainIdentity(rpc);
+  assertChainIdentity(expected, current, 'confirmation');
 }
 
 /**

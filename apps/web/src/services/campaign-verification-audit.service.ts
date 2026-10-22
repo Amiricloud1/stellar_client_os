@@ -216,6 +216,14 @@ import {
   type VerificationEventType,
 } from "@/types/campaign-verification";
 import {
+  DEFAULT_PAGE_SIZE,
+  MAX_PAGE_SIZE,
+  buildPageInfo,
+  normalizePagination,
+  type PageInfo,
+  type PaginationParams,
+} from "@/types/pagination";
+import {
   getCampaign,
   getCampaignDataSource,
   type CampaignDataSource,
@@ -240,6 +248,24 @@ export interface VerificationActivityFilter {
   eventType?: VerificationEventType;
   actorId?: string;
   since?: number;
+}
+
+export type VerificationActivitySortField = "occurredAt" | "id";
+export type SortDirection = "asc" | "desc";
+
+export interface VerificationActivitySort {
+  field?: VerificationActivitySortField;
+  direction?: SortDirection;
+}
+
+export interface VerificationActivityListParams extends PaginationParams {
+  filter?: VerificationActivityFilter;
+  sort?: VerificationActivitySort;
+}
+
+export interface PaginatedVerificationActivities {
+  items: VerificationAuditEntry[];
+  pageInfo: PageInfo;
 }
 
 export class CampaignVerificationAuditService {
@@ -310,6 +336,53 @@ export class CampaignVerificationAuditService {
       if (filter.since && e.occurredAt < filter.since) return false;
       return true;
     });
+  }
+
+  /**
+   * Lists verification activities with the shared pagination/sorting contract.
+   *
+   * Ordering is stable: entries are sorted by the requested field (default
+   * `occurredAt` descending) with `id` as a deterministic tie-breaker so that
+   * pages never overlap or skip entries. Page size is clamped to
+   * `MAX_PAGE_SIZE` and the response carries shared `PageInfo` metadata.
+   */
+  async listActivities(
+    campaignId: string,
+    params: VerificationActivityListParams = {}
+  ): Promise<PaginatedVerificationActivities> {
+    const { page, pageSize } = normalizePagination(params, {
+      defaultPageSize: DEFAULT_PAGE_SIZE,
+      maxPageSize: MAX_PAGE_SIZE,
+    });
+
+    const filter = params.filter ?? {};
+    const sortField: VerificationActivitySortField = params.sort?.field ?? "occurredAt";
+    const direction: SortDirection = params.sort?.direction ?? "desc";
+
+    const entries = await this.filterActivities(campaignId, filter);
+
+    const sorted = [...entries].sort((a, b) => {
+      const primaryA = sortField === "id" ? a.id : a.occurredAt;
+      const primaryB = sortField === "id" ? b.id : b.occurredAt;
+      let cmp = 0;
+      if (primaryA < primaryB) cmp = -1;
+      else if (primaryA > primaryB) cmp = 1;
+      if (cmp === 0) {
+        // Stable tie-breaker on id, always ascending for determinism.
+        if (a.id < b.id) cmp = -1;
+        else if (a.id > b.id) cmp = 1;
+      }
+      return direction === "asc" ? cmp : -cmp;
+    });
+
+    const totalItems = sorted.length;
+    const offset = (page - 1) * pageSize;
+    const items = sorted.slice(offset, offset + pageSize);
+
+    return {
+      items,
+      pageInfo: buildPageInfo({ page, pageSize, totalItems }),
+    };
   }
 
   /**

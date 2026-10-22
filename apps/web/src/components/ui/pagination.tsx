@@ -34,6 +34,14 @@ const PaginationItem = React.forwardRef<
 ))
 PaginationItem.displayName = "PaginationItem"
 
+export type PageInfo = {
+    total: number
+    page: number
+    pageSize: number
+    hasNext: boolean
+    hasPrev: boolean
+}
+
 type PaginationLinkProps = {
     isActive?: boolean
     disabled?: boolean
@@ -100,6 +108,31 @@ const PaginationNext = ({
 )
 PaginationNext.displayName = "PaginationNext"
 
+const PaginationSummary = ({
+    className,
+    pageInfo,
+    ...props
+}: Omit<React.ComponentProps<"p">, "children"> & {
+    pageInfo: PageInfo
+}) => {
+    const { total, page, pageSize } = pageInfo
+    const start = total === 0 ? 0 : (page - 1) * pageSize + 1
+    const end = Math.min(page * pageSize, total)
+
+    return (
+        <p
+            aria-live="polite"
+            className={cn("text-sm text-zinc-400", className)}
+            {...props}
+        >
+            {total === 0
+                ? "No results"
+                : `Showing ${start}\u2013${end} of ${total}`}
+        </p>
+    )
+}
+PaginationSummary.displayName = "PaginationSummary"
+
 const PaginationEllipsis = ({
     className,
     ...props
@@ -123,4 +156,5 @@ export {
     PaginationLink,
     PaginationNext,
     PaginationPrevious,
+    PaginationSummary,
 }

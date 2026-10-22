@@ -1,0 +1,61 @@
+# Gitleaks configuration (issue #97).
+#
+# Used by CI (.github/workflows/security.yml) as the pre-merge gate alongside
+# the dependency-free scanner in scripts/security/scan-secrets.mjs. The rules
+# below cover representative credential classes for this repository; rotation
+# guidance for anything that slips through lives in
+# docs/security/secret-rotation.md.
+#
+# Local usage:
+#   gitleaks detect --source . -c .gitleaks.toml --redact
+
+title = "stellar_client_os"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "stellar-secret-seed"
+description = "Stellar secret seed (S...)"
+regex = '''\bS[A-Z2-7]{55}\b'''
+tags = ["stellar", "wallet", "high-entropy"]
+
+[[rules]]
+id = "github-pat-legacy"
+description = "GitHub personal access token (ghp_/gho_/ghu_/ghs_/ghr_)"
+regex = '''\bgh[pousr]_[A-Za-z0-9]{36,}\b'''
+tags = ["github", "token"]
+
+[[rules]]
+id = "github-fine-grained-pat"
+description = "GitHub fine-grained personal access token"
+regex = '''\bgithub_pat_[A-Za-z0-9_]{22,}\b'''
+tags = ["github", "token"]
+
+[[rules]]
+id = "aws-access-key-id"
+description = "AWS access key id (AKIA/ASIA)"
+regex = '''\b(?:AKIA|ASIA)[0-9A-Z]{16}\b'''
+tags = ["aws", "key"]
+
+[[rules]]
+id = "slack-token"
+description = "Slack bot/user/app token"
+regex = '''\bxox[abprs]-[A-Za-z0-9-]{10,}\b'''
+tags = ["slack", "token"]
+
+[[rules]]
+id = "npm-token"
+description = "npm access token"
+regex = '''\bnpm_[A-Za-z0-9]{36}\b'''
+tags = ["npm", "token"]
+
+[allowlist]
+description = "Scanner fixtures, pattern definitions, canonical AWS docs example key, and the pre-existing testnet seeds tracked for removal in docs/security/threat-model.md"
+paths = [
+  '''scripts/security/.*\.test\.mjs''',
+  '''\.gitleaks\.toml''',
+  '''apps/web/src/lib/s3/presigner\.test\.ts''',
+  '''apps/web/src/services/video-anchor\.service\.test\.ts''',
+  '''apps/web/src/app/api/campaign-verification/stream/route\.ts''',
+]

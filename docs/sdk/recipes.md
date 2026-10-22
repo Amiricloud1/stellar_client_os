@@ -17,7 +17,7 @@ Implement the `WalletAdapter` interface to connect any Stellar wallet
 to the SDK's signing helpers (`signAndSend`, `signAndWait`).
 
 ```typescript
-import { WalletAdapter } from "@fundable/sdk/recipes/wallet";
+import { WalletAdapter } from "@fundable/sdk";
 
 const myWallet: WalletAdapter = {
   name: "MyWallet",
@@ -47,7 +47,7 @@ Use `connectWallet` for consistent connection handling across
 providers:
 
 ```typescript
-import { connectWallet } from "@fundable/sdk/recipes/wallet";
+import { connectWallet } from "@fundable/sdk";
 
 const result = await connectWallet(myWallet);
 if (result.success) {
@@ -63,7 +63,7 @@ Use `signTransactionWithWallet` to wrap wallet signing with safe error
 recovery:
 
 ```typescript
-import { signTransactionWithWallet } from "@fundable/sdk/recipes/wallet";
+import { signTransactionWithWallet } from "@fundable/sdk";
 
 try {
   const signedXdr = await signTransactionWithWallet(wallet, unsignedXdr);
@@ -85,7 +85,7 @@ try {
 local development and testing. **Not for production use.**
 
 ```typescript
-import { createTestWallet } from "@fundable/sdk/recipes/wallet";
+import { createTestWallet } from "@fundable/sdk";
 
 const wallet = createTestWallet("SAAAA...");
 await wallet.connect();
@@ -101,7 +101,7 @@ const signed = await wallet.signTransaction(unsignedXdr);
 Use `getRpcProviderConfig` for standard network presets:
 
 ```typescript
-import { getRpcProviderConfig } from "@fundable/sdk/recipes/rpc";
+import { getRpcProviderConfig } from "@fundable/sdk";
 
 const testnet = getRpcProviderConfig("testnet");
 // { network: "testnet", networkPassphrase: "...", rpcUrl: "...", ... }
@@ -128,7 +128,7 @@ constructing Stellar RPC servers, enforcing the same security rules as
 the SDK:
 
 ```typescript
-import { getRpcServerOptions } from "@fundable/sdk/recipes/rpc";
+import { getRpcServerOptions } from "@fundable/sdk";
 
 const options = getRpcServerOptions("https://soroban-testnet.stellar.org");
 // { allowHttp: false }
@@ -141,7 +141,7 @@ Use `isLocalRpcUrl` to check whether a URL is a plain-HTTP loopback
 endpoint safe for local development:
 
 ```typescript
-import { isLocalRpcUrl } from "@fundable/sdk/recipes/rpc";
+import { isLocalRpcUrl } from "@fundable/sdk";
 
 isLocalRpcUrl("http://localhost:8000");   // true
 isLocalRpcUrl("https://soroban-testnet.stellar.org"); // false
@@ -157,7 +157,7 @@ isLocalRpcUrl("https://soroban-testnet.stellar.org"); // false
 a discriminated outcome instead of throwing:
 
 ```typescript
-import { executeTransaction } from "@fundable/sdk/recipes/transactions";
+import { executeTransaction } from "@fundable/sdk";
 
 const outcome = await executeTransaction(
   tx,
@@ -181,7 +181,7 @@ if (outcome.success) {
 handling "not found" during propagation automatically:
 
 ```typescript
-import { waitForTransactionWithRetry } from "@fundable/sdk/recipes/transactions";
+import { waitForTransactionWithRetry } from "@fundable/sdk";
 
 await tx.signAndSend({ signTransaction: (xdr) => wallet.signTransaction(xdr) });
 
@@ -199,7 +199,7 @@ try {
 contract with a cancel method:
 
 ```typescript
-import { cancelStreamSafely } from "@fundable/sdk/recipes/transactions";
+import { cancelStreamSafely } from "@fundable/sdk";
 
 const cancelTx = await client.cancelStream({ streamId: 123n });
 const outcome = await cancelStreamSafely(cancelTx, rpcUrl, signer);
@@ -215,7 +215,7 @@ if (!outcome.success) {
 `isRetryableError` helps decide whether to retry or show an error:
 
 ```typescript
-import { isRetryableError } from "@fundable/sdk/recipes/transactions";
+import { isRetryableError } from "@fundable/sdk";
 
 if (isRetryableError(error)) {
   // Retry with exponential backoff
@@ -236,7 +236,7 @@ if (isRetryableError(error)) {
 payment-stream events:
 
 ```typescript
-import { consumeContractEvents } from "@fundable/sdk/recipes/events";
+import { consumeContractEvents } from "@fundable/sdk";
 
 const rawEvents = await server.getEvents({ contractIds: [contractId] });
 const result = consumeContractEvents(rawEvents);
@@ -253,7 +253,7 @@ if (result.unparsedEvents.length > 0) {
 ### Filter Events by Type
 
 ```typescript
-import { filterEventsByType } from "@fundable/sdk/recipes/events";
+import { filterEventsByType } from "@fundable/sdk";
 
 const deposits = filterEventsByType(result.parsedEvents, "StreamDeposit");
 ```
@@ -261,7 +261,7 @@ const deposits = filterEventsByType(result.parsedEvents, "StreamDeposit");
 ### Group Events by Contract
 
 ```typescript
-import { groupEventsByContract } from "@fundable/sdk/recipes/events";
+import { groupEventsByContract } from "@fundable/sdk";
 
 const byContract = groupEventsByContract(result.parsedEvents);
 ```
@@ -269,7 +269,7 @@ const byContract = groupEventsByContract(result.parsedEvents);
 ### Convenience Helpers
 
 ```typescript
-import { getStreamDeposits, getStreamPauses } from "@fundable/sdk/recipes/events";
+import { getStreamDeposits, getStreamPauses } from "@fundable/sdk";
 
 const deposits = getStreamDeposits(result.parsedEvents);
 const pauses = getStreamPauses(result.parsedEvents);

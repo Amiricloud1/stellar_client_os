@@ -21,6 +21,7 @@ import { isValidStellarAddress } from "@/utils/stellar-validation";
 import { offrampService } from "@/services/offramp.service";
 import { notify } from "@/utils/notification";
 import { NETWORK_PASSPHRASE } from "@/lib/constants";
+import { transactionGuard } from "@/lib/transaction-guard";
 
 import {
   Dialog,
@@ -31,7 +32,13 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { isLockedWalletError, isWalletCancellationError } from "@/utils/wallet-errors";
+import {
+  isLockedWalletError,
+  isWalletCancellationError,
+  classifyWalletError,
+  type WalletErrorAction,
+  type WalletErrorKind,
+} from "@/utils/wallet-errors";
 
 export type WalletId = string;
 export type ConnectionStatus =
@@ -50,6 +57,13 @@ const WALLET_INSTALL_URL: Partial<Record<WalletId, string>> = {
   rango: "https://app.rango.exchange/",
 };
 
+/** A classified wallet failure surfaced to the UI along with its recovery actions. */
+export interface WalletRecoveryState {
+  kind: WalletErrorKind;
+  message: string;
+  actions: WalletErrorAction[];
+}
+
 interface WalletContextType {
   connect: (walletId: WalletId) => Promise<void>;
   disconnect: () => Promise<void>;
@@ -60,12 +74,28 @@ interface WalletContextType {
   connectionStatus: ConnectionStatus;
   selectedWalletId: string | null;
   network: WalletNetwork;
+  /**
+   * Active chain identity (network passphrase) that simulation, signing and
+   * confirmation are bound to. In-flight wallet flows capture this value and
+   * abort if it changes before they complete.
+   */
+  chainId: string;
   setNetwork: (network: WalletNetwork) => Promise<void>;
   signTransaction: (xdr: string) => Promise<string>;
   openModal: () => void;
   closeModal: () => void;
   isModalOpen: boolean;
   supportedWallets: { id: WalletId; name: string; icon: string }[];
+  /** Last classified wallet failure, or null when there is nothing to recover from. */
+  walletError: WalletRecoveryState | null;
+  /** Clear the current wallet error without changing connection state. */
+  clearWalletError: () => void;
+  /** Retry the last failed connection attempt (no-op when nothing to retry). */
+  retryConnection: () => Promise<void>;
+  /** Switch the app network and reconnect the previously selected wallet. */
+  switchNetworkAndReconnect: (target: WalletNetwork) => Promise<void>;
+  /** Re-run the auto-reconnect verification for the persisted session. */
+  reconnect: () => Promise<void>;
 }
 
 const WalletContext = createContext<WalletContextType | undefined>(undefined);
@@ -147,6 +177,16 @@ export const StellarWalletProvider = ({
   const [kit, setKit] = useState<StellarWalletsKit | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isPersistenceAvailable, setIsPersistenceAvailable] = useState(true);
+  const [walletError, setWalletError] = useState<WalletRecoveryState | null>(null);
+
+  // Remember the last wallet the user attempted to connect so retry/reconnect
+  // can re-run the same flow without the caller having to pass it again.
+  const lastAttemptedWalletRef = useRef<WalletId | null>(null);
+
+  // The chain identity every wallet flow is bound to. Derived from the
+  // configured network passphrase so it always reflects the chain the kit
+  // will actually sign for.
+  const chainId = NETWORK_PASSPHRASE ?? network;
 
   // Network mismatch modal state
   const [networkMismatchOpen, setNetworkMismatchOpen] = useState(false);
@@ -158,6 +198,26 @@ export const StellarWalletProvider = ({
   // Holds the AbortController for the current in-flight connection attempt.
   // Aborting it signals connect() to discard any resolved address.
   const connectionAbortRef = useRef<AbortController | null>(null);
+
+  const clearWalletError = useCallback(() => setWalletError(null), []);
+
+  /**
+   * Classify a raw wallet/RPC failure into a safe recovery state and surface it
+   * to the UI. Returns the classified state so callers can branch on the kind.
+   */
+  const surfaceWalletError = useCallback(
+    (error: unknown, fallbackMessage: string): WalletRecoveryState => {
+      const classified = classifyWalletError(error, fallbackMessage);
+      const state: WalletRecoveryState = {
+        kind: classified.kind,
+        message: classified.message,
+        actions: classified.actions,
+      };
+      setWalletError(state);
+      return state;
+    },
+    [],
+  );
 
   // Initialize kit and handle persistence
   useEffect(() => {
@@ -208,7 +268,7 @@ export const StellarWalletProvider = ({
             offrampService.syncWallet(liveAddress);
           }
         })
-        .catch(() => {
+        .catch((error: unknown) => {
           if (cancelled) return;
           // Wallet is locked, removed, or rejected the request — clear stale state.
           safeRemoveItem("stellar_wallet_address");
@@ -217,6 +277,13 @@ export const StellarWalletProvider = ({
           setAddress(null);
           setSelectedWalletId(null);
           setConnectionStatus("idle");
+
+          // Surface a classified recovery state so the UI can offer reconnect.
+          // Cancellations are silent; everything else is actionable.
+          if (!isWalletCancellationError(error)) {
+            lastAttemptedWalletRef.current = savedWalletId;
+            surfaceWalletError(error, "Wallet session could not be restored.");
+          }
         });
 
       return () => {
@@ -259,11 +326,18 @@ export const StellarWalletProvider = ({
     safeRemoveItem("@fundable/web:selected_wallet");
     safeRemoveItem("stellar_wallet_network");
     setConnectionStatus("idle");
+    // An explicit disconnect clears any stale recovery prompt.
+    setWalletError(null);
   }, [kit]);
 
   const setNetwork = useCallback(
     async (newNetwork: WalletNetwork) => {
       if (newNetwork === network) return;
+
+      // Invalidate any in-flight wallet flow before the chain identity changes.
+      // This aborts stale simulation/signing/confirmation and forces a renewed
+      // confirmation for subsequent transactions.
+      transactionGuard.invalidate("network-changed");
 
       // Block network switch while a connection is in progress — abort it first
       if (connectionAbortRef.current) {
@@ -289,6 +363,10 @@ export const StellarWalletProvider = ({
 
   const connect = useCallback(async (walletId: WalletId) => {
     if (!kit) return;
+
+    lastAttemptedWalletRef.current = walletId;
+    // Starting a fresh attempt clears any previous recovery prompt.
+    setWalletError(null);
 
     // Abort any previous in-flight attempt before starting a new one
     if (connectionAbortRef.current) {
@@ -402,6 +480,7 @@ export const StellarWalletProvider = ({
           "Your wallet extension is locked. Unlock it and try connecting again.",
         );
         setConnectionStatus("locked");
+        surfaceWalletError(error, "Your wallet extension is locked.");
         return;
       }
 
@@ -433,17 +512,46 @@ export const StellarWalletProvider = ({
       }
 
       setConnectionStatus("idle");
+      surfaceWalletError(error, `Failed to connect to ${walletId}.`);
     } finally {
       // Only clear the ref if this controller is still the active one
       if (connectionAbortRef.current === controller) {
         connectionAbortRef.current = null;
       }
     }
-  }, [kit, network]);
+  }, [kit, network, surfaceWalletError]);
+
+  const retryConnection = useCallback(async () => {
+    const walletId = lastAttemptedWalletRef.current ?? selectedWalletId;
+    if (!walletId) return;
+    await connect(walletId);
+  }, [connect, selectedWalletId]);
+
+  const reconnect = useCallback(async () => {
+    const walletId = lastAttemptedWalletRef.current ?? selectedWalletId;
+    if (!walletId) return;
+    await connect(walletId);
+  }, [connect, selectedWalletId]);
+
+  const switchNetworkAndReconnect = useCallback(
+    async (target: WalletNetwork) => {
+      const walletId = lastAttemptedWalletRef.current ?? selectedWalletId;
+      await setNetwork(target);
+      if (walletId) {
+        await connect(walletId);
+      }
+    },
+    [setNetwork, connect, selectedWalletId],
+  );
 
   const signTransaction = useCallback(
     async (xdr: string) => {
       if (!kit || !address) throw new Error("Wallet not connected");
+
+      // Bind this signing request to the chain identity active at call time.
+      // If the network switches mid-flight the guard aborts and we discard the
+      // signed XDR rather than returning a signature for a stale chain.
+      const flow = transactionGuard.begin("sign", chainId);
 
       let timeoutId: ReturnType<typeof setTimeout>;
       const timeoutPromise = new Promise<never>((_, reject) => {
@@ -457,12 +565,27 @@ export const StellarWalletProvider = ({
           kit.signTransaction(xdr),
           timeoutPromise,
         ]);
+
+        // The network may have changed while the wallet was signing.
+        if (!transactionGuard.isCurrent(flow)) {
+          throw new Error(
+            "Network changed while signing. Please review and confirm the transaction again.",
+          );
+        }
+
         return signedTxXdr;
+      } catch (error: unknown) {
+        // Classify signing failures so callers can offer retry / reconnect.
+        if (!isWalletCancellationError(error)) {
+          surfaceWalletError(error, "Transaction signing failed.");
+        }
+        throw error;
       } finally {
         clearTimeout(timeoutId!);
+        transactionGuard.end(flow);
       }
     },
-    [kit, address],
+    [kit, address, surfaceWalletError],
   );
 
   const openModal = useCallback(() => setIsModalOpen(true), []);
@@ -480,12 +603,18 @@ export const StellarWalletProvider = ({
         connectionStatus,
         selectedWalletId,
         network,
+        chainId,
         setNetwork,
         signTransaction,
         openModal,
         closeModal,
         isModalOpen,
         supportedWallets,
+        walletError,
+        clearWalletError,
+        retryConnection,
+        switchNetworkAndReconnect,
+        reconnect,
       }}
     >
       {children}
@@ -540,6 +669,15 @@ export const StellarWalletProvider = ({
               onClick={() => setNetworkMismatchOpen(false)}
             >
               Dismiss
+            </Button>
+            <Button
+              className="bg-violet-600 text-white hover:bg-violet-500"
+              onClick={() => {
+                setNetworkMismatchOpen(false);
+                void switchNetworkAndReconnect(network);
+              }}
+            >
+              Switch &amp; Reconnect
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -1,5 +1,5 @@
 /**
- * @module @fundable/sdk/recipes/wallet
+ * @module @fundable/sdk
  *
  * Wallet integration recipes for the Fundable Stellar SDK.
  *
@@ -58,7 +58,7 @@ export interface WalletConnectionResult {
  *
  * @example
  * ```typescript
- * import { connectWallet } from "@fundable/sdk/recipes/wallet";
+ * import { connectWallet } from "@fundable/sdk";
  *
  * const result = await connectWallet(myWallet);
  * if (result.success) {
@@ -97,7 +97,7 @@ export async function connectWallet(
  *
  * @example
  * ```typescript
- * import { signTransactionWithWallet } from "@fundable/sdk/recipes/wallet";
+ * import { signTransactionWithWallet } from "@fundable/sdk";
  *
  * try {
  *   const signedXdr = await signTransactionWithWallet(wallet, unsignedXdr);
@@ -143,7 +143,7 @@ export async function signTransactionWithWallet(
  * @param secretKey - Stellar secret key (starting with `S`).
  * @example
  * ```typescript
- * import { createTestWallet } from "@fundable/sdk/recipes/wallet";
+ * import { createTestWallet } from "@fundable/sdk";
  *
  * const wallet = createTestWallet("SAAAA...");
  * await wallet.connect();

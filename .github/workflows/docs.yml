@@ -1,0 +1,64 @@
+name: Documentation CI
+
+on:
+  push:
+    paths:
+      - 'docs/**'
+      - 'packages/sdk/src/__tests__/docs-validation.test.ts'
+      - 'packages/sdk/src/__tests__/webhook-schemas.ts'
+      - 'packages/sdk/src/__tests__/webhook-fixtures/**'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'packages/sdk/src/__tests__/docs-validation.test.ts'
+      - 'packages/sdk/src/__tests__/webhook-schemas.ts'
+      - 'packages/sdk/src/__tests__/webhook-fixtures/**'
+      - '.github/workflows/docs.yml'
+
+jobs:
+  validate-docs:
+    name: Validate Documentation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: Ensure no npm/yarn lockfiles exist
+        run: |
+          if find . -name "package-lock.json" -o -name "yarn.lock" | grep -q .; then
+            echo "❌ npm/yarn lockfile detected. This repo uses pnpm. Remove the lockfile and re-run."
+            find . -name "package-lock.json" -o -name "yarn.lock"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify required doc files exist
+        run: |
+          for f in \
+            docs/operations/component-ownership-runbook.md \
+            docs/audits/contract-security-remediation.md \
+            docs/webhooks/event-schemas.md \
+            docs/tax-reporting/sponsorship-tax-provenance.md; do
+            if [ ! -f "$f" ]; then
+              echo "❌ Missing required documentation file: $f"
+              exit 1
+            fi
+          done
+          echo "✅ All required documentation files are present."
+
+      - name: Run Docs Validation Test Suite
+        run: pnpm --filter @fundable/sdk test src/__tests__/docs-validation.test.ts

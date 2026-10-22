@@ -22,9 +22,32 @@ Fundable enforces sliding-window rate limiting to protect public infrastructure:
 - **Paid Tier 2:** 10,000 requests/day ($50/month, high-throughput dedicated quota)
 - **Enterprise Tier:** Custom / Unlimited (Contact support for custom capacity)
 
+GraphQL analytics, webhook subscriptions, campaign metadata IPFS pinning,
+creator stats, and verification SLA guarantees.
+
+## Rate Limits & Throttling
+All endpoints enforce sliding-window rate limiting (60 req/min for Read APIs,
+30 req/min for Creation APIs, 10 req/min for Execution APIs).
 Standard rate-limiting headers (`RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`)
 are returned on all responses. Exceeded limits return `429 Too Many Requests` with a `Retry-After` header.
 For detailed policy, see `docs/campaign-api-rate-limits.md`.
+
+### API Versioning & Deprecation Policy
+
+The API is versioned via the `info.version` field and the top-level
+`x-api-version` extension. The current stable version is `1.0.0`.
+
+- **Compatibility:** Within a major version, additive changes (new optional
+  fields, new endpoints, new enum values where documented as extensible) are
+  non-breaking. Removing fields, tightening validation, or changing response
+  shapes is a breaking change and requires a new major version.
+- **Deprecation:** Deprecated operations are annotated with `deprecated: true`,
+  an `x-sunset` ISO-8601 date, and an `x-deprecation-policy` reference.
+  Deprecated operations remain available until their sunset date, after which
+  they are removed in the next major version.
+- **Sunset window:** A minimum of 90 days notice is provided before any
+  operation is removed. Clients should monitor the `Deprecation` and `Sunset`
+  response headers where present.
 
 ## Servers
 
@@ -166,7 +189,7 @@ variables (defaults: velocity 0.4, engagement 0.3, completion 0.3).
 | Status Code | Description | Schema |
 | :--- | :--- | :--- |
 | `200` | Campaign details | `Campaign` |
-| `404` | - | - |
+| `404` | The requested resource was not found | `Error` |
 
 ---
 
@@ -193,7 +216,7 @@ variables (defaults: velocity 0.4, engagement 0.3, completion 0.3).
 | :--- | :--- | :--- |
 | `200` | Updated campaign | `Campaign` |
 | `400` | Request validation failed | `Error` |
-| `404` | - | - |
+| `404` | The requested resource was not found | `Error` |
 
 ---
 
@@ -216,7 +239,7 @@ variables (defaults: velocity 0.4, engagement 0.3, completion 0.3).
 | :--- | :--- | :--- |
 | `200` | CSV report | - |
 | `400` | Request validation failed | `Error` |
-| `404` | - | - |
+| `404` | The requested resource was not found | `Error` |
 
 ---
 
@@ -240,7 +263,7 @@ variables (defaults: velocity 0.4, engagement 0.3, completion 0.3).
 | Status Code | Description | Schema |
 | :--- | :--- | :--- |
 | `200` | Historical impact metrics including tree count, CO2 sequestration, and sponsor count | `object` |
-| `404` | - | - |
+| `404` | The requested resource was not found | `Error` |
 
 ---
 
@@ -577,6 +600,7 @@ Intended for testing and administrative event dispatch.
 
 **Summary:** Register mobile push subscription
 
+**Operation ID:** `createMobilePushSubscription`  
 
 Subscribe a device to receive campaign milestone push notifications.
 
@@ -589,8 +613,8 @@ Subscribe a device to receive campaign milestone push notifications.
 
 | Status Code | Description | Schema |
 | :--- | :--- | :--- |
-| `201` | Subscription registered | - |
-| `400` | Validation error | - |
+| `201` | Subscription registered | `SuccessMessage` |
+| `400` | Request validation failed | `Error` |
 
 ---
 
@@ -598,6 +622,7 @@ Subscribe a device to receive campaign milestone push notifications.
 
 **Summary:** Unregister mobile push subscription
 
+**Operation ID:** `deleteMobilePushSubscription`  
 
 ##### Parameters
 
@@ -610,8 +635,8 @@ Subscribe a device to receive campaign milestone push notifications.
 
 | Status Code | Description | Schema |
 | :--- | :--- | :--- |
-| `200` | Subscription removed | - |
-| `404` | Subscription not found | - |
+| `200` | Subscription removed | `SuccessMessage` |
+| `404` | The requested resource was not found | `Error` |
 
 ---
 
@@ -619,6 +644,7 @@ Subscribe a device to receive campaign milestone push notifications.
 
 **Summary:** Get subscriptions for a wallet
 
+**Operation ID:** `listMobilePushSubscriptions`  
 
 ##### Parameters
 
@@ -630,7 +656,7 @@ Subscribe a device to receive campaign milestone push notifications.
 
 | Status Code | Description | Schema |
 | :--- | :--- | :--- |
-| `200` | List of subscriptions | - |
+| `200` | List of subscriptions | `array` |
 
 ---
 
@@ -638,6 +664,7 @@ Subscribe a device to receive campaign milestone push notifications.
 
 **Summary:** Update milestone push preferences
 
+**Operation ID:** `updateMobilePushPreferences`  
 
 ##### Request Body
 
@@ -648,7 +675,7 @@ Subscribe a device to receive campaign milestone push notifications.
 
 | Status Code | Description | Schema |
 | :--- | :--- | :--- |
-| `200` | Preferences updated | - |
+| `200` | Preferences updated | `SuccessMessage` |
 
 ---
 
@@ -656,6 +683,7 @@ Subscribe a device to receive campaign milestone push notifications.
 
 **Summary:** Dispatch milestone push notification
 
+**Operation ID:** `dispatchMobilePushNotification`  
 
 ##### Request Body
 
@@ -666,7 +694,7 @@ Subscribe a device to receive campaign milestone push notifications.
 
 | Status Code | Description | Schema |
 | :--- | :--- | :--- |
-| `200` | Milestone notifications dispatched | - |
+| `200` | Milestone notifications dispatched | `SuccessMessage` |
 
 ---
 
@@ -676,6 +704,7 @@ Subscribe a device to receive campaign milestone push notifications.
 
 **Summary:** Retrieve immutable campaign verification audit trail
 
+**Operation ID:** `getCampaignVerificationAudit`  
 
 ##### Parameters
 
@@ -687,7 +716,7 @@ Subscribe a device to receive campaign milestone push notifications.
 
 | Status Code | Description | Schema |
 | :--- | :--- | :--- |
-| `200` | Complete audit trail | - |
+| `200` | Complete audit trail | `array` |
 
 ---
 
@@ -695,6 +724,7 @@ Subscribe a device to receive campaign milestone push notifications.
 
 **Summary:** Log verification activity
 
+**Operation ID:** `logCampaignVerificationActivity`  
 
 ##### Parameters
 
@@ -711,7 +741,7 @@ Subscribe a device to receive campaign milestone push notifications.
 
 | Status Code | Description | Schema |
 | :--- | :--- | :--- |
-| `201` | Activity logged to immutable trail | - |
+| `201` | Activity logged to immutable trail | `VerificationAuditEntry` |
 
 ---
 
@@ -757,3 +787,5 @@ Subscribe a device to receive campaign milestone push notifications.
 | `TrendingWeights` | `object` | Properties: `velocity, engagement, completion` |
 | `TrendingCampaignMeta` | `object` | Properties: `total, evaluated, weights, generatedAt, network` |
 | `SuccessMessage` | `object` | Properties: `success, message` |
+| `MobilePushSubscription` | `object` | Properties: `id, subscriberAddress, campaignId, endpoint, keys, deviceType, enabledMilestones` |
+| `VerificationAuditEntry` | `object` | Properties: `id, campaignId, activityType, actor, details, txHash, createdAt` |

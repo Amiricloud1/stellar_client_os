@@ -4,7 +4,20 @@
  * Exposes aggregate payment stream metrics queryable by region, category,
  * and asset (token). All monetary amounts are returned as strings to avoid
  * JavaScript BigInt serialisation issues.
+ *
+ * Query safety (issue #60): the schema is served with depth-limit and
+ * complexity-limit validation rules plus a per-request execution timeout.
+ * See `./limits` for the exported rules, budgets, and timeout helper.
  */
+
+import type { GraphQLSchema } from 'graphql';
+import {
+  DEFAULT_QUERY_LIMITS,
+  createDepthLimitRule,
+  createComplexityLimitRule,
+  withExecutionTimeout,
+  type QueryLimits,
+} from './limits';
 
 export const typeDefs = /* GraphQL */`
   """Supported Stellar network."""
@@ -126,12 +139,58 @@ export const typeDefs = /* GraphQL */`
     latestStreamAt: Int
   }
 
-  """Pagination arguments for list queries."""
+  """
+  Pagination arguments shared by all list queries (issue #59).
+
+  Ordering is stable: results are always sorted by the query's default sort
+  key with a unique tiebreaker (id) so pages never overlap or skip items.
+  """
   input PaginationInput {
-    """Maximum number of items to return (default 20, max 100)."""
+    """
+    Maximum number of items to return. Defaults to 20 and is capped at 100;
+    values above the cap are clamped to 100, values below 1 are rejected.
+    """
     limit: Int
     """Zero-based offset for the result set (default 0)."""
     offset: Int
+  }
+
+  """Sort direction shared by all list queries."""
+  enum SortDirection {
+    ASC
+    DESC
+  }
+
+  """
+  Generic sort input shared by all list queries (issue #59).
+
+  When `field` is omitted the query's documented default sort field is used.
+  When `direction` is omitted it defaults to DESC. A unique tiebreaker is
+  always applied so ordering is deterministic across pages.
+  """
+  input SortInput {
+    """Field to sort by. Omit to use the query's default sort field."""
+    field: String
+    """Sort direction (default DESC)."""
+    direction: SortDirection
+  }
+
+  """Shared pagination metadata returned alongside every list result."""
+  type PageInfo {
+    """Number of items requested after clamping (default 20, max 100)."""
+    limit: Int!
+    """Offset applied to the result set."""
+    offset: Int!
+    """Total number of items matching the filter, ignoring pagination."""
+    totalCount: Int!
+    """Whether more items exist after this page."""
+    hasNextPage: Boolean!
+    """Whether items exist before this page."""
+    hasPreviousPage: Boolean!
+    """Sort field actually applied (after defaulting)."""
+    sortField: String!
+    """Sort direction actually applied (after defaulting)."""
+    sortDirection: SortDirection!
   }
 
   """Filter arguments for region metrics."""
@@ -212,11 +271,6 @@ export const typeDefs = /* GraphQL */`
     raisedAmount
     sponsorCount
     treeCount
-  }
-
-  enum SortDirection {
-    ASC
-    DESC
   }
 
   input CampaignFilter {
@@ -483,11 +537,80 @@ export const typeDefs = /* GraphQL */`
     nextMatchAmount: String!
   }
 
+  """
+  A page of campaigns plus shared pagination metadata (issue #59).
+  """
+  type CampaignPage {
+    items: [Campaign!]!
+    pageInfo: PageInfo!
+  }
+
+  """
+  A page of backers plus shared pagination metadata (issue #59).
+  """
+  type BackerPage {
+    items: [CampaignSponsor!]!
+    pageInfo: PageInfo!
+  }
+
+  """
+  A page of audit entries plus shared pagination metadata (issue #59).
+  """
+  type AuditEntryPage {
+    items: [CampaignStatusHistory!]!
+    pageInfo: PageInfo!
+  }
+
+  """
+  A page of analytics rows plus shared pagination metadata (issue #59).
+  """
+  type AnalyticsPage {
+    items: [DailyFundingPoint!]!
+    pageInfo: PageInfo!
+  }
+
   type Query {
     """
     Search individual sponsored trees derived from indexed payment streams.
+
+    Paginated with the shared PaginationInput (default limit 20, max 100).
+    Default sort: createdAt DESC, tiebroken by id ASC.
     """
     campaigns(filter: CampaignFilter, sort: CampaignSort, pagination: PaginationInput, network: Network): [Campaign!]!
+
+    """
+    Paginated campaign list with shared pagination metadata (issue #59).
+
+    Default sort: createdAt DESC, tiebroken by id ASC. Limit defaults to 20
+    and is capped at 100.
+    """
+    campaignPage(filter: CampaignFilter, sort: SortInput, pagination: PaginationInput, network: Network): CampaignPage!
+
+    """
+    Paginated backer (sponsor) list for a campaign with shared pagination
+    metadata (issue #59).
+
+    Default sort: sponsoredAt DESC, tiebroken by id ASC. Limit defaults to 20
+    and is capped at 100.
+    """
+    campaignBackers(campaignId: ID!, sort: SortInput, pagination: PaginationInput, network: Network): BackerPage!
+
+    """
+    Paginated audit trail of campaign status changes with shared pagination
+    metadata (issue #59).
+
+    Default sort: changedAt DESC, tiebroken by id ASC. Limit defaults to 20
+    and is capped at 100.
+    """
+    campaignAuditLog(campaignId: ID!, sort: SortInput, pagination: PaginationInput): AuditEntryPage!
+
+    """
+    Paginated daily funding trend for a campaign with shared pagination
+    metadata (issue #59).
+
+    Default sort: date DESC. Limit defaults to 20 and is capped at 100.
+    """
+    campaignAnalyticsTrend(campaignId: ID!, sort: SortInput, pagination: PaginationInput, network: Network): AnalyticsPage!
 
     trees(filter: TreeFilter, pagination: PaginationInput, network: Network): [Tree!]!
 
@@ -610,3 +733,39 @@ export const typeDefs = /* GraphQL */`
     cloneCampaign(id: ID!, network: Network): CloneResult
   }
 `;
+
+/**
+ * Build the validation rule set that enforces the depth and complexity
+ * budgets for a request. Exported so the GraphQL server setup can pass the
+ * result as `validationRules` to the execution engine.
+ *
+ * @param limits Optional budget overrides (defaults to DEFAULT_QUERY_LIMITS).
+ */
+export function createQueryValidationRules(limits: Partial<QueryLimits> = {}) {
+  const resolved: QueryLimits = { ...DEFAULT_QUERY_LIMITS, ...limits };
+  return [createDepthLimitRule(resolved), createComplexityLimitRule(resolved)];
+}
+
+/**
+ * Wrap a GraphQL schema so every resolver execution is bounded by the
+ * configured timeout. Abusive or runaway queries are rejected with a clear
+ * error instead of holding server resources indefinitely.
+ *
+ * @param schema The schema to guard.
+ * @param limits Optional budget overrides (defaults to DEFAULT_QUERY_LIMITS).
+ */
+export function applyQueryLimits(
+  schema: GraphQLSchema,
+  limits: Partial<QueryLimits> = {},
+): GraphQLSchema {
+  const resolved: QueryLimits = { ...DEFAULT_QUERY_LIMITS, ...limits };
+  return withExecutionTimeout(schema, resolved);
+}
+
+export {
+  DEFAULT_QUERY_LIMITS,
+  createDepthLimitRule,
+  createComplexityLimitRule,
+  withExecutionTimeout,
+};
+export type { QueryLimits };

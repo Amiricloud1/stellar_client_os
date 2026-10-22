@@ -1,5 +1,5 @@
 /**
- * @module @fundable/sdk/recipes/transactions
+ * @module @fundable/sdk
  *
  * Transaction lifecycle recipes for the Fundable Stellar SDK.
  *
@@ -56,7 +56,7 @@ export interface TransactionOutcome<T = unknown> {
  *
  * @example
  * ```typescript
- * import { executeTransaction } from "@fundable/sdk/recipes/transactions";
+ * import { executeTransaction } from "@fundable/sdk";
  *
  * const outcome = await executeTransaction(
  *   tx,
@@ -91,7 +91,7 @@ export async function executeTransaction<T = unknown>(
   } catch (error) {
     let hash: string | undefined;
     try {
-      hash = tx.signed?.hash().toString("hex");
+      hash = tx.signed ? Buffer.from(tx.signed.hash()).toString("hex") : undefined;
     } catch {
       // Transaction not yet signed — no hash available.
     }
@@ -128,7 +128,7 @@ export async function executeTransaction<T = unknown>(
  *
  * @example
  * ```typescript
- * import { waitForTransactionWithRetry } from "@fundable/sdk/recipes/transactions";
+ * import { waitForTransactionWithRetry } from "@fundable/sdk";
  *
  * await tx.signAndSend({ signTransaction: (xdr) => wallet.signTransaction(xdr) });
  *
@@ -161,7 +161,7 @@ export async function waitForTransactionWithRetry<T = unknown>(
  *
  * @example
  * ```typescript
- * import { cancelStreamSafely } from "@fundable/sdk/recipes/transactions";
+ * import { cancelStreamSafely } from "@fundable/sdk";
  *
  * const cancelTx = await client.cancelStream({ streamId: 123n });
  * const outcome = await cancelStreamSafely(cancelTx, rpcUrl, signer);
@@ -192,7 +192,7 @@ export async function cancelStreamSafely<T = unknown>(
  *
  * @example
  * ```typescript
- * import { isRetryableError } from "@fundable/sdk/recipes/transactions";
+ * import { isRetryableError } from "@fundable/sdk";
  *
  * if (isRetryableError(error)) {
  *   // Retry with exponential backoff

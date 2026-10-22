@@ -2,6 +2,11 @@ import { QueryClient, QueryKey, useMutation, useQueryClient } from '@tanstack/re
 import toast from 'react-hot-toast';
 import { withdraw } from '@/lib/api';
 import { useWallet } from '@/providers/StellarWalletProvider';
+import {
+    classifyWalletError,
+    getWalletErrorRecovery,
+    type WalletErrorRecovery,
+} from '@/lib/wallet-errors';
 
 type WithdrawInput = Parameters<typeof withdraw>[0];
 
@@ -9,6 +14,14 @@ interface WithdrawMutationContext {
     previousStreams: Array<[QueryKey, unknown]>;
     streamQueryKey?: QueryKey;
     previousStream?: unknown;
+    chainGuard?: { assertCurrentChain: () => void };
+}
+
+export interface WithdrawErrorState {
+    message: string;
+    recovery: WalletErrorRecovery;
+    /** Form values captured at failure time so the UI can restore them. */
+    formValues?: WithdrawInput;
 }
 
 function restorePreviousStreams(
@@ -29,13 +42,22 @@ function restorePreviousStreams(
 export function useWithdraw() {
     const queryClient = useQueryClient();
     const { address, signTransaction } = useWallet();
+    const { beginChainBoundTransaction } = useChainBoundTransaction();
 
     return useMutation({
-        mutationFn: (params: WithdrawInput) => {
+        mutationFn: async (params: WithdrawInput) => {
+            // Bind this flow to the chain identity captured at start. If the
+            // wallet network changes mid-flight, abort before signing.
+            const guard = beginChainBoundTransaction();
+            guard.assertCurrentChain();
+
             return withdraw({
                 ...params,
                 sender: params.sender || address || undefined,
-                signTransaction,
+                signTransaction: (transaction: string, options?: unknown) => {
+                    guard.assertCurrentChain();
+                    return signTransaction(transaction, options as never);
+                },
             });
         },
         onMutate: async (variables): Promise<WithdrawMutationContext> => {
@@ -59,7 +81,7 @@ export function useWithdraw() {
 
             return { previousStreams, streamQueryKey, previousStream };
         },
-        onError: (_error, variables, context) => {
+        onError: (error, variables, context) => {
             const restoredStreams = restorePreviousStreams(queryClient, context?.previousStreams);
             let restoredStreamDetails = false;
 
@@ -74,17 +96,36 @@ export function useWithdraw() {
                     queryClient.invalidateQueries({ queryKey: ['stream', variables.streamId] });
                 }
             }
+
+            // Classify the failure and surface a safe, actionable message. Form
+            // values are preserved via the mutation's `variables` so the caller
+            // can repopulate the form without losing user input.
+            const classified = classifyWalletError(error);
+            const recovery = getWalletErrorRecovery(classified);
+            toast.error(recovery.message);
         },
         onSettled: (_data, _error, variables) => {
-            // Only show error toast on final failure (after all retries)
-            if (_error) {
-                toast.error('Withdraw failed. Refreshing latest data.');
-            }
-
             queryClient.invalidateQueries({ queryKey: ['streams'] });
             if (typeof variables?.streamId === 'number') {
                 queryClient.invalidateQueries({ queryKey: ['stream', variables.streamId] });
             }
         },
     });
+}
+
+/**
+ * Derive a recoverable error state from a withdraw mutation error, including
+ * the form values that should be restored so retries don't lose user input.
+ */
+export function getWithdrawErrorState(
+    error: unknown,
+    variables?: WithdrawInput
+): WithdrawErrorState {
+    const classified = classifyWalletError(error);
+    const recovery = getWalletErrorRecovery(classified);
+    return {
+        message: recovery.message,
+        recovery,
+        formValues: variables,
+    };
 }

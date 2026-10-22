@@ -17,9 +17,32 @@ info:
     - **Paid Tier 2:** 10,000 requests/day ($50/month, high-throughput dedicated quota)
     - **Enterprise Tier:** Custom / Unlimited (Contact support for custom capacity)
 
+    GraphQL analytics, webhook subscriptions, campaign metadata IPFS pinning,
+    creator stats, and verification SLA guarantees.
+
+    ## Rate Limits & Throttling
+    All endpoints enforce sliding-window rate limiting (60 req/min for Read APIs,
+    30 req/min for Creation APIs, 10 req/min for Execution APIs).
     Standard rate-limiting headers (`RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`)
     are returned on all responses. Exceeded limits return `429 Too Many Requests` with a `Retry-After` header.
     For detailed policy, see `docs/campaign-api-rate-limits.md`.
+
+    ### API Versioning & Deprecation Policy
+
+    The API is versioned via the `info.version` field and the top-level
+    `x-api-version` extension. The current stable version is `1.0.0`.
+
+    - **Compatibility:** Within a major version, additive changes (new optional
+      fields, new endpoints, new enum values where documented as extensible) are
+      non-breaking. Removing fields, tightening validation, or changing response
+      shapes is a breaking change and requires a new major version.
+    - **Deprecation:** Deprecated operations are annotated with `deprecated: true`,
+      an `x-sunset` ISO-8601 date, and an `x-deprecation-policy` reference.
+      Deprecated operations remain available until their sunset date, after which
+      they are removed in the next major version.
+    - **Sunset window:** A minimum of 90 days notice is provided before any
+      operation is removed. Clients should monitor the `Deprecation` and `Sunset`
+      response headers where present.
   license:
     name: MIT
     url: https://opensource.org/license/mit/
@@ -58,6 +81,8 @@ tags:
     description: Mobile push notification subscriptions and milestone delivery
   - name: CampaignAudit
     description: Immutable on-chain verification audit trail for campaigns
+
+x-api-version: 1.0.0
 
 paths:
   /api/campaigns/trending:
@@ -114,6 +139,7 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '500':
           $ref: '#/components/responses/InternalServerError'
+
   /api/campaigns:
     get:
       tags: [Campaigns]
@@ -788,6 +814,7 @@ paths:
     post:
       tags: [MobilePush]
       summary: Register mobile push subscription
+      operationId: createMobilePushSubscription
       description: Subscribe a device to receive campaign milestone push notifications.
       requestBody:
         required: true
@@ -822,11 +849,16 @@ paths:
       responses:
         '201':
           description: Subscription registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
         '400':
-          description: Validation error
+          $ref: '#/components/responses/BadRequest'
     delete:
       tags: [MobilePush]
       summary: Unregister mobile push subscription
+      operationId: deleteMobilePushSubscription
       parameters:
         - in: query
           name: endpoint
@@ -839,11 +871,16 @@ paths:
       responses:
         '200':
           description: Subscription removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
         '404':
-          description: Subscription not found
+          $ref: '#/components/responses/NotFound'
     get:
       tags: [MobilePush]
       summary: Get subscriptions for a wallet
+      operationId: listMobilePushSubscriptions
       parameters:
         - in: query
           name: address
@@ -852,11 +889,18 @@ paths:
       responses:
         '200':
           description: List of subscriptions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MobilePushSubscription'
 
   /api/mobile/push/preferences:
     put:
       tags: [MobilePush]
       summary: Update milestone push preferences
+      operationId: updateMobilePushPreferences
       requestBody:
         required: true
         content:
@@ -875,11 +919,16 @@ paths:
       responses:
         '200':
           description: Preferences updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
 
   /api/mobile/push/notify:
     post:
       tags: [MobilePush]
       summary: Dispatch milestone push notification
+      operationId: dispatchMobilePushNotification
       requestBody:
         required: true
         content:
@@ -898,11 +947,16 @@ paths:
       responses:
         '200':
           description: Milestone notifications dispatched
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
 
   /api/campaigns/{id}/verification-audit:
     get:
       tags: [CampaignAudit]
       summary: Retrieve immutable campaign verification audit trail
+      operationId: getCampaignVerificationAudit
       parameters:
         - in: path
           name: id
@@ -911,9 +965,16 @@ paths:
       responses:
         '200':
           description: Complete audit trail
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/VerificationAuditEntry'
     post:
       tags: [CampaignAudit]
       summary: Log verification activity
+      operationId: logCampaignVerificationActivity
       parameters:
         - in: path
           name: id
@@ -937,6 +998,10 @@ paths:
       responses:
         '201':
           description: Activity logged to immutable trail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerificationAuditEntry'
 
 components:
   securitySchemes:
@@ -997,6 +1062,12 @@ components:
             $ref: '#/components/schemas/Error'
     InternalServerError:
       description: Unexpected server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: The requested resource was not found
       content:
         application/json:
           schema:
@@ -1122,7 +1193,7 @@ components:
         changedBy: { type: string }
         reason: { type: string }
         treeCount: { type: integer, minimum: 0, description: 'Cumulative trees planted; crossing 1000 or 5000 emits a campaign_milestone_reached webhook' }
-        co2Sequestration: { type: string, pattern: '^\\d+(\\.\\d+)?$', description: 'Cumulative CO2 sequestration in metric tonnes; crossing 10 emits a campaign_milestone_reached webhook' }
+        co2Sequestration: { type: string, pattern: '^\d+(\.\d+)?$', description: 'Cumulative CO2 sequestration in metric tonnes; crossing 10 emits a campaign_milestone_reached webhook' }
     Pagination:
       type: object
       required: [limit, offset, count]
@@ -1582,3 +1653,37 @@ components:
           type: boolean
         message:
           type: string
+    MobilePushSubscription:
+      type: object
+      required: [id, subscriberAddress, endpoint, keys, enabledMilestones]
+      properties:
+        id: { type: string }
+        subscriberAddress: { type: string }
+        campaignId: { type: string, default: '*' }
+        endpoint: { type: string }
+        keys:
+          type: object
+          properties:
+            p256dh: { type: string }
+            auth: { type: string }
+        deviceType:
+          type: string
+          enum: [mobile_ios, mobile_android, mobile_web, unknown]
+        enabledMilestones:
+          type: array
+          items:
+            type: string
+            enum: [trees_planted, verification_complete, campaign_finished, impact_achieved]
+    VerificationAuditEntry:
+      type: object
+      required: [id, campaignId, activityType, actor, details, createdAt]
+      properties:
+        id: { type: string }
+        campaignId: { type: string }
+        activityType:
+          type: string
+          enum: [submitted_for_review, verifier_comments, photo_uploaded, approved, rejected]
+        actor: { type: string }
+        details: { type: string }
+        txHash: { type: string }
+        createdAt: { type: string, format: date-time }

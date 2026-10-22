@@ -8,17 +8,29 @@ export const metadata: Metadata = {
 
 export default function CampaignsPage() {
   return (
-    <div className="container mx-auto py-8 px-4">
-      <div className="mb-6">
-        <h1 className="text-3xl font-bold tracking-tight text-zinc-900 dark:text-white">
+    <div
+      className="container mx-auto py-8 px-4"
+      data-testid="campaigns-page"
+      data-e2e-page="campaigns"
+    >
+      <div className="mb-6" data-testid="campaigns-header">
+        <h1
+          className="text-3xl font-bold tracking-tight text-zinc-900 dark:text-white"
+          data-testid="campaigns-heading"
+        >
           Explore Impact Campaigns
         </h1>
-        <p className="mt-2 text-zinc-600 dark:text-zinc-400">
+        <p
+          className="mt-2 text-zinc-600 dark:text-zinc-400"
+          data-testid="campaigns-description"
+        >
           Find and back environmental campaigns with full-text search by tree species, geographic location, and verified creator.
         </p>
       </div>
 
-      <CampaignSearch />
+      <div data-testid="campaigns-search-region" data-e2e-region="campaign-discovery">
+        <CampaignSearch />
+      </div>
     </div>
   );
 }

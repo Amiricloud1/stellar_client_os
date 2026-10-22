@@ -10,6 +10,67 @@ import { StreamRecord } from './validations'
 export const server = new Horizon.Server('https://horizon-testnet.stellar.org')
 export const networkPassphrase = Networks.TESTNET
 
+/**
+ * Identity of the chain a wallet flow is bound to.
+ *
+ * Captured when a simulation/signing/confirmation flow starts and re-checked
+ * before each subsequent step so that a network switch mid-flight aborts the
+ * stale flow instead of submitting to the wrong chain (issue #70).
+ */
+export interface ChainIdentity {
+  /** Stellar network passphrase (e.g. `Networks.TESTNET`). */
+  networkPassphrase: string
+  /** Chain id used by the SDK client wrappers; defaults to the passphrase. */
+  chainId: string
+}
+
+/** Result of comparing a captured identity against the active network. */
+export type ChainIdentityCheck =
+  | { ok: true; identity: ChainIdentity }
+  | {
+      ok: false
+      reason: 'network-changed'
+      expected: ChainIdentity
+      actual: ChainIdentity
+    }
+
+/**
+ * Build a {@link ChainIdentity} for the currently active network.
+ *
+ * `chainId` is optional so callers that only know the passphrase still get a
+ * stable identity; it falls back to the passphrase.
+ */
+export function getActiveChainIdentity(chainId?: string): ChainIdentity {
+  return {
+    networkPassphrase,
+    chainId: chainId ?? networkPassphrase,
+  }
+}
+
+/**
+ * Compare a previously captured identity against the active network.
+ *
+ * Returns a typed mismatch result (never throws) so wallet flows can abort and
+ * require renewed confirmation after a network switch.
+ */
+export function checkChainIdentity(
+  captured: ChainIdentity,
+  active: ChainIdentity = getActiveChainIdentity(captured.chainId),
+): ChainIdentityCheck {
+  if (
+    captured.networkPassphrase !== active.networkPassphrase ||
+    captured.chainId !== active.chainId
+  ) {
+    return {
+      ok: false,
+      reason: 'network-changed',
+      expected: captured,
+      actual: active,
+    }
+  }
+  return { ok: true, identity: active }
+}
+
 export class StellarService {
   static async getAccountInfo(publicKey: string) {
     try {

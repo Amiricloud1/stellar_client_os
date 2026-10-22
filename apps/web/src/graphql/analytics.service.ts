@@ -15,6 +15,16 @@
  * the network.
  */
 
+import {
+  DEFAULT_MAX_AUTHORITY_STALENESS_MS,
+  getAnalyticsMetricDefinitions,
+  validateStreamMetricsAgainstLedger,
+  type AnalyticsAuthorityReport,
+  type AnalyticsMetricDefinition,
+  type AnalyticsMetricKey,
+  type AuthoritativeLedgerSnapshot,
+} from "@/lib/analytics-authority";
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export type StreamStatusFilter = "Active" | "Paused" | "Canceled" | "Completed";
@@ -77,6 +87,11 @@ export interface GlobalMetrics {
   latestStreamAt: number | null;
 }
 
+export interface GlobalMetricsWithAuthority extends GlobalMetrics {
+  authority: AnalyticsAuthorityReport;
+  metricDefinitions: Record<AnalyticsMetricKey, AnalyticsMetricDefinition>;
+}
+
 export interface RegionFilter {
   region?: string;
   asset?: string;
@@ -101,6 +116,101 @@ export interface AssetFilter {
 export interface PaginationInput {
   limit?: number;
   offset?: number;
+}
+
+/**
+ * Shared pagination contract (issue #59).
+ *
+ * All list endpoints (campaigns, backers, audit, analytics) accept the same
+ * `PaginationInput` shape and return a `PageInfo` alongside their items so
+ * clients can page deterministically.
+ */
+export interface PageInfo {
+  /** Number of items requested (after clamping to the shared bounds). */
+  limit: number;
+  /** Number of items skipped. */
+  offset: number;
+  /** Total number of items available before pagination. */
+  totalCount: number;
+  /** Whether more items exist after this page. */
+  hasNextPage: boolean;
+  /** Whether items exist before this page. */
+  hasPreviousPage: boolean;
+}
+
+/** A paginated list result: items plus shared page metadata. */
+export interface PaginatedResult<T> {
+  items: T[];
+  pageInfo: PageInfo;
+}
+
+/** Default page size when the caller does not specify a limit. */
+export const DEFAULT_PAGE_LIMIT = 20;
+/** Maximum page size a caller may request. */
+export const MAX_PAGE_LIMIT = 100;
+
+/** Sort direction shared by all list endpoints. */
+export type SortDirection = "ASC" | "DESC";
+
+/** Normalize a requested limit into the shared [1, MAX_PAGE_LIMIT] bounds. */
+export function normalizeLimit(limit?: number): number {
+  if (limit === undefined || limit === null || !Number.isFinite(limit)) {
+    return DEFAULT_PAGE_LIMIT;
+  }
+  const floored = Math.floor(limit);
+  if (floored < 1) return 1;
+  return Math.min(floored, MAX_PAGE_LIMIT);
+}
+
+/** Normalize a requested offset into a non-negative integer. */
+export function normalizeOffset(offset?: number): number {
+  if (offset === undefined || offset === null || !Number.isFinite(offset)) return 0;
+  const floored = Math.floor(offset);
+  return floored < 0 ? 0 : floored;
+}
+
+/**
+ * Apply the shared pagination contract to an already-sorted list.
+ *
+ * Returns the page of items plus `PageInfo` metadata. Callers are
+ * responsible for sorting deterministically before calling this helper.
+ */
+export function paginateWithInfo<T>(
+  items: T[],
+  pagination?: PaginationInput
+): PaginatedResult<T> {
+  const limit = normalizeLimit(pagination?.limit);
+  const offset = normalizeOffset(pagination?.offset);
+  const totalCount = items.length;
+  const pageItems = items.slice(offset, offset + limit);
+  return {
+    items: pageItems,
+    pageInfo: {
+      limit,
+      offset,
+      totalCount,
+      hasNextPage: offset + pageItems.length < totalCount,
+      hasPreviousPage: offset > 0 && totalCount > 0,
+    },
+  };
+}
+
+/**
+ * Stable comparator helper: compares two string keys, applying direction.
+ * Used to guarantee deterministic ordering for equal primary sort keys.
+ */
+export function compareStrings(a: string, b: string, direction: SortDirection = "ASC"): number {
+  const cmp = a < b ? -1 : a > b ? 1 : 0;
+  return direction === "ASC" ? cmp : -cmp;
+}
+
+/**
+ * Stable comparator helper for bigint values (e.g. volumes), applying
+ * direction. Falls back to a string tiebreaker supplied by the caller.
+ */
+export function compareBigInts(a: bigint, b: bigint, direction: SortDirection = "DESC"): number {
+  const cmp = a < b ? -1 : a > b ? 1 : 0;
+  return direction === "ASC" ? cmp : -cmp;
 }
 
 // ── Sponsor impact comparison (issue #639) ───────────────────────────────────
@@ -194,6 +304,7 @@ function toCo2Kg(volumeUsd: bigint): number {
 /** Pluggable data source interface — swap for a real DB/RPC in production. */
 export interface StreamDataSource {
   getStreams(network: string): Promise<StreamRecord[]>;
+  getLedgerSnapshot?(network: string): Promise<AuthoritativeLedgerSnapshot | null>;
 }
 
 // ── Default data source (reads from env-configured Stellar RPC) ───────────────
@@ -291,16 +402,16 @@ function filterStreams(
   });
 }
 
-function paginate<T>(items: T[], pagination?: PaginationInput): T[] {
-  const limit = Math.min(pagination?.limit ?? 20, 100);
-  const offset = pagination?.offset ?? 0;
-  return items.slice(offset, offset + limit);
-}
+
 
 // ── Analytics Service ─────────────────────────────────────────────────────────
 
 export class AnalyticsService {
   constructor(private readonly dataSource: StreamDataSource = new DefaultStreamDataSource()) {}
+
+  getMetricDefinitions(): Record<AnalyticsMetricKey, AnalyticsMetricDefinition> {
+    return getAnalyticsMetricDefinitions();
+  }
 
   // ── globalMetrics ─────────────────────────────────────────────────────────
 
@@ -330,13 +441,68 @@ export class AnalyticsService {
     };
   }
 
+  async getGlobalMetricsWithAuthority(
+    network = "testnet",
+    options: {
+      now?: number;
+      maxStalenessMs?: number;
+      ledgerSnapshot?: AuthoritativeLedgerSnapshot | null;
+    } = {},
+  ): Promise<GlobalMetricsWithAuthority> {
+    const metrics = await this.getGlobalMetrics(network);
+    const now = options.now ?? Date.now();
+    const maxStalenessMs = options.maxStalenessMs ?? DEFAULT_MAX_AUTHORITY_STALENESS_MS;
+
+    let authority: AnalyticsAuthorityReport;
+    if (options.ledgerSnapshot !== undefined) {
+      authority = validateStreamMetricsAgainstLedger(metrics, options.ledgerSnapshot, {
+        now,
+        maxStalenessMs,
+      });
+    } else if (typeof this.dataSource.getLedgerSnapshot === "function") {
+      try {
+        const snapshot = await this.dataSource.getLedgerSnapshot(network);
+        authority = validateStreamMetricsAgainstLedger(metrics, snapshot, {
+          now,
+          maxStalenessMs,
+        });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : "Authority source unreachable";
+        authority = {
+          state: "unavailable",
+          isAuthoritative: false,
+          isFresh: false,
+          ledgerSequence: null,
+          ledgerClosedAt: null,
+          checkedAt: now,
+          stalenessMs: null,
+          maxStalenessMs,
+          reason: "authority_error",
+          message: `Authoritative stream ledger query failed: ${detail}`,
+          discrepancies: [],
+        };
+      }
+    } else {
+      authority = validateStreamMetricsAgainstLedger(metrics, null, {
+        now,
+        maxStalenessMs,
+      });
+    }
+
+    return {
+      ...metrics,
+      authority,
+      metricDefinitions: getAnalyticsMetricDefinitions(),
+    };
+  }
+
   // ── regionMetrics ─────────────────────────────────────────────────────────
 
   async getRegionMetrics(
     filter?: RegionFilter,
     pagination?: PaginationInput,
     network = "testnet"
-  ): Promise<RegionMetrics[]> {
+  ): Promise<PaginatedResult<RegionMetrics>> {
     let streams = await this.dataSource.getStreams(network);
     streams = filterStreams(streams, filter ?? {});
 
@@ -366,10 +532,13 @@ export class AnalyticsService {
       };
     });
 
-    // Sort by totalStreams descending
-    results.sort((a, b) => b.totalStreams - a.totalStreams);
+    // Stable ordering: totalStreams desc, then region asc as a tiebreaker.
+    results.sort(
+      (a, b) =>
+        b.totalStreams - a.totalStreams || compareStrings(a.region, b.region, "ASC")
+    );
 
-    return paginate(results, pagination);
+    return paginateWithInfo(results, pagination);
   }
 
   // ── categoryMetrics ───────────────────────────────────────────────────────
@@ -378,7 +547,7 @@ export class AnalyticsService {
     filter?: CategoryFilter,
     pagination?: PaginationInput,
     network = "testnet"
-  ): Promise<CategoryMetrics[]> {
+  ): Promise<PaginatedResult<CategoryMetrics>> {
     let streams = await this.dataSource.getStreams(network);
     streams = filterStreams(streams, filter ?? {});
 
@@ -410,8 +579,12 @@ export class AnalyticsService {
       }
     );
 
-    results.sort((a, b) => b.totalStreams - a.totalStreams);
-    return paginate(results, pagination);
+    // Stable ordering: totalStreams desc, then category asc as a tiebreaker.
+    results.sort(
+      (a, b) =>
+        b.totalStreams - a.totalStreams || compareStrings(a.category, b.category, "ASC")
+    );
+    return paginateWithInfo(results, pagination);
   }
 
   // ── assetMetrics ──────────────────────────────────────────────────────────
@@ -420,13 +593,18 @@ export class AnalyticsService {
     filter?: AssetFilter,
     pagination?: PaginationInput,
     network = "testnet"
-  ): Promise<AssetMetrics[]> {
+  ): Promise<PaginatedResult<AssetMetrics>> {
     let streams = await this.dataSource.getStreams(network);
     streams = filterStreams(streams, filter ?? {});
 
     const results = aggregateByAsset(streams);
-    results.sort((a, b) => Number(toBigInt(b.totalVolume) - toBigInt(a.totalVolume)));
-    return paginate(results, pagination);
+    // Stable ordering: totalVolume desc, then asset asc as a tiebreaker.
+    results.sort(
+      (a, b) =>
+        compareBigInts(toBigInt(a.totalVolume), toBigInt(b.totalVolume), "DESC") ||
+        compareStrings(a.asset, b.asset, "ASC")
+    );
+    return paginateWithInfo(results, pagination);
   }
 
   // ── sponsorImpact ────────────────────────────────────────────────────────

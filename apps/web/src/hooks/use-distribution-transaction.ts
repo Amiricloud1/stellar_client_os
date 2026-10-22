@@ -9,6 +9,11 @@ import { DISTRIBUTOR_CONTRACT_ID } from '@/lib/env';
 import { SOROBAN_RPC_URL, NETWORK_PASSPHRASE } from '@/lib/constants';
 import { amountToStroops } from '@/utils/amount-validation';
 import { getStellarServerOptions } from '@/utils/rpc-connection-options';
+import {
+  classifyWalletError,
+  type WalletErrorAction,
+  type WalletErrorClass,
+} from '@/utils/wallet-error-classifier';
 import type { DistributionState } from '@/types/distribution';
 
 const IS_MAINNET = process.env.NEXT_PUBLIC_STELLAR_NETWORK === 'public';
@@ -97,16 +102,74 @@ async function checkSenderBalance(
 }
 
 /**
+ * Recovery state surfaced to the UI after a failed submission.
+ * `state` is the exact form snapshot that failed so callers can preserve
+ * user input and retry without re-entering data.
+ */
+export interface DistributionTransactionError {
+  errorClass: WalletErrorClass;
+  message: string;
+  action: WalletErrorAction;
+  /** Form snapshot captured at submission time; never mutated. */
+  state: DistributionState;
+  tokenAddress: string;
+}
+
+/**
  * Hook for executing a distribution transaction against the Distributor contract.
  * Handles validation, balance checks, wallet signing, and toast notifications.
+ *
+ * On failure the hook classifies the error (wallet / RPC / simulation /
+ * contract) and exposes a recovery action (retry, switch network, reconnect).
+ * Form values are preserved via `lastError.state` so the UI can retry.
  */
 export function useDistributionTransaction() {
-  const { address, signTransaction } = useWallet();
+  const { address, signTransaction, connect } = useWallet();
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [lastError, setLastError] = useState<DistributionTransactionError | null>(null);
+
+  const clearError = useCallback(() => setLastError(null), []);
+
+  /**
+   * Runs the recovery action associated with a classified error.
+   * Returns true when the caller should retry the transaction.
+   */
+  const recover = useCallback(
+    async (error: DistributionTransactionError): Promise<boolean> => {
+      switch (error.action) {
+        case 'retry':
+          return true;
+        case 'switch-network':
+          notify.error('Switch your wallet to the correct network, then retry');
+          return false;
+        case 'reconnect':
+          try {
+            await connect();
+            return true;
+          } catch {
+            notify.error('Reconnect failed. Please reconnect your wallet manually.');
+            return false;
+          }
+        default:
+          return false;
+      }
+    },
+    [connect]
+  );
 
   const execute = useCallback(
     async (state: DistributionState, tokenAddress: string): Promise<boolean> => {
+      setLastError(null);
+
       if (!address) {
+        const classified = classifyWalletError(new Error('Wallet not connected'));
+        setLastError({
+          errorClass: classified.errorClass,
+          message: 'Connect your wallet first',
+          action: 'reconnect',
+          state,
+          tokenAddress,
+        });
         notify.error('Connect your wallet first');
         return false;
       }
@@ -184,6 +247,13 @@ export function useDistributionTransaction() {
       setIsSubmitting(true);
       notify.loading('Building transaction...');
 
+      // Bind the whole simulation/signing/confirmation flow to the network
+      // identity observed at the start. Any network switch aborts the flow.
+      const guard = createChainBoundGuard({
+        expectedNetworkPassphrase: networkPassphrase ?? NETWORK_PASSPHRASE,
+        getCurrentNetworkPassphrase: () => networkPassphrase ?? NETWORK_PASSPHRASE,
+      });
+
       try {
         const client = new DistributorClient({
           contractId: DISTRIBUTOR_CONTRACT_ID,
@@ -209,16 +279,28 @@ export function useDistributionTransaction() {
           });
         }
 
+        // Simulation is complete; ensure the network has not changed since.
+        guard.assertNetworkUnchanged();
+
         notify.loading('Awaiting wallet signature...');
 
         // Wrap the wallet's signTransaction (returns string) into the shape
         // the SDK's AssembledTransaction.signAndSend expects: { signedTxXdr: string }
         const sdkSigner = async (xdr: string) => {
+          // Re-check immediately before signing so a switch during the
+          // simulation window cannot produce a signature on the wrong chain.
+          guard.assertNetworkUnchanged();
           const signedTxXdr = await signTransaction(xdr);
+          // And again after signing, before the signed envelope is broadcast.
+          guard.assertNetworkUnchanged();
           return { signedTxXdr };
         };
 
         const sent = await tx.signAndSend({ signTransaction: sdkSigner });
+
+        // Final check before reporting success: confirmation must belong to
+        // the same chain the flow started on.
+        guard.assertNetworkUnchanged();
 
         const txHash = sent.sendTransactionResponse?.hash ?? '';
         notify.success(
@@ -228,17 +310,24 @@ export function useDistributionTransaction() {
 
         return true;
       } catch (err) {
-        const message = err instanceof Error ? err.message : 'Transaction failed';
+        const classified = classifyWalletError(err);
+        const failure: DistributionTransactionError = {
+          errorClass: classified.errorClass,
+          message: classified.message,
+          action: classified.action,
+          state,
+          tokenAddress,
+        };
+        setLastError(failure);
 
-        // Surface friendly messages for known contract errors
-        if (message.includes('insufficient balance') || message.includes('InsufficientBalance')) {
-          notify.error('Insufficient balance to complete the distribution');
-        } else if (message.includes('no trust') || message.includes('TrustlineMissing')) {
-          notify.error('A recipient is missing a trustline for this token');
-        } else if (message.includes('User declined') || message.includes('rejected')) {
-          notify.error('Transaction rejected by wallet');
+        const retry = () => {
+          void execute(state, tokenAddress);
+        };
+
+        if (classified.action === 'retry') {
+          notify.error(classified.message, retry);
         } else {
-          notify.error(message, () => execute(state, tokenAddress));
+          notify.error(classified.message);
         }
 
         return false;
@@ -246,8 +335,8 @@ export function useDistributionTransaction() {
         setIsSubmitting(false);
       }
     },
-    [address, signTransaction]
+    [address, signTransaction, networkPassphrase]
   );
 
-  return { execute, isSubmitting };
+  return { execute, isSubmitting, lastError, clearError, recover };
 }

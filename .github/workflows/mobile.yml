@@ -1,0 +1,121 @@
+name: Mobile CI
+
+on:
+  push:
+    paths:
+      - 'apps/mobile/**'
+      - '.github/workflows/mobile.yml'
+  pull_request:
+    paths:
+      - 'apps/mobile/**'
+      - '.github/workflows/mobile.yml'
+
+jobs:
+  # ── Unit tests and type checking ───────────────────────────────────────────
+  test:
+    name: Test & Typecheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        run: echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run mobile offline tests
+        run: pnpm --filter @fundable/mobile test
+
+      - name: Typecheck offline layer
+        run: pnpm --filter @fundable/mobile typecheck
+
+  # ── EAS Build (development client) — only on main/release branches ─────────
+  #
+  # This job requires the EAS_TOKEN secret to be set in the repository or
+  # organisation settings. It is skipped on fork PRs for security.
+  #
+  # To trigger a production build manually, run:
+  #   eas build --platform all --profile production
+  #   from the apps/mobile directory with a valid EAS_TOKEN.
+  eas-build-check:
+    name: Validate EAS Config
+    runs-on: ubuntu-latest
+    # Skip on fork PRs (no access to secrets).
+    if: github.event.pull_request.head.repo.fork != true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate eas.json schema
+        run: |
+          # Verify eas.json is valid JSON with the required top-level keys.
+          node -e "
+            const fs = require('fs');
+            const cfg = JSON.parse(fs.readFileSync('apps/mobile/eas.json', 'utf8'));
+            const required = ['cli', 'build'];
+            for (const key of required) {
+              if (!cfg[key]) {
+                console.error('Missing key in eas.json:', key);
+                process.exit(1);
+              }
+            }
+            const profiles = Object.keys(cfg.build);
+            console.log('EAS build profiles found:', profiles.join(', '));
+            if (!profiles.includes('development') || !profiles.includes('production')) {
+              console.error('eas.json must define at least development and production profiles');
+              process.exit(1);
+            }
+            console.log('eas.json validation passed.');
+          "
+
+      - name: Validate app.config.ts structure
+        run: |
+          # Verify app.config.ts exports an object with the required fields.
+          node -e "
+            const fs = require('fs');
+            const src = fs.readFileSync('apps/mobile/app.config.ts', 'utf8');
+            const required = ['name', 'slug', 'version', 'ios', 'android'];
+            for (const field of required) {
+              if (!src.includes(field + ':') && !src.includes(field + ' :')) {
+                console.error('Missing field in app.config.ts:', field);
+                process.exit(1);
+              }
+            }
+            console.log('app.config.ts structure validation passed.');
+          "

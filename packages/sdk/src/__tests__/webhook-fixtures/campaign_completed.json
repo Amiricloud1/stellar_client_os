@@ -1,0 +1,13 @@
+{
+  "eventVersion": 1,
+  "eventId": "comp_3391",
+  "eventType": "campaign_completed",
+  "subscriptionId": "sub_12345abcd",
+  "deliveredAt": "2026-07-29T13:00:00.000Z",
+  "payload": {
+    "campaignId": "cmp_12345",
+    "completedAt": "2026-07-29T13:00:00.000Z",
+    "treeCount": 10000,
+    "co2Sequestration": "120.0"
+  }
+}

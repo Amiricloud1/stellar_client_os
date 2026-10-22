@@ -1,5 +1,5 @@
 /**
- * @module @fundable/sdk/recipes/rpc
+ * @module @fundable/sdk
  *
  * RPC provider configuration recipes for the Fundable Stellar SDK.
  *
@@ -65,7 +65,7 @@ export interface RpcProviderConfig {
  *
  * @example
  * ```typescript
- * import { getRpcProviderConfig } from "@fundable/sdk/recipes/rpc";
+ * import { getRpcProviderConfig } from "@fundable/sdk";
  *
  * const config = getRpcProviderConfig("testnet");
  * const client = new PaymentStreamClient({
@@ -114,7 +114,7 @@ export function getRpcProviderConfig(
  *
  * @example
  * ```typescript
- * import { getRpcServerOptions } from "@fundable/sdk/recipes/rpc";
+ * import { getRpcServerOptions } from "@fundable/sdk";
  *
  * const options = getRpcServerOptions("https://soroban-testnet.stellar.org");
  * // { allowHttp: false }
@@ -138,7 +138,7 @@ export function getRpcServerOptions(
  *
  * @example
  * ```typescript
- * import { isLocalRpcUrl } from "@fundable/sdk/recipes/rpc";
+ * import { isLocalRpcUrl } from "@fundable/sdk";
  *
  * isLocalRpcUrl("http://localhost:8000");   // true
  * isLocalRpcUrl("https://soroban-testnet.stellar.org"); // false

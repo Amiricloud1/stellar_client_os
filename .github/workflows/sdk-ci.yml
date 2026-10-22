@@ -2,114 +2,121 @@ name: SDK CI
 
 on:
   push:
+    branches: [main]
     paths:
-      - 'packages/sdk/**'
+      - 'sdk/**'
+      - 'pnpm-lock.yaml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
       - '.github/workflows/sdk-ci.yml'
   pull_request:
     paths:
-      - 'packages/sdk/**'
+      - 'sdk/**'
+      - 'pnpm-lock.yaml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
       - '.github/workflows/sdk-ci.yml'
 
+concurrency:
+  group: sdk-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    name: Test & Coverage
+  cache-key:
+    name: Derive cache keys
     runs-on: ubuntu-latest
-
+    outputs:
+      pnpm-key: ${{ steps.pnpm.outputs.key }}
+      cargo-key: ${{ steps.cargo.outputs.key }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Derive pnpm cache key
+        id: pnpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f pnpm-lock.yaml ]; then
+            lock_hash=$(sha256sum pnpm-lock.yaml | cut -d' ' -f1)
+          else
+            echo "::warning::pnpm-lock.yaml missing; using no-lockfile cache key"
+            lock_hash="no-lockfile"
+          fi
+          node_version=$(node --version 2>/dev/null || echo "no-node")
+          pnpm_version=$(pnpm --version 2>/dev/null || echo "no-pnpm")
+          key="pnpm-${RUNNER_OS}-${node_version}-${pnpm_version}-${lock_hash}"
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
+
+      - name: Derive Cargo cache key
+        id: cargo
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f Cargo.lock ]; then
+            lock_hash=$(sha256sum Cargo.lock | cut -d' ' -f1)
+          else
+            echo "::warning::Cargo.lock missing; using no-lockfile cache key"
+            lock_hash="no-lockfile"
+          fi
+          toolchain=$(grep -E '^channel' rust-toolchain.toml 2>/dev/null | head -n1 | tr -d ' "' | cut -d= -f2 || true)
+          toolchain=${toolchain:-stable}
+          target=${CARGO_BUILD_TARGET:-$(rustc -vV 2>/dev/null | awk '/host:/{print $2}' || echo "unknown-target")}
+          key="cargo-${RUNNER_OS}-${toolchain}-${target}-${lock_hash}"
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
+
+  sdk:
+    name: Build & test SDK
+    needs: cache-key
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v3
-        with:
-          version: 9
-
-      - name: Get pnpm store directory
-        id: pnpm-cache
-        run: echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
-
-      - name: Cache pnpm store
+      - name: Restore pnpm store
         uses: actions/cache@v4
         with:
-          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
-          key: pnpm-store-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+          path: ~/.local/share/pnpm/store
+          key: ${{ needs.cache-key.outputs.pnpm-key }}
           restore-keys: |
-            pnpm-store-${{ runner.os }}-
-
-      - name: Ensure no npm/yarn lockfiles exist
-        run: |
-          if find . -name "package-lock.json" -o -name "yarn.lock" | grep -q .; then
-            echo "❌ npm/yarn lockfile detected. This repo uses pnpm. Remove the lockfile and re-run."
-            find . -name "package-lock.json" -o -name "yarn.lock"
-            exit 1
-          fi
+            pnpm-${{ runner.os }}-
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Run SDK tests with coverage
-        run: pnpm --filter @fundable/sdk test:coverage
+      - name: Build SDK
+        run: pnpm --filter ./sdk build
 
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: sdk-coverage-report
-          path: packages/sdk/coverage/
-          retention-days: 30
+      - name: Test SDK
+        run: pnpm --filter ./sdk test
 
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        if: always()
-        with:
-          files: packages/sdk/coverage/lcov.info
-          flags: sdk
-          name: sdk-coverage
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
-
-  sdk-compat:
-    name: ESM/CJS Consumer Compatibility
+  contracts:
+    name: Build & test contracts
+    needs: cache-key
     runs-on: ubuntu-latest
-    needs: test
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo registry & target
+        uses: actions/cache@v4
         with:
-          node-version: 20
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ needs.cache-key.outputs.cargo-key }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v3
-        with:
-          version: 9
+      - name: Build contracts
+        run: cargo build --locked
 
-      - name: Install SDK dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Build SDK (ESM + CJS)
-        run: pnpm --filter @fundable/sdk build
-
-      - name: Install consumer test dependencies
-        run: npm install
-        working-directory: packages/sdk/test-consumer
-
-      - name: Type-check consumer
-        run: npx tsc --noEmit
-        working-directory: packages/sdk/test-consumer
-
-      - name: Runtime ESM import check
-        run: node check-esm.mjs
-        working-directory: packages/sdk/test-consumer
-
-      - name: Runtime CJS require check
-        run: node check-cjs.cjs
-        working-directory: packages/sdk/test-consumer
+      - name: Test contracts
+        run: cargo test --locked

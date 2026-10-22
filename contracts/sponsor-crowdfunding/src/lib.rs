@@ -20,6 +20,10 @@ pub enum DataKey {
     PoolCount,
     /// Per-sponsor contribution keyed by (pool_id, sponsor).
     Contribution(u64, Address),
+    /// Settlement state marker for one-time settlement verification.
+    PoolSettled(u64),
+    /// Payout marker guaranteeing raised funds are paid out only once.
+    PoolPaidOut(u64),
 }
 
 /// Lifecycle state of a funding pool.
@@ -237,27 +241,38 @@ impl SponsorCrowdfundingContract {
     /// Settle a pool and distribute revenue proportionally.
     ///
     /// Only callable after the pool has been settled (target reached).
+    /// Guarantees that settlement is one-time and idempotent/locked.
     ///
     /// # Arguments
-    /// * `pool_id`        ??? Pool to settle.
-    /// * `revenue_amount` ??? Total revenue to distribute.
+    /// * `pool_id`        — Pool to settle.
+    /// * `revenue_amount` — Total revenue to distribute.
     ///
     /// # Errors
-    /// * [`Error::PoolNotOpen`] ??? pool is not settled.
+    /// * [`Error::PoolNotOpen`] — pool is not settled.
+    /// * [`Error::PoolAlreadySettled`] — pool has already been settled.
     pub fn settle_pool(env: Env, pool_id: u64, revenue_amount: i128) {
         Self::assert_initialized(&env);
 
-        let mut pool = Self::load_pool(&env, pool_id);
+        let pool = Self::load_pool(&env, pool_id);
 
         if pool.status != PoolStatus::Settled {
             panic_with_error!(&env, Error::PoolNotOpen);
         }
 
+        let settled_key = DataKey::PoolSettled(pool_id);
+        if env.storage().persistent().has(&settled_key) {
+            panic_with_error!(&env, Error::PoolAlreadySettled);
+        }
+
+        env.storage().persistent().set(&settled_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&settled_key, LEDGER_THRESHOLD, LEDGER_BUMP);
+
         // Calculate and distribute proportional revenue to each sponsor.
         if pool.total_raised > 0 && revenue_amount > 0 {
             // Revenue distribution is proportional to contribution.
             // Each sponsor gets: (their_contribution / total_raised) * revenue_amount
-            // This is recorded as an event; actual distribution can be claimed separately.
             env.events().publish(
                 ("RevenueDistributed", pool_id),
                 (pool_id, revenue_amount, pool.total_raised),
@@ -266,6 +281,45 @@ impl SponsorCrowdfundingContract {
 
         env.events()
             .publish(("PoolFinalized", pool_id), (pool_id, pool.tree_id));
+    }
+
+    /// Payout total raised funds to the project beneficiary after successful settlement.
+    ///
+    /// Authority: Admin only.
+    /// Guarantees that raised funds can only be paid out once.
+    ///
+    /// # Errors
+    /// * [`Error::Unauthorized`] — caller is not the admin.
+    /// * [`Error::PoolNotOpen`] — pool is not in Settled status.
+    /// * [`Error::PoolAlreadySettled`] — payout has already occurred.
+    pub fn payout_funds(env: Env, pool_id: u64, beneficiary: Address) {
+        Self::assert_initialized(&env);
+        let admin = Self::get_admin(env.clone());
+        admin.require_auth();
+
+        let pool = Self::load_pool(&env, pool_id);
+        if pool.status != PoolStatus::Settled {
+            panic_with_error!(&env, Error::PoolNotOpen);
+        }
+
+        let paid_key = DataKey::PoolPaidOut(pool_id);
+        if env.storage().persistent().has(&paid_key) {
+            panic_with_error!(&env, Error::PoolAlreadySettled);
+        }
+
+        env.storage().persistent().set(&paid_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&paid_key, LEDGER_THRESHOLD, LEDGER_BUMP);
+
+        let amount = pool.total_raised;
+        if amount > 0 {
+            let token_client = token::Client::new(&env, &pool.token);
+            token_client.transfer(&env.current_contract_address(), &beneficiary, &amount);
+        }
+
+        env.events()
+            .publish(("PoolFundsPaidOut", pool_id), (pool_id, beneficiary, amount));
     }
 
     /// Dissolve a pool that didn't reach its target.
@@ -609,4 +663,106 @@ mod tests {
         let id = client.create_pool(&1, &10_000, &token_addr);
         client.contribute(&sponsor, &id, &-1);
     }
+
+    #[test]
+    fn test_partial_contributions_pool_remains_open() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, token_addr) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr2, _, token_admin_client) = create_token(&env, &token_admin);
+        let sponsor = Address::generate(&env);
+        token_admin_client.mint(&sponsor, &10_000);
+
+        let id = client.create_pool(&1, &10_000, &token_addr2);
+
+        // Partial contribution of 4_000
+        client.contribute(&sponsor, &id, &4_000);
+        let pool = client.get_pool(&id);
+        assert_eq!(pool.status, PoolStatus::Open);
+        assert_eq!(pool.total_raised, 4_000);
+        assert_eq!(client.get_contribution(&id, &sponsor), 4_000);
+    }
+
+    #[test]
+    fn test_settle_pool_is_one_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr2, _, token_admin_client) = create_token(&env, &token_admin);
+        let sponsor = Address::generate(&env);
+        token_admin_client.mint(&sponsor, &10_000);
+
+        let id = client.create_pool(&1, &10_000, &token_addr2);
+        client.contribute(&sponsor, &id, &10_000);
+
+        // First settlement succeeds
+        client.settle_pool(&id, &500);
+
+        // Second settlement fails with Error::PoolAlreadySettled (#7)
+        let res = client.try_settle_pool(&id, &500);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_successful_payout_and_escrow_conservation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr2, token_client, token_admin_client) = create_token(&env, &token_admin);
+        let sponsor1 = Address::generate(&env);
+        let sponsor2 = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+
+        token_admin_client.mint(&sponsor1, &6_000);
+        token_admin_client.mint(&sponsor2, &4_000);
+
+        let id = client.create_pool(&1, &10_000, &token_addr2);
+        client.contribute(&sponsor1, &id, &6_000);
+        client.contribute(&sponsor2, &id, &4_000);
+
+        let pool = client.get_pool(&id);
+        assert_eq!(pool.status, PoolStatus::Settled);
+
+        // Payout to beneficiary
+        client.payout_funds(&id, &beneficiary);
+        assert_eq!(token_client.balance(&beneficiary), 10_000);
+
+        // Double payout fails
+        let res = client.try_payout_funds(&id, &beneficiary);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_dissolved_pool_double_refund_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr2, token_client, token_admin_client) = create_token(&env, &token_admin);
+        let sponsor = Address::generate(&env);
+        token_admin_client.mint(&sponsor, &5_000);
+
+        let id = client.create_pool(&1, &10_000, &token_addr2);
+        client.contribute(&sponsor, &id, &3_000);
+        client.dissolve_pool(&id);
+
+        client.refund(&sponsor, &id);
+        assert_eq!(token_client.balance(&sponsor), 5_000);
+
+        // Second refund fails with NoContribution
+        let res = client.try_refund(&sponsor, &id);
+        assert!(res.is_err());
+    }
 }
+

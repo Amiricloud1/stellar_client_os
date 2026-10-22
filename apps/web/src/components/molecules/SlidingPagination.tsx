@@ -10,10 +10,10 @@ import {
   PaginationPrevious,
 } from "@/components/ui/pagination";
 import { usePagination } from "@/hooks/use-pagination";
+import type { PageInfo } from "@/lib/pagination";
 
 type SlidingPaginationProps = {
-  page: number;
-  pageCount: number;
+  pageInfo: PageInfo;
   onPageChange: (p: number) => void;
   className?: string;
 };
@@ -22,13 +22,12 @@ const clampPage = (value: number, min: number, max: number) =>
   Math.min(Math.max(value, min), max);
 
 const SlidingPagination = ({
-  page,
-  pageCount,
+  pageInfo,
   onPageChange,
   className,
 }: SlidingPaginationProps) => {
-  const safePageCount = Math.max(1, pageCount);
-  const currentPage = clampPage(page, 1, safePageCount);
+  const safePageCount = Math.max(1, pageInfo.totalPages);
+  const currentPage = clampPage(pageInfo.page, 1, safePageCount);
   const items = usePagination({
     currentPage,
     pageCount: safePageCount,

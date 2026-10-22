@@ -19,6 +19,8 @@ import { CSVError, CSVWarning } from '@/types/distribution';
 import { ErrorBoundary } from '@/components/ui/error-boundary';
 import { ErrorFallback } from '@/components/ui/error-fallback';
 import { useUnsavedChanges } from '@/hooks/use-unsaved-changes';
+import { TransactionSimulationReview } from '@/components/transaction/TransactionSimulationReview';
+import { useTransactionSimulation } from '@/hooks/use-transaction-simulation';
 
 export default function DistributionPage() {
   const {
@@ -69,6 +71,13 @@ export default function DistributionPage() {
   };
 
   const { execute, isSubmitting } = useDistributionTransaction();
+
+  const simulation = useTransactionSimulation({
+    kind: 'distribution',
+    distributionType: state.type,
+    recipients: state.recipients,
+    tokenAddress,
+  });
 
   const validateXPostUrl = (url: string): string => {
     if (!url.trim()) return 'Please enter an X post URL.';
@@ -129,18 +138,29 @@ export default function DistributionPage() {
 
   useUnsavedChanges(hasRecipientInput || Boolean(urlInput));
 
-  const handleDistribute = () => setShowPreview(true);
+  const handleDistribute = () => {
+    setShowPreview(true);
+    void simulation.simulate();
+  };
 
   const handleConfirmDistribute = async () => {
+    if (!simulation.isReadyToSign) return;
+
     const success = await execute(state, tokenAddress);
     if (!success) return;
 
     setShowPreview(false);
+    simulation.reset();
     reset();
     setUrlInput('');
     setCsvErrors([]);
     setCsvWarnings([]);
     setUploadStatus({ type: null, message: '' });
+  };
+
+  const handleBackFromPreview = () => {
+    setShowPreview(false);
+    simulation.reset();
   };
 
   const handleAddRecipient = () => {
@@ -213,11 +233,23 @@ export default function DistributionPage() {
           </h1>
 
           {showPreview ? (
-            <div className="flex gap-4">
-              <Button onClick={() => setShowPreview(false)}>Back</Button>
-              <Button onClick={handleConfirmDistribute} disabled={isSubmitting}>
-                {isSubmitting ? 'Processing...' : 'Confirm'}
-              </Button>
+            <div className="space-y-6">
+              <TransactionSimulationReview
+                simulation={simulation}
+                title="Distribution Simulation"
+                onRetry={() => void simulation.simulate()}
+              />
+              <div className="flex gap-4">
+                <Button onClick={handleBackFromPreview} disabled={isSubmitting}>
+                  Back
+                </Button>
+                <Button
+                  onClick={handleConfirmDistribute}
+                  disabled={isSubmitting || !simulation.isReadyToSign}
+                >
+                  {isSubmitting ? 'Processing...' : 'Confirm'}
+                </Button>
+              </div>
             </div>
           ) : (
             <>
@@ -453,7 +485,7 @@ export default function DistributionPage() {
                   disabled={state.recipients.length === 0 || isSubmitting || distInsufficientBalance}
                   onClick={handleDistribute}
                 >
-                  {isSubmitting ? 'Distributing...' : 'Distribute Token'}
+                  {isSubmitting ? 'Distributing...' : 'Review & Distribute'}
                 </Button>
               </div>
             </>

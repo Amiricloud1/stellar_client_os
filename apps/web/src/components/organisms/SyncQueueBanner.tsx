@@ -1,17 +1,18 @@
 "use client";
 
 /**
- * SyncQueueBanner — Offline-first PWA sync status banner (issue #528)
+ * SyncQueueBanner — Offline-first PWA sync status banner (Issues #528, #73)
  *
  * Sticky notification banner that appears when there are pending evidence
- * uploads in the sync queue. Follows the same visual pattern as the
- * existing offline status banner in AppProvider.
+ * uploads or conflict resolutions in the sync queue. Follows the same
+ * visual pattern as the existing offline status banner in AppProvider.
  *
  * States:
  *   - Hidden when queue is empty and device is online
  *   - Amber (warning)  — offline with pending items
  *   - Purple (active)  — online, syncing items now
  *   - Red (error)      — items failed after all retries
+ *   - Orange (alert)   — items with conflicts or stale server versions (Issue #73)
  *   - Green (success)  — all items synced (auto-dismisses after 4s)
  *
  * Accessibility:
@@ -22,9 +23,9 @@
  */
 
 import React, { useEffect, useState } from "react";
-import { AlertCircle, CheckCircle2, CloudOff, Loader2, RefreshCw, UploadCloud, X } from "lucide-react";
+import { AlertCircle, AlertTriangle, CheckCircle2, CloudOff, Loader2, RefreshCw, UploadCloud } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { SyncQueueState } from "@/hooks/use-sync-queue";
+import type { SyncQueueItem, SyncQueueState } from "@/hooks/use-sync-queue";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -40,14 +41,17 @@ export interface SyncQueueBannerProps {
     | "pendingItems"
     | "syncingItems"
     | "retryAll"
-  >;
+  > & {
+    conflictItems?: SyncQueueItem[];
+    conflictCount?: number;
+  };
   /** Called when the user clicks "View all" — opens the action drawer. */
   onOpenDrawer?: () => void;
   /** Additional className applied to the root element. */
   className?: string;
 }
 
-type BannerVariant = "offline" | "syncing" | "failed" | "success" | "pending";
+type BannerVariant = "offline" | "syncing" | "failed" | "success" | "pending" | "conflict";
 
 // ── Variant config ─────────────────────────────────────────────────────────────
 
@@ -79,6 +83,12 @@ const VARIANT_STYLES: Record<
     label: ({ failed }) =>
       `${failed} upload${failed !== 1 ? "s" : ""} failed to sync`,
   },
+  conflict: {
+    banner: "border-orange-600 bg-orange-950 text-orange-100",
+    icon: AlertTriangle,
+    label: ({ conflicts }) =>
+      `${conflicts} upload${conflicts !== 1 ? "s" : ""} have conflicts — action required`,
+  },
   success: {
     banner: "border-emerald-700 bg-emerald-950 text-emerald-100",
     icon: CheckCircle2,
@@ -92,6 +102,7 @@ interface BannerCounts {
   syncing: number;
   failed: number;
   synced: number;
+  conflicts: number;
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -109,6 +120,8 @@ export function SyncQueueBanner({
     syncedItems,
     pendingItems,
     syncingItems,
+    conflictItems = [],
+    conflictCount = conflictItems.length,
     retryAll,
   } = syncQueue;
 
@@ -134,6 +147,8 @@ export function SyncQueueBanner({
   // Determine which variant to show
   const variant: BannerVariant = showSuccess
     ? "success"
+    : conflictCount > 0 && !isSyncing
+    ? "conflict"
     : failedItems.length > 0 && !isSyncing
     ? "failed"
     : isSyncing
@@ -146,7 +161,8 @@ export function SyncQueueBanner({
     showSuccess ||
     isSyncing ||
     pendingCount > 0 ||
-    failedItems.length > 0;
+    failedItems.length > 0 ||
+    conflictCount > 0;
 
   if (!shouldShow) return null;
 
@@ -155,6 +171,7 @@ export function SyncQueueBanner({
     syncing: syncingItems.length,
     failed: failedItems.length,
     synced: syncedItems.length,
+    conflicts: conflictCount,
   };
 
   const config = VARIANT_STYLES[variant];
@@ -177,14 +194,14 @@ export function SyncQueueBanner({
       data-testid="sync-queue-banner"
       data-variant={variant}
       className={cn(
-        "sticky top-0 z-50 flex min-h-11 items-center justify-between gap-2 border-b px-4 py-2 text-sm",
+        "sticky top-0 z-50 flex w-full max-w-full flex-wrap sm:flex-nowrap min-h-11 items-center justify-between gap-2 overflow-x-hidden border-b px-3 sm:px-4 py-2 text-sm",
         "transition-colors duration-300",
         config.banner,
         className
       )}
     >
       {/* Left: icon + message */}
-      <div className="flex min-w-0 items-center gap-2">
+      <div className="flex min-w-0 flex-1 items-center gap-2">
         <Icon
           aria-hidden="true"
           className={cn(
@@ -206,7 +223,7 @@ export function SyncQueueBanner({
               disabled={isRetrying || isSyncing}
               aria-label="Retry syncing pending uploads"
               className={cn(
-                "flex items-center gap-1 rounded-sm px-2 py-0.5 text-xs font-medium",
+                "flex min-h-8 items-center gap-1 rounded-sm px-2.5 py-1 text-xs font-medium",
                 "transition-all duration-150",
                 "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50",
                 "disabled:cursor-not-allowed disabled:opacity-50",
@@ -227,31 +244,36 @@ export function SyncQueueBanner({
         {onOpenDrawer && pendingCount + failedItems.length > 0 && (
           <button
             type="button"
-            onClick={onOpenDrawer}
-            aria-label="View pending sync items"
+            onClick={handleRetry}
+            disabled={isSyncing || isRetrying || !isOnline}
+            aria-label="Retry syncing pending uploads"
             className={cn(
-              "rounded-sm px-2 py-0.5 text-xs font-medium underline-offset-2",
+              "min-h-8 rounded-sm px-2.5 py-1 text-xs font-medium underline-offset-2",
               "hover:underline focus-visible:outline-none focus-visible:ring-2",
               "focus-visible:ring-white/50 transition-all duration-150"
             )}
           >
-            View all
+            <RefreshCw
+              aria-hidden="true"
+              className={cn("h-3 w-3", (isSyncing || isRetrying) && "animate-spin")}
+            />
+            <span>{isSyncing || isRetrying ? "Syncing…" : "Retry"}</span>
           </button>
         )}
 
-        {/* Dismiss success banner */}
-        {variant === "success" && (
+        {/* View all button — opens the action drawer */}
+        {onOpenDrawer && (
           <button
             type="button"
-            onClick={() => setShowSuccess(false)}
-            aria-label="Dismiss sync success notification"
+            onClick={onOpenDrawer}
+            aria-label={variant === "conflict" ? "Review and resolve sync conflicts" : "View pending sync items"}
             className={cn(
-              "rounded-sm p-0.5 opacity-70 hover:opacity-100",
+              "min-h-8 min-w-8 inline-flex items-center justify-center rounded-sm p-1 opacity-70 hover:opacity-100",
               "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50",
-              "transition-all duration-150"
+              "transition-colors duration-150 text-white/90"
             )}
           >
-            <X aria-hidden="true" className="h-3.5 w-3.5" />
+            {variant === "conflict" ? "Resolve" : "View all"}
           </button>
         )}
       </div>
