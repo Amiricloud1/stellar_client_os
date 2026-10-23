@@ -67,44 +67,127 @@ Successful identities are persisted in `apps/web/data/webhook_delivered_events.j
 
 Every webhook payload delivered includes the following headers to enable authenticity verification and prevent replay attacks:
 
-* `X-Webhook-Timestamp`: Unix epoch timestamp of the dispatch.
-* `X-Webhook-Signature`: The computed HMAC-SHA256 hex signature of the payload.
+* `X-Webhook-Timestamp`: Unix epoch timestamp (seconds) of the dispatch.
+* `X-Webhook-Signature`: Versioned signature header, `v1=<hmac_sha256_hex>` (see below).
 * `X-Webhook-Event`: The type of event (e.g. `stream.status_updated`).
-* `X-Webhook-Delivery-Id`: Unique delivery execution ID.
+* `X-Webhook-Delivery-Id`: Stable delivery ID for the event (see below).
+
+### Signature Header Format (v1)
+
+The signature header is versioned so the signing scheme can evolve without
+breaking existing consumers:
+
+```
+X-Webhook-Signature: v1=<hex-encoded HMAC-SHA256>
+```
+
+Consumers must parse the header, select the `v1` scheme, and ignore unknown
+schemes (e.g. a future `v2=`) rather than rejecting the request outright. If
+multiple space-separated signatures are present, accept the request when any
+one of them verifies.
+
+### Canonical Signing String
+
+The signed string is exactly:
+
+```
+<X-Webhook-Timestamp>.<raw_request_body>
+```
+
+where `<raw_request_body>` is the exact bytes received on the wire (not a
+re-serialized object). Sign with the subscription `secret` using HMAC-SHA256
+and hex-encode the digest. Compare signatures in constant time.
 
 ### Verifying Signatures (Node.js Example)
 
-To verify the payload was sent by Fundable and was not tampered with, sign the string: `<X-Webhook-Timestamp>.<stringified_json_body>` using the shared subscription `secret`:
-
 ```javascript
-import { createHmac } from 'crypto';
+import { createHmac, timingSafeEqual } from 'crypto';
 
-function verifyWebhook(req, secret) {
+const REPLAY_WINDOW_SECONDS = 300; // 5 minutes
+
+function verifyWebhook(req, secrets) {
   const timestamp = req.headers['x-webhook-timestamp'];
-  const signature = req.headers['x-webhook-signature'];
-  const rawBody = JSON.stringify(req.body); // Ensure this is the raw string body
+  const header = req.headers['x-webhook-signature'];
+  const rawBody = req.rawBody; // exact raw body string/bytes as received
 
-  const expectedSignature = createHmac('sha256', secret)
-    .update(`${timestamp}.${rawBody}`)
-    .digest('hex');
+  if (!timestamp || !header || !rawBody) return false;
 
-  return expectedSignature === signature;
+  // Replay window: reject stale or far-future timestamps.
+  const age = Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp));
+  if (!Number.isFinite(age) || age > REPLAY_WINDOW_SECONDS) return false;
+
+  const provided = header
+    .split(' ')
+    .filter((part) => part.startsWith('v1='))
+    .map((part) => part.slice(3));
+
+  const payload = `${timestamp}.${rawBody}`;
+  // `secrets` may contain the primary and (during rotation) secondary secret.
+  return secrets.some((secret) => {
+    const expected = createHmac('sha256', secret).update(payload).digest('hex');
+    const a = Buffer.from(expected, 'hex');
+    return provided.some((sig) => {
+      const b = Buffer.from(sig, 'hex');
+      return a.length === b.length && timingSafeEqual(a, b);
+    });
+  });
 }
 ```
+
+### Delivery ID Semantics
+
+`X-Webhook-Delivery-Id` identifies the *event*, not the individual HTTP
+attempt. It is derived from the event's stable identity (e.g. `verificationId`,
+`batchId`, `completionId`, or `eventId`) and is therefore identical across
+retries. Consumers should use it (or the payload's stable identity field) as an
+idempotency key and process each delivery ID at most once. Do not treat a
+repeated delivery ID as a new event.
+
+### Replay Window
+
+Deliveries are timestamped at dispatch. Consumers should reject requests whose
+`X-Webhook-Timestamp` is more than **5 minutes** (300 seconds) away from their
+own clock, in either direction. Combined with the delivery ID idempotency check,
+this bounds the window in which a captured request can be replayed. Keep
+consumer clocks synchronized (NTP) to avoid false rejections.
+
+### Key Rotation (Primary / Secondary Secrets)
+
+Each subscription supports a primary secret and an optional secondary secret so
+secrets can be rotated without dropping deliveries:
+
+1. **Add the new secret as secondary.** Set `secondarySecret` on the
+   subscription (via the subscription update API) while the primary remains
+   active. Deliveries are signed with the primary secret; consumers should
+   accept either secret during rotation.
+2. **Update the consumer.** Deploy the consumer so it verifies against both the
+   old and new secrets.
+3. **Promote the new secret.** Swap the values so the new secret becomes
+   primary and the old secret becomes secondary. New deliveries are now signed
+   with the new secret.
+4. **Remove the old secret.** Once logs show no deliveries verifying only with
+   the old secret, clear `secondarySecret`.
+
+Never remove a secret before consumers accept the replacement, and never reuse
+a previously retired secret.
 
 ---
 
 ## 🔄 Delivery Retries and Dead-Letter Queue (DLQ)
 
-If a subscriber's endpoint fails to acknowledge the webhook payload (returns a non-2xx status, times out, or encounters a network error), the delivery system will automatically retry:
+If a subscriber's endpoint fails to acknowledge the webhook payload (returns a non-2xx status, times out, or encounters a network error), the delivery system will automatically retry with a bounded policy:
 
-* **Max Retries:** 5 attempts.
+* **Max Attempts:** 5 total attempts (1 initial + 4 retries).
 * **Exponential Backoff:** The delay doubles after each failed attempt:
   * Attempt 1: Immediate
   * Attempt 2: 2s delay
   * Attempt 3: 4s delay
   * Attempt 4: 8s delay
   * Attempt 5: 16s delay
+* **Stable Identity Across Retries:** Every attempt reuses the same
+  `X-Webhook-Delivery-Id` but carries a fresh `X-Webhook-Timestamp` and
+  signature, so consumers can de-duplicate by delivery ID while still
+  validating the replay window per attempt.
 * **Dead-Letter Queue:** If all 5 attempts fail, the delivery attempt (including the payload, destination URL, status code, timestamps, and error message) is permanently logged to the dead-letter queue (`apps/web/data/webhook_dead_letter.json`).
 
 ## 📡 Event Types

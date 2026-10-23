@@ -103,11 +103,57 @@ export class CertificateError extends Error {
       | "INVALID_INPUT"
       | "QR_GENERATION_FAILED"
       | "PDF_GENERATION_FAILED"
+      | "UNAUTHENTICATED"
+      | "FORBIDDEN"
+      | "PROFILE_UNVERIFIED"
   ) {
     super(message);
     this.name = "CertificateError";
     Object.setPrototypeOf(this, CertificateError.prototype);
   }
+}
+
+/**
+ * Authenticated caller context. In production this MUST be derived from the
+ * verified session/JWT — never from client-supplied request bodies.
+ */
+export interface AuthenticatedActor {
+  /** Authenticated account id (e.g. user id from the session). */
+  accountId: string;
+  /** Whether the account's profile has completed identity verification. */
+  profileVerified: boolean;
+}
+
+/**
+ * Verified profile attributes used to populate tax documents. These values
+ * come from the KYC/verification pipeline, not from user input.
+ */
+export interface VerifiedProfile {
+  /** Account id the profile belongs to. */
+  accountId: string;
+  /** Whether identity verification has completed successfully. */
+  verified: boolean;
+  /** Verified legal name of the account holder. */
+  legalName?: string;
+  /** Verified tax identifier (e.g. TIN/EIN). Sensitive — never log. */
+  taxId?: string;
+  /** Verified country code (ISO 3166-1 alpha-2). */
+  country?: string;
+}
+
+/** Options controlling ownership/verification enforcement. */
+export interface CertificateAccessOptions {
+  /** Authenticated actor making the request. */
+  actor: AuthenticatedActor;
+  /** Verified profile for the account that owns the document. */
+  profile: VerifiedProfile;
+  /** Account id that owns the underlying contribution/document. */
+  ownerAccountId: string;
+  /**
+   * When true (default in production), the profile must be verified and the
+   * actor must own the document. Set to false only in tests/dev fixtures.
+   */
+  requireVerifiedIdentity?: boolean;
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -166,6 +212,56 @@ function truncateMiddle(str: string, maxLength = 24): string {
   if (str.length <= maxLength) return str;
   const half = Math.floor((maxLength - 3) / 2);
   return `${str.slice(0, half)}...${str.slice(-half)}`;
+}
+
+/**
+ * Redact a sensitive identifier (e.g. tax ID) for logging. Keeps only the
+ * last 4 characters so operators can correlate without exposing the value.
+ */
+export function redactTaxId(taxId: string | undefined | null): string {
+  if (!taxId) return "[redacted]";
+  const trimmed = taxId.trim();
+  if (trimmed.length <= 4) return "[redacted]";
+  return `***${trimmed.slice(-4)}`;
+}
+
+/**
+ * Enforce authenticated ownership and verified identity before generating a
+ * tax document. Throws `CertificateError` on any violation.
+ */
+export function assertCertificateAccess(
+  options: CertificateAccessOptions
+): void {
+  const { actor, profile, ownerAccountId } = options;
+  const requireVerified = options.requireVerifiedIdentity ?? true;
+
+  if (!actor?.accountId) {
+    throw new CertificateError(
+      "Authentication required to generate tax documents",
+      "UNAUTHENTICATED"
+    );
+  }
+
+  if (actor.accountId !== ownerAccountId) {
+    throw new CertificateError(
+      "Cross-account access to tax documents is not permitted",
+      "FORBIDDEN"
+    );
+  }
+
+  if (profile.accountId !== ownerAccountId) {
+    throw new CertificateError(
+      "Profile does not belong to the document owner",
+      "FORBIDDEN"
+    );
+  }
+
+  if (requireVerified && (!actor.profileVerified || !profile.verified)) {
+    throw new CertificateError(
+      "A verified identity profile is required to generate tax documents",
+      "PROFILE_UNVERIFIED"
+    );
+  }
 }
 
 /** Draw a horizontal rule across the content area. */
@@ -566,13 +662,22 @@ export async function buildCertificatePdf(
 }
 
 /**
- * Top-level entry point: validate → generate QR → build PDF.
+ * Top-level entry point: enforce access → validate → generate QR → build PDF.
  *
- * @throws `CertificateError` on invalid input or generation failure.
+ * When `access` is provided, authenticated ownership and verified identity are
+ * enforced before any document is generated. Callers in production MUST pass
+ * `access`; omitting it is only permitted for non-tax documents in dev/tests.
+ *
+ * @throws `CertificateError` on access violation, invalid input, or failure.
  */
 export async function generateCertificate(
-  input: CertificateInput
+  input: CertificateInput,
+  access?: CertificateAccessOptions
 ): Promise<CertificateResult> {
+  if (access) {
+    assertCertificateAccess(access);
+  }
+
   validateCertificateInput(input);
 
   const certificateId = uuid();

@@ -27,11 +27,68 @@ export interface CampaignTaxCertificate {
 export class CampaignTaxCertificateError extends Error {
   constructor(
     message: string,
-    public readonly code: "INVALID_INPUT" | "CAMPAIGN_NOT_FOUND" | "INELIGIBLE_CAMPAIGN" | "NO_CONTRIBUTIONS" | "INVALID_LEDGER",
+    public readonly code:
+      | "INVALID_INPUT"
+      | "CAMPAIGN_NOT_FOUND"
+      | "INELIGIBLE_CAMPAIGN"
+      | "NO_CONTRIBUTIONS"
+      | "INVALID_LEDGER"
+      | "UNAUTHENTICATED"
+      | "FORBIDDEN"
+      | "UNVERIFIED_PROFILE",
   ) {
     super(message);
     this.name = "CampaignTaxCertificateError";
   }
+}
+
+export interface AuthenticatedCreator {
+  userId: string;
+  address: string;
+}
+
+export interface VerifiedTaxProfile {
+  userId: string;
+  legalName: string;
+  taxId: string;
+  country: string;
+  verificationStatus: "VERIFIED" | "PENDING" | "REJECTED";
+}
+
+export interface CampaignTaxCertificateDependencies {
+  resolveAuthenticatedCreator: () => Promise<AuthenticatedCreator | null>;
+  getVerifiedTaxProfile: (userId: string) => Promise<VerifiedTaxProfile | null>;
+  logger?: Pick<Console, "info" | "warn" | "error">;
+}
+
+const TAX_ID_PATTERN = /\b\d{2,3}[- ]?\d{2,4}[- ]?\d{3,4}\b|\b[A-Z]{1,2}\d{6,9}[A-Z]?\b/gi;
+
+export function redactTaxIds(value: string): string {
+  return value.replace(TAX_ID_PATTERN, "[REDACTED]");
+}
+
+function redactForLog(value: unknown): unknown {
+  if (typeof value === "string") return redactTaxIds(value);
+  if (value instanceof Error) return redactTaxIds(value.message);
+  if (Array.isArray(value)) return value.map(redactForLog);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = /taxid|tax_id|ssn|ein/i.test(key) ? "[REDACTED]" : redactForLog(entry);
+    }
+    return out;
+  }
+  return value;
+}
+
+function logSafely(
+  logger: Pick<Console, "info" | "warn" | "error"> | undefined,
+  level: "info" | "warn" | "error",
+  message: string,
+  context?: Record<string, unknown>,
+): void {
+  if (!logger) return;
+  logger[level](redactTaxIds(message), context ? redactForLog(context) : undefined);
 }
 
 const PAGE_WIDTH = 595.28;
@@ -124,15 +181,50 @@ export async function generateCampaignTaxCertificate(
   taxYear: number,
   dataSource: CampaignDataSource = getCampaignDataSource(),
   now = Date.now(),
+  dependencies?: CampaignTaxCertificateDependencies,
 ): Promise<CampaignTaxCertificate> {
+  const logger = dependencies?.logger;
   if (!campaignId.trim()) throw new CampaignTaxCertificateError("campaignId is required", "INVALID_INPUT");
   if (!sponsorAddress?.trim()) throw new CampaignTaxCertificateError("sponsorAddress is required", "INVALID_INPUT");
   if (!Number.isInteger(taxYear) || taxYear < 2000 || taxYear > 2100) {
     throw new CampaignTaxCertificateError("taxYear must be a valid calendar year", "INVALID_INPUT");
   }
 
+  const creator = await dependencies?.resolveAuthenticatedCreator();
+  if (!creator) {
+    logSafely(logger, "warn", "Tax certificate denied: unauthenticated request", { campaignId });
+    throw new CampaignTaxCertificateError("Authentication required", "UNAUTHENTICATED");
+  }
+
   const campaign = await getCampaign(campaignId, dataSource);
   if (!campaign) throw new CampaignTaxCertificateError("Campaign not found", "CAMPAIGN_NOT_FOUND");
+
+  const normalizedSponsor = sponsorAddress.trim().toLowerCase();
+  const normalizedCreator = creator.address.trim().toLowerCase();
+  if (normalizedSponsor !== normalizedCreator) {
+    logSafely(logger, "warn", "Tax certificate denied: cross-account access", {
+      campaignId,
+      userId: creator.userId,
+    });
+    throw new CampaignTaxCertificateError("Sponsor address does not belong to the authenticated account", "FORBIDDEN");
+  }
+
+  const profile = await dependencies?.getVerifiedTaxProfile(creator.userId);
+  if (
+    !profile ||
+    profile.userId !== creator.userId ||
+    profile.verificationStatus !== "VERIFIED" ||
+    !profile.legalName.trim() ||
+    !profile.taxId.trim() ||
+    !profile.country.trim()
+  ) {
+    logSafely(logger, "warn", "Tax certificate denied: unverified tax profile", {
+      campaignId,
+      userId: creator.userId,
+    });
+    throw new CampaignTaxCertificateError("A verified tax profile is required", "UNVERIFIED_PROFILE");
+  }
+
   const partner = campaign.nonprofitPartner;
   if (
     !partner || partner.verificationStatus !== "VERIFIED" ||
@@ -144,7 +236,7 @@ export async function generateCampaignTaxCertificate(
   const totals = new Map<string, bigint>();
   for (const sponsor of campaign.sponsors ?? []) {
     if (sponsor.campaignId !== campaign.id) continue;
-    if (sponsor.address.trim().toLowerCase() !== sponsorAddress.trim().toLowerCase()) continue;
+    if (sponsor.address.trim().toLowerCase() !== normalizedSponsor) continue;
     if (new Date(sponsor.sponsoredAt).getUTCFullYear() !== taxYear) continue;
     if (!/^\d+$/.test(sponsor.amount) || !sponsor.token.trim()) {
       throw new CampaignTaxCertificateError("Invalid contribution data in campaign ledger", "INVALID_LEDGER");
@@ -173,5 +265,11 @@ export async function generateCampaignTaxCertificate(
     contributions,
     issuedAt,
   };
+  logSafely(logger, "info", "Tax certificate issued", {
+    certificateId,
+    campaignId: campaign.id,
+    userId: creator.userId,
+    taxYear,
+  });
   return { ...result, pdfBytes: await buildCertificatePdf(result) };
 }

@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { CampaignRecord } from "@/services/campaign.service";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { safeGetItem, safeSetItem } from "@/utils/safe-storage";
 import { useSyncQueue } from "./use-sync-queue";
 
 // ---------------------------------------------------------------------------
@@ -33,43 +33,139 @@ function readFixture(): CampaignsFixture | null {
 // currently-visible cards are in the DOM.  We fetch up to 500 at a time and
 // append on scroll (infinite load pattern) to support 10k+ campaign lists
 // without a single blocking request.
+//
+// Issue #59: pagination and sorting are standardized across list endpoints.
+// The API enforces a maximum page size (see shared pagination contract), so
+// this value is clamped to the server-advertised limit when one is returned.
 // ---------------------------------------------------------------------------
+
+/** Query key namespace for campaign list data. */
+export const CAMPAIGNS_QUERY_KEY = ["campaigns"] as const;
+
+/** Maximum records per page when loading from the API. */
 const PAGE_SIZE = 500;
 
-export function useCampaigns() {
-  const defaultCampaigns = [
-    {
-      id: "camp-101",
-      title: "Save the Amazon RainForest Reserve",
-      category: "Environmental & Reforestation",
-      raisedAmount: "33,850",
-      goalAmount: "50,000",
+/** localStorage key used for offline fallback cache. */
+const CACHE_KEY = "campaigns_cache";
+
+/**
+ * How long campaign list data is considered fresh (1 minute).
+ * During this window a mounted component will not re-fetch in the background.
+ */
+const CAMPAIGNS_STALE_TIME = 60_000;
+
+/**
+ * How long campaigns stay in the React Query cache after the last subscriber
+ * unmounts (5 minutes). Keeps data warm for quick navigation.
+ */
+const CAMPAIGNS_GC_TIME = 5 * 60_000;
+
+// ---------------------------------------------------------------------------
+// Campaign shape returned by the hook
+// ---------------------------------------------------------------------------
+
+export interface CampaignItem {
+  id: string;
+  title: string;
+  category: string;
+  raisedAmount: string;
+  goalAmount: string;
+  token: string;
+  sponsorCount: number;
+  collaboratorCount: number;
+  status: string;
+  description: string;
+  treeSpecies?: string;
+  region?: string;
+  location?: unknown;
+  gpsLocations?: unknown;
+  endDate?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Default seed data shown while the first fetch is in-flight
+// ---------------------------------------------------------------------------
+
+const DEFAULT_CAMPAIGNS: CampaignItem[] = [
+  {
+    id: "camp-101",
+    title: "Save the Amazon RainForest Reserve",
+    category: "Environmental & Reforestation",
+    raisedAmount: "33,850",
+    goalAmount: "50,000",
+    token: "XLM",
+    sponsorCount: 6,
+    collaboratorCount: 2,
+    status: "ACTIVE",
+    description:
+      "Protecting 50,000 hectares of primary rainforest through community-led guardianship and carbon streaming.",
+    endDate: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString(),
+  },
+  {
+    id: "camp-102",
+    title: "Clean Water Wells for Sub-Saharan Communities",
+    category: "Community & Social Impact",
+    raisedAmount: "18,200",
+    goalAmount: "25,000",
+    token: "USDC",
+    sponsorCount: 14,
+    collaboratorCount: 3,
+    status: "ACTIVE",
+    description:
+      "Installing 12 solar-powered water filtration wells across rural farming villages.",
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Internal fetch helper (all pages)
+// ---------------------------------------------------------------------------
+
+async function fetchAllCampaigns(): Promise<CampaignItem[]> {
+  let offset = 0;
+  const accumulated: CampaignItem[] = [];
+
+  while (true) {
+    const res = await fetch(`/api/campaigns?limit=${PAGE_SIZE}&offset=${offset}`);
+    if (!res.ok) break;
+
+    const { data } = (await res.json()) as { data: Record<string, unknown>[] };
+
+    const formatted: CampaignItem[] = (data ?? []).map((c) => ({
+      id: String(c.id ?? ""),
+      title: String(c.name ?? ""),
+      category: "General",
+      raisedAmount: String(c.raisedAmount ?? "0"),
+      goalAmount: String(c.goalAmount ?? "0"),
       token: "XLM",
-      sponsorCount: 6,
-      collaboratorCount: 2,
-      status: "ACTIVE",
-      description: "Protecting 50,000 hectares of primary rainforest through community-led guardianship and carbon streaming.",
-      endDate: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString(), // Expires in 5 days
-    },
-    {
-      id: "camp-102",
-      title: "Clean Water Wells for Sub-Saharan Communities",
-      category: "Community & Social Impact",
-      raisedAmount: "18,200",
-      goalAmount: "25,000",
-      token: "USDC",
-      sponsorCount: 14,
-      collaboratorCount: 3,
-      status: "ACTIVE",
-      description: "Installing 12 solar-powered water filtration wells across rural farming villages.",
-    },
-  ];
+      sponsorCount: Number(c.sponsorCount ?? 0),
+      collaboratorCount: 0,
+      status: String(c.status ?? ""),
+      description: String(c.description ?? ""),
+      treeSpecies: c.treeSpecies !== undefined ? String(c.treeSpecies) : undefined,
+      region: c.region !== undefined ? String(c.region) : undefined,
+      location: c.location,
+      gpsLocations: c.gpsLocations,
+      endDate:
+        c.deadline || c.endDate
+          ? new Date(String(c.deadline ?? c.endDate)).toISOString()
+          : undefined,
+    }));
+
+    accumulated.push(...formatted);
+    offset += PAGE_SIZE;
+
+    if (!data || data.length < PAGE_SIZE) break;
+  }
+
+  return accumulated;
+}
 
   const [campaigns, setCampaigns] = useState<any[]>(defaultCampaigns);
   const [isLoading, setIsLoading] = useState(true);
   const [hasMore, setHasMore] = useState(true);
   const [error, setError] = useState<Error | null>(null);
   const { isOnline } = useSyncQueue();
+  const queryClient = useQueryClient();
 
   useEffect(() => {
     // 0. Deterministic E2E fixtures take precedence over cache and network.
@@ -114,7 +210,9 @@ export function useCampaigns() {
       }
 
       let offset = 0;
+      let pageLimit = requestedLimit;
       const accumulated: any[] = [];
+      let lastPageInfo: PageInfo | null = null;
 
       try {
         while (true) {
@@ -125,6 +223,22 @@ export function useCampaigns() {
           }
 
           const { data, pagination } = await res.json();
+
+          // Issue #59: the API returns shared PageInfo metadata.  Use it as
+          // the source of truth for the effective limit, total count and
+          // whether more pages exist, so ordering stays stable across pages.
+          if (pagination) {
+            lastPageInfo = {
+              limit: pagination.limit ?? pageLimit,
+              offset: pagination.offset ?? offset,
+              total: pagination.total ?? 0,
+              hasMore: Boolean(pagination.hasMore),
+              sort: pagination.sort ?? sort,
+              order: pagination.order ?? order,
+            };
+            // Respect the server-advertised max page size on subsequent pages.
+            pageLimit = lastPageInfo.limit;
+          }
 
           // Map backend records to UI format
           const formatted = (data as any[]).map((c) => ({
@@ -146,14 +260,22 @@ export function useCampaigns() {
           }));
 
           accumulated.push(...formatted);
-          offset += PAGE_SIZE;
+          offset += pageLimit;
 
-          // Stop when the API returns fewer items than the page size,
-          // meaning we've fetched all available campaigns.
-          if (!data || data.length < PAGE_SIZE) {
+          // Prefer the server's PageInfo to decide whether to continue; fall
+          // back to the short-page heuristic for older API responses.
+          const more = lastPageInfo
+            ? lastPageInfo.hasMore
+            : Boolean(data) && data.length >= pageLimit;
+
+          if (!more) {
             setHasMore(false);
             break;
           }
+        }
+
+        if (lastPageInfo) {
+          setPageInfo(lastPageInfo);
         }
 
         if (accumulated.length > 0) {
@@ -170,7 +292,7 @@ export function useCampaigns() {
     };
 
     fetchCampaigns();
-  }, [isOnline]);
+  }, [isOnline, requestedLimit, sort, order]);
 
   return { campaigns, isLoading, hasMore, error };
 }

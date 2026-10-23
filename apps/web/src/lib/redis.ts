@@ -11,6 +11,9 @@
  * | REDIS_URL              | redis://localhost:6379   | Full Redis connection string  |
  * | REDIS_CONNECT_TIMEOUT  | 2000                     | Connect timeout (ms)         |
  * | REDIS_COMMAND_TIMEOUT  | 500                      | Per-command timeout (ms)     |
+ *
+ * Idempotency (issue #58) also uses this client. See `idempotency.ts` for the
+ * store implementation and the `IDEMPOTENCY_*` environment variables.
  */
 
 import Redis from "ioredis";
@@ -139,28 +142,12 @@ export async function closeRedisClient(): Promise<void> {
 }
 
 /**
- * In-memory RateLimitStore for tests. Deterministic: the caller supplies the
- * clock so window rollover and 429 reset timing can be asserted exactly.
+ * Returns the shared client only if it is currently usable (status "ready").
+ * Used by the idempotency store, which must fail closed rather than silently
+ * skipping reservation when Redis is down.
  */
-export function createInMemoryRateLimitStore(
-  now: () => number = () => Date.now()
-): RateLimitStore & { reset(): void } {
-  const buckets = new Map<string, { count: number; expiresAt: number }>();
-
-  return {
-    async evalScript(key, windowMs) {
-      const t = now();
-      const existing = buckets.get(key);
-      if (!existing || existing.expiresAt <= t) {
-        const expiresAt = t + Math.max(1, Math.floor(windowMs));
-        buckets.set(key, { count: 1, expiresAt });
-        return { count: 1, ttlMs: expiresAt - t };
-      }
-      existing.count += 1;
-      return { count: existing.count, ttlMs: existing.expiresAt - t };
-    },
-    reset() {
-      buckets.clear();
-    },
-  };
+export function getReadyRedisClient(): Redis | null {
+  const client = getRedisClient();
+  if (!client) return null;
+  return client.status === "ready" ? client : null;
 }

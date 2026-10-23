@@ -66,3 +66,104 @@ jobs:
         if: steps.changesets.outputs.published == 'true'
         run: |
           echo "Published packages: ${{ steps.changesets.outputs.publishedPackages }}"
+
+  publish-wasm:
+    name: Publish wasm artifacts with provenance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Build wasm artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist/wasm
+          # Build every contract crate that targets wasm; fail loudly if none exist.
+          mapfile -t manifests < <(find . -name Cargo.toml -not -path '*/target/*' -not -path './node_modules/*')
+          built=0
+          for manifest in "${manifests[@]}"; do
+            if grep -q 'crate-type.*cdylib' "$manifest"; then
+              cargo build --manifest-path "$manifest" --target wasm32-unknown-unknown --release
+              built=$((built + 1))
+            fi
+          done
+          if [ "$built" -eq 0 ]; then
+            echo "::error::No wasm contract crates found to build" >&2
+            exit 1
+          fi
+          find target/wasm32-unknown-unknown/release -maxdepth 1 -name '*.wasm' -exec cp {} dist/wasm/ \;
+          if [ -z "$(ls -A dist/wasm)" ]; then
+            echo "::error::No wasm artifacts produced" >&2
+            exit 1
+          fi
+
+      - name: Generate checksums and provenance metadata
+        run: |
+          set -euo pipefail
+          cd dist/wasm
+          # SHA-256 checksums for every artifact (deterministic, network-independent).
+          sha256sum ./*.wasm > SHA256SUMS
+          # Verify checksums before publishing; abort on mismatch.
+          sha256sum --check --strict SHA256SUMS
+          cd - >/dev/null
+          # Network-independent provenance: commit, compiler, and artifact digests.
+          RUSTC_VERSION="$(rustc --version)"
+          CARGO_VERSION="$(cargo --version)"
+          COMMIT_SHA="${GITHUB_SHA}"
+          cat > dist/wasm/provenance.json <<EOF
+          {
+            "schemaVersion": 1,
+            "commit": "${COMMIT_SHA}",
+            "ref": "${GITHUB_REF}",
+            "repository": "${GITHUB_REPOSITORY}",
+            "target": "wasm32-unknown-unknown",
+            "profile": "release",
+            "rustc": "${RUSTC_VERSION}",
+            "cargo": "${CARGO_VERSION}",
+            "checksumAlgorithm": "sha256",
+            "artifacts": [
+          EOF
+          first=1
+          while read -r digest name; do
+            if [ "$first" -eq 0 ]; then printf ',\n' >> dist/wasm/provenance.json; fi
+            first=0
+            printf '    { "name": "%s", "sha256": "%s" }' "$name" "$digest" >> dist/wasm/provenance.json
+          done < dist/wasm/SHA256SUMS
+          printf '\n  ]\n}\n' >> dist/wasm/provenance.json
+          # Validate the generated metadata is well-formed JSON.
+          node -e "JSON.parse(require('fs').readFileSync('dist/wasm/provenance.json','utf8'))"
+
+      - name: Upload wasm artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-artifacts-${{ github.sha }}
+          path: |
+            dist/wasm/*.wasm
+            dist/wasm/SHA256SUMS
+            dist/wasm/provenance.json
+          if-no-files-found: error
+
+      - name: Attach artifacts to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="wasm-${GITHUB_SHA::12}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/wasm/*.wasm dist/wasm/SHA256SUMS dist/wasm/provenance.json --clobber
+          else
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "wasm ${GITHUB_SHA::12}" \
+              --notes "Checksummed wasm artifacts with source provenance for commit ${GITHUB_SHA}." \
+              dist/wasm/*.wasm dist/wasm/SHA256SUMS dist/wasm/provenance.json
+          fi

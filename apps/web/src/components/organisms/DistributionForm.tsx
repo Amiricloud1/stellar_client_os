@@ -8,7 +8,9 @@ import { Label } from '@/components/ui/label';
 import { DistributionTypeSelector } from '@/components/molecules/DistributionTypeSelector';
 import { RecipientTable } from '@/components/organisms/RecipientTable';
 import { AmountSummary } from '@/components/molecules/AmountSummary';
+import { SimulationReview } from '@/components/organisms/SimulationReview';
 import { useDistributionState } from '@/hooks/use-distribution-state';
+import { useTransactionSimulation } from '@/hooks/use-transaction-simulation';
 import { DistributionState } from '@/types/distribution';
 import {
   InsufficientFundsError,
@@ -40,12 +42,26 @@ export const DistributionForm = memo(function DistributionForm({
     reset,
   } = useDistributionState();
 
+  const simulation = useTransactionSimulation({
+    kind: 'distribution',
+    payload: state,
+    enabled: state.isValid && state.recipients.length > 0,
+  });
+
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
 
     const validationErrors = validate();
     if (validationErrors.length > 0) {
       toast.error(validationErrors[0].message, { duration: 6000 });
+      return;
+    }
+
+    if (!simulation.isFresh) {
+      toast.error(
+        'Simulation is stale or missing. Re-run the simulation before signing.',
+        { duration: 7000 },
+      );
       return;
     }
 
@@ -72,7 +88,7 @@ export const DistributionForm = memo(function DistributionForm({
 
       toast.error(message, { duration: 7000 });
     }
-  }, [onSubmit, state, validate]);
+  }, [onSubmit, state, validate, simulation]);
 
   const handleTotalAmountChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     setTotalAmount(e.target.value);
@@ -80,6 +96,7 @@ export const DistributionForm = memo(function DistributionForm({
 
   const canSubmit = state.isValid && 
     state.recipients.length > 0 && 
+    simulation.isFresh &&
     (state.type === 'weighted' || (state.type === 'equal' && state.totalAmount));
 
   return (
@@ -147,6 +164,18 @@ export const DistributionForm = memo(function DistributionForm({
         />
       )}
 
+      {/* Simulation Review */}
+      {state.recipients.length > 0 && (
+        <SimulationReview
+          simulation={simulation.simulation}
+          status={simulation.status}
+          error={simulation.error}
+          isStale={simulation.isStale}
+          onRetry={simulation.refresh}
+          disabled={isLoading}
+        />
+      )}
+
       {/* Form Errors */}
       {state.errors.length > 0 && (
         <div role="alert" aria-live="assertive" className="bg-red-900/20 border border-red-700 rounded-lg p-4">
@@ -167,6 +196,11 @@ export const DistributionForm = memo(function DistributionForm({
           type="submit"
           disabled={!canSubmit || isLoading}
           className="flex-1"
+          title={
+            !simulation.isFresh
+              ? 'Review a fresh simulation before signing'
+              : undefined
+          }
         >
           {isLoading ? 'Processing...' : 'Distribute Tokens'}
         </Button>

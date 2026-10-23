@@ -63,31 +63,51 @@ const envSchema = z.object({
     .transform((val: string) => val === "true")
     .optional(),
 
-  // Optional: Trusted reverse proxies (comma-separated CIDR/IP list).
-  // Only requests arriving from these addresses may supply forwarding headers
-  // (X-Forwarded-For / X-Real-IP) used for rate-limit identity keys.
-  // Defaults to an empty list, meaning forwarding headers are ignored.
-  TRUSTED_PROXIES: z
+  // Webhook signing & delivery configuration (server-side only)
+  // Primary secret used to sign outgoing webhook payloads. Required in production.
+  WEBHOOK_SIGNING_SECRET: z
     .string()
-    .optional()
-    .transform((val: string | undefined) =>
-      (val ?? "")
-        .split(",")
-        .map((entry) => entry.trim())
-        .filter((entry) => entry.length > 0),
-    ),
+    .min(16, "Webhook signing secret must be at least 16 characters")
+    .optional(),
+  // Secondary secret accepted during key rotation (old or new key).
+  WEBHOOK_SECONDARY_SECRET: z
+    .string()
+    .min(16, "Webhook secondary secret must be at least 16 characters")
+    .optional(),
+  // Maximum age (seconds) of a signed delivery before it is rejected as a replay.
+  WEBHOOK_REPLAY_WINDOW_SECONDS: z
+    .coerce.number()
+    .int("Replay window must be an integer number of seconds")
+    .positive("Replay window must be positive")
+    .max(3600, "Replay window must not exceed 3600 seconds")
+    .default(300),
+  // Maximum number of delivery attempts before a webhook is dead-lettered.
+  WEBHOOK_MAX_RETRIES: z
+    .coerce.number()
+    .int("Max retries must be an integer")
+    .min(0, "Max retries must be zero or greater")
+    .max(20, "Max retries must not exceed 20")
+    .default(5),
 
-  // Optional: Unified rate-limit policy overrides, per route class.
-  // Each value is a positive integer; unset values fall back to the
-  // per-class defaults defined in the rate-limit policy module.
-  RATE_LIMIT_AUTH_MAX: z.coerce.number().int().positive().optional(),
-  RATE_LIMIT_AUTH_WINDOW_MS: z.coerce.number().int().positive().optional(),
-  RATE_LIMIT_WRITE_MAX: z.coerce.number().int().positive().optional(),
-  RATE_LIMIT_WRITE_WINDOW_MS: z.coerce.number().int().positive().optional(),
-  RATE_LIMIT_READ_MAX: z.coerce.number().int().positive().optional(),
-  RATE_LIMIT_READ_WINDOW_MS: z.coerce.number().int().positive().optional(),
-  RATE_LIMIT_WEBHOOK_MAX: z.coerce.number().int().positive().optional(),
-  RATE_LIMIT_WEBHOOK_WINDOW_MS: z.coerce.number().int().positive().optional(),
+  // GraphQL query budget configuration (server-side only)
+  GRAPHQL_MAX_DEPTH: z
+    .coerce.number()
+    .int("GraphQL max depth must be an integer")
+    .positive("GraphQL max depth must be positive")
+    .max(50, "GraphQL max depth must not exceed 50")
+    .default(10),
+  GRAPHQL_MAX_COMPLEXITY: z
+    .coerce.number()
+    .int("GraphQL max complexity must be an integer")
+    .positive("GraphQL max complexity must be positive")
+    .max(100000, "GraphQL max complexity must not exceed 100000")
+    .default(1000),
+  GRAPHQL_EXECUTION_TIMEOUT_MS: z
+    .coerce.number()
+    .int("GraphQL execution timeout must be an integer")
+    .positive("GraphQL execution timeout must be positive")
+    .max(60000, "GraphQL execution timeout must not exceed 60000ms")
+    .default(5000),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -114,15 +134,13 @@ export function validateEnv(): Env {
     NEXT_PUBLIC_USDT_CONTRACT_ID: process.env.NEXT_PUBLIC_USDT_CONTRACT_ID,
     NEXT_PUBLIC_EURC_CONTRACT_ID: process.env.NEXT_PUBLIC_EURC_CONTRACT_ID,
     NEXT_PUBLIC_OFFRAMP_MOCK: process.env.NEXT_PUBLIC_OFFRAMP_MOCK,
-    TRUSTED_PROXIES: process.env.TRUSTED_PROXIES,
-    RATE_LIMIT_AUTH_MAX: process.env.RATE_LIMIT_AUTH_MAX,
-    RATE_LIMIT_AUTH_WINDOW_MS: process.env.RATE_LIMIT_AUTH_WINDOW_MS,
-    RATE_LIMIT_WRITE_MAX: process.env.RATE_LIMIT_WRITE_MAX,
-    RATE_LIMIT_WRITE_WINDOW_MS: process.env.RATE_LIMIT_WRITE_WINDOW_MS,
-    RATE_LIMIT_READ_MAX: process.env.RATE_LIMIT_READ_MAX,
-    RATE_LIMIT_READ_WINDOW_MS: process.env.RATE_LIMIT_READ_WINDOW_MS,
-    RATE_LIMIT_WEBHOOK_MAX: process.env.RATE_LIMIT_WEBHOOK_MAX,
-    RATE_LIMIT_WEBHOOK_WINDOW_MS: process.env.RATE_LIMIT_WEBHOOK_WINDOW_MS,
+    WEBHOOK_SIGNING_SECRET: process.env.WEBHOOK_SIGNING_SECRET,
+    WEBHOOK_SECONDARY_SECRET: process.env.WEBHOOK_SECONDARY_SECRET,
+    WEBHOOK_REPLAY_WINDOW_SECONDS: process.env.WEBHOOK_REPLAY_WINDOW_SECONDS,
+    WEBHOOK_MAX_RETRIES: process.env.WEBHOOK_MAX_RETRIES,
+    GRAPHQL_MAX_DEPTH: process.env.GRAPHQL_MAX_DEPTH,
+    GRAPHQL_MAX_COMPLEXITY: process.env.GRAPHQL_MAX_COMPLEXITY,
+    GRAPHQL_EXECUTION_TIMEOUT_MS: process.env.GRAPHQL_EXECUTION_TIMEOUT_MS,
   };
 
   const result = envSchema.safeParse(env);
@@ -162,38 +180,26 @@ export const env = process.env.NODE_ENV === 'test'
       NEXT_PUBLIC_STELLAR_HORIZON_URL: process.env.NEXT_PUBLIC_STELLAR_HORIZON_URL ?? 'https://horizon-testnet.stellar.org',
       NEXT_PUBLIC_USDT_CONTRACT_ID: process.env.NEXT_PUBLIC_USDT_CONTRACT_ID ?? '',
       NEXT_PUBLIC_EURC_CONTRACT_ID: process.env.NEXT_PUBLIC_EURC_CONTRACT_ID ?? '',
-      // Test-mode fallbacks: no trusted proxies (forwarding headers ignored)
-      // and no rate-limit overrides (per-class defaults apply).
-      TRUSTED_PROXIES: (process.env.TRUSTED_PROXIES ?? '')
-        .split(',')
-        .map((entry) => entry.trim())
-        .filter((entry) => entry.length > 0),
-      RATE_LIMIT_AUTH_MAX: process.env.RATE_LIMIT_AUTH_MAX
-        ? Number(process.env.RATE_LIMIT_AUTH_MAX)
-        : undefined,
-      RATE_LIMIT_AUTH_WINDOW_MS: process.env.RATE_LIMIT_AUTH_WINDOW_MS
-        ? Number(process.env.RATE_LIMIT_AUTH_WINDOW_MS)
-        : undefined,
-      RATE_LIMIT_WRITE_MAX: process.env.RATE_LIMIT_WRITE_MAX
-        ? Number(process.env.RATE_LIMIT_WRITE_MAX)
-        : undefined,
-      RATE_LIMIT_WRITE_WINDOW_MS: process.env.RATE_LIMIT_WRITE_WINDOW_MS
-        ? Number(process.env.RATE_LIMIT_WRITE_WINDOW_MS)
-        : undefined,
-      RATE_LIMIT_READ_MAX: process.env.RATE_LIMIT_READ_MAX
-        ? Number(process.env.RATE_LIMIT_READ_MAX)
-        : undefined,
-      RATE_LIMIT_READ_WINDOW_MS: process.env.RATE_LIMIT_READ_WINDOW_MS
-        ? Number(process.env.RATE_LIMIT_READ_WINDOW_MS)
-        : undefined,
-      RATE_LIMIT_WEBHOOK_MAX: process.env.RATE_LIMIT_WEBHOOK_MAX
-        ? Number(process.env.RATE_LIMIT_WEBHOOK_MAX)
-        : undefined,
-      RATE_LIMIT_WEBHOOK_WINDOW_MS: process.env.RATE_LIMIT_WEBHOOK_WINDOW_MS
-        ? Number(process.env.RATE_LIMIT_WEBHOOK_WINDOW_MS)
-        : undefined,
+      WEBHOOK_SIGNING_SECRET: process.env.WEBHOOK_SIGNING_SECRET,
+      WEBHOOK_SECONDARY_SECRET: process.env.WEBHOOK_SECONDARY_SECRET,
+      WEBHOOK_REPLAY_WINDOW_SECONDS: Number(process.env.WEBHOOK_REPLAY_WINDOW_SECONDS ?? 300),
+      WEBHOOK_MAX_RETRIES: Number(process.env.WEBHOOK_MAX_RETRIES ?? 5),
+      GRAPHQL_MAX_DEPTH: Number(process.env.GRAPHQL_MAX_DEPTH ?? 10),
+      GRAPHQL_MAX_COMPLEXITY: Number(process.env.GRAPHQL_MAX_COMPLEXITY ?? 1000),
+      GRAPHQL_EXECUTION_TIMEOUT_MS: Number(process.env.GRAPHQL_EXECUTION_TIMEOUT_MS ?? 5000),
     } as ReturnType<typeof validateEnv>)
   : validateEnv();
 
 export const PAYMENT_STREAM_CONTRACT_ID = env.NEXT_PUBLIC_PAYMENT_STREAM_CONTRACT_ID;
 export const DISTRIBUTOR_CONTRACT_ID = env.NEXT_PUBLIC_DISTRIBUTOR_CONTRACT_ID;
+
+// Webhook delivery configuration (see docs/webhooks.md for rotation guidance)
+export const WEBHOOK_SIGNING_SECRET = env.WEBHOOK_SIGNING_SECRET;
+export const WEBHOOK_SECONDARY_SECRET = env.WEBHOOK_SECONDARY_SECRET;
+export const WEBHOOK_REPLAY_WINDOW_SECONDS = env.WEBHOOK_REPLAY_WINDOW_SECONDS;
+export const WEBHOOK_MAX_RETRIES = env.WEBHOOK_MAX_RETRIES;
+
+// GraphQL query budget configuration
+export const GRAPHQL_MAX_DEPTH = env.GRAPHQL_MAX_DEPTH;
+export const GRAPHQL_MAX_COMPLEXITY = env.GRAPHQL_MAX_COMPLEXITY;
+export const GRAPHQL_EXECUTION_TIMEOUT_MS = env.GRAPHQL_EXECUTION_TIMEOUT_MS;

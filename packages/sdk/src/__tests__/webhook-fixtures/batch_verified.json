@@ -1,0 +1,24 @@
+{
+  "eventVersion": 1,
+  "eventId": "batch_9901",
+  "eventType": "batch_verified",
+  "subscriptionId": "sub_12345abcd",
+  "deliveredAt": "2026-07-29T13:00:00.000Z",
+  "payload": {
+    "campaignId": "cmp_12345",
+    "treeIds": [
+      "tree_1",
+      "tree_2",
+      "tree_3",
+      "tree_4",
+      "tree_5",
+      "tree_6",
+      "tree_7",
+      "tree_8",
+      "tree_9",
+      "tree_10"
+    ],
+    "treeCount": 10,
+    "verifiedAt": "2026-07-29T13:00:00.000Z"
+  }
+}

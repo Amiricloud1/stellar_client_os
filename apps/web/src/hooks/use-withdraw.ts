@@ -14,6 +14,7 @@ interface WithdrawMutationContext {
     previousStreams: Array<[QueryKey, unknown]>;
     streamQueryKey?: QueryKey;
     previousStream?: unknown;
+    chainGuard?: { assertCurrentChain: () => void };
 }
 
 export interface WithdrawErrorState {
@@ -41,13 +42,22 @@ function restorePreviousStreams(
 export function useWithdraw() {
     const queryClient = useQueryClient();
     const { address, signTransaction } = useWallet();
+    const { beginChainBoundTransaction } = useChainBoundTransaction();
 
     return useMutation({
-        mutationFn: (params: WithdrawInput) => {
+        mutationFn: async (params: WithdrawInput) => {
+            // Bind this flow to the chain identity captured at start. If the
+            // wallet network changes mid-flight, abort before signing.
+            const guard = beginChainBoundTransaction();
+            guard.assertCurrentChain();
+
             return withdraw({
                 ...params,
                 sender: params.sender || address || undefined,
-                signTransaction,
+                signTransaction: (transaction: string, options?: unknown) => {
+                    guard.assertCurrentChain();
+                    return signTransaction(transaction, options as never);
+                },
             });
         },
         onMutate: async (variables): Promise<WithdrawMutationContext> => {

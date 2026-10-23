@@ -1,8 +1,148 @@
 import fs from 'fs/promises';
 import type { CampaignWebhookEvent } from "../types/webhook";
 import path from 'path';
-import { createHmac, randomUUID } from 'crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import type { WebhookSubscription, WebhookDeliveryAttempt, WebhookPayload } from '../types/webhook';
+import {
+  getActiveTrace,
+  createChildContext,
+  extractTraceContext,
+  injectTraceHeaders,
+  Span,
+  sanitizeObject,
+  sanitizeString,
+  type TraceContext,
+} from '@/lib/tracing';
+
+/** Current signature scheme version. Included in the signed canonical string. */
+export const WEBHOOK_SIGNATURE_VERSION = 'v1';
+
+/** Default replay window (ms) accepted by {@link verifyWebhookSignature}. */
+export const DEFAULT_WEBHOOK_REPLAY_WINDOW_MS = 5 * 60 * 1000;
+
+/** Default bounded retry count for a single delivery. */
+export const DEFAULT_WEBHOOK_MAX_RETRIES = 5;
+
+/** Default base delay (ms) for exponential backoff. */
+export const DEFAULT_WEBHOOK_BASE_DELAY_MS = 1000;
+
+/** Maximum backoff delay (ms) so retries stay bounded even with large retry counts. */
+export const MAX_WEBHOOK_BACKOFF_MS = 60 * 1000;
+
+/**
+ * Build the versioned canonical string that is signed.
+ *
+ * Format: `<version>.<timestamp>.<deliveryId>.<body>`
+ *
+ * Binding the delivery ID and timestamp into the signature prevents an
+ * attacker from replaying a captured body under a different delivery or
+ * timestamp, and the version prefix allows future schemes to coexist.
+ */
+export function buildWebhookSigningString(
+  timestamp: number | string,
+  deliveryId: string,
+  body: string,
+  version: string = WEBHOOK_SIGNATURE_VERSION,
+): string {
+  return `${version}.${timestamp}.${deliveryId}.${body}`;
+}
+
+/** Compute the hex HMAC-SHA256 signature for a delivery. */
+export function signWebhookPayload(
+  secret: string,
+  timestamp: number | string,
+  deliveryId: string,
+  body: string,
+  version: string = WEBHOOK_SIGNATURE_VERSION,
+): string {
+  return createHmac('sha256', secret)
+    .update(buildWebhookSigningString(timestamp, deliveryId, body, version))
+    .digest('hex');
+}
+
+export interface WebhookSignatureHeaders {
+  'X-Webhook-Timestamp': string;
+  'X-Webhook-Signature': string;
+  'X-Webhook-Signature-Version': string;
+  'X-Webhook-Delivery-Id': string;
+}
+
+export interface WebhookDeliveryMetadata {
+  deliveryId: string;
+  timestamp: number;
+  signatureVersion: string;
+}
+
+export interface VerifyWebhookSignatureOptions {
+  /** Raw request body exactly as received (string or Buffer). */
+  body: string | Buffer;
+  /** Value of the `X-Webhook-Timestamp` header. */
+  timestamp: string | number;
+  /** Value of the `X-Webhook-Delivery-Id` header. */
+  deliveryId: string;
+  /** Value of the `X-Webhook-Signature` header (hex). */
+  signature: string;
+  /** One or more accepted secrets (primary + secondary during rotation). */
+  secrets: string | string[];
+  /** Accepted signature version. Defaults to the current version. */
+  version?: string;
+  /** Replay window in ms. Defaults to 5 minutes. */
+  replayWindowMs?: number;
+  /** Injectable clock for deterministic tests. Defaults to `Date.now`. */
+  now?: number;
+}
+
+export interface VerifyWebhookSignatureResult {
+  valid: boolean;
+  reason?: 'missing_fields' | 'invalid_timestamp' | 'timestamp_out_of_window' | 'signature_mismatch';
+}
+
+/**
+ * Verify a webhook signature and enforce a replay window.
+ *
+ * Accepts multiple secrets so a subscriber can rotate keys without downtime:
+ * publish the new secret as secondary, switch the primary, then retire the old
+ * one once in-flight deliveries have drained.
+ */
+export function verifyWebhookSignature(options: VerifyWebhookSignatureOptions): VerifyWebhookSignatureResult {
+  const {
+    body,
+    timestamp,
+    deliveryId,
+    signature,
+    secrets,
+    version = WEBHOOK_SIGNATURE_VERSION,
+    replayWindowMs = DEFAULT_WEBHOOK_REPLAY_WINDOW_MS,
+    now = Date.now(),
+  } = options;
+
+  if (!signature || !deliveryId || timestamp === undefined || timestamp === null || timestamp === '') {
+    return { valid: false, reason: 'missing_fields' };
+  }
+
+  const ts = typeof timestamp === 'number' ? timestamp : Number(timestamp);
+  if (!Number.isFinite(ts)) {
+    return { valid: false, reason: 'invalid_timestamp' };
+  }
+
+  if (Math.abs(now - ts) > replayWindowMs) {
+    return { valid: false, reason: 'timestamp_out_of_window' };
+  }
+
+  const bodyStr = typeof body === 'string' ? body : body.toString('utf-8');
+  const secretList = Array.isArray(secrets) ? secrets : [secrets];
+  const provided = Buffer.from(signature, 'hex');
+
+  for (const secret of secretList) {
+    if (!secret) continue;
+    const expected = Buffer.from(signWebhookPayload(secret, ts, deliveryId, bodyStr, version), 'hex');
+    if (expected.length === provided.length && timingSafeEqual(expected, provided)) {
+      return { valid: true };
+    }
+  }
+
+  return { valid: false, reason: 'signature_mismatch' };
+}
 
 /**
  * Subscription representation safe to return from read operations.
@@ -91,6 +231,10 @@ export interface WebhookServiceOptions {
   deadLetterPath?: string;
   /** Persistent store for successfully delivered event identities. */
   deduplicationPath?: string;
+  /** Maximum backoff delay (ms). Defaults to {@link MAX_WEBHOOK_BACKOFF_MS}. */
+  maxBackoff?: number;
+  /** Replay window (ms) advertised to subscribers. Defaults to 5 minutes. */
+  replayWindowMs?: number;
 }
 
 interface DedupeState {
@@ -137,6 +281,8 @@ interface DedupeState {
 export class WebhookService {
   private readonly maxRetries: number;
   private readonly baseDelay: number;
+  private readonly maxBackoff: number;
+  private readonly replayWindowMs: number;
   private readonly subscriptionsPath: string;
   private readonly deadLetterPath: string;
   private readonly deduplicationPath: string;
@@ -147,11 +293,18 @@ export class WebhookService {
   private deduplicationLock: Promise<void> = Promise.resolve();
 
   constructor(options: WebhookServiceOptions = {}) {
-    this.maxRetries = options.maxRetries ?? 5;
-    this.baseDelay = options.baseDelay ?? 1000;
+    this.maxRetries = Math.max(1, options.maxRetries ?? DEFAULT_WEBHOOK_MAX_RETRIES);
+    this.baseDelay = options.baseDelay ?? DEFAULT_WEBHOOK_BASE_DELAY_MS;
+    this.maxBackoff = options.maxBackoff ?? MAX_WEBHOOK_BACKOFF_MS;
+    this.replayWindowMs = options.replayWindowMs ?? DEFAULT_WEBHOOK_REPLAY_WINDOW_MS;
     this.subscriptionsPath = options.subscriptionsPath ?? path.join(process.cwd(), 'data', 'webhook_subscriptions.json');
     this.deadLetterPath = options.deadLetterPath ?? path.join(process.cwd(), 'data', 'webhook_dead_letter.json');
     this.deduplicationPath = options.deduplicationPath ?? path.join(process.cwd(), 'data', 'webhook_delivered_events.json');
+  }
+
+  /** Replay window (ms) that subscribers should enforce. */
+  getReplayWindowMs(): number {
+    return this.replayWindowMs;
   }
 
   // ============================================
@@ -520,8 +673,13 @@ export class WebhookService {
    * delivery for events without a stable identity and effectively-once
    * delivery for events with one, including across process restarts.
    */
-  async dispatchEvent(event: string, eventData: Record<string, unknown>): Promise<void> {
-    const subscriptions = await this.readAllSubscriptions();
+  async dispatchEvent(
+    event: string,
+    eventData: Record<string, unknown>,
+    traceContext?: TraceContext
+  ): Promise<void> {
+    const parentTrace = traceContext ?? getActiveTrace();
+    const subscriptions = await this.getSubscriptions();
     const matchingSubs = subscriptions.filter(
       (sub) => sub.events.includes(event) || sub.events.includes('*')
     );
@@ -533,7 +691,7 @@ export class WebhookService {
       const eventKey = sourceKey ? `${sub.id}:${sourceKey}` : null;
       if (!(await this.reserveEvent(eventKey))) continue;
 
-      const deliveryPromise = this.deliverWithRetry(sub, event, eventData).then(
+      const deliveryPromise = this.deliverWithRetry(sub, event, eventData, 1, parentTrace).then(
         (delivered) => this.completeEvent(eventKey, delivered),
         async () => {
           await this.completeEvent(eventKey, false);
@@ -547,16 +705,44 @@ export class WebhookService {
   }
 
   /**
-   * Internal method to orchestrate delivery with backoff retries
+   * Compute the bounded exponential backoff delay for a given attempt.
+   * Attempt 1 -> baseDelay, attempt 2 -> 2*baseDelay, ... capped at maxBackoff.
+   */
+  private computeBackoffDelay(attemptNum: number): number {
+    const exponential = this.baseDelay * Math.pow(2, attemptNum - 1);
+    return Math.min(exponential, this.maxBackoff);
+  }
+
+  /**
+   * Internal method to orchestrate delivery with backoff retries.
+   *
+   * A single delivery ID and timestamp are generated per logical delivery and
+   * reused across retries so subscribers can deduplicate retried attempts.
    */
   private async deliverWithRetry(
     sub: WebhookSubscription,
     event: string,
     eventData: Record<string, unknown>,
-    attemptNum = 1
+    attemptNum = 1,
+    delivery?: WebhookDeliveryMetadata,
   ): Promise<boolean> {
-    const deliveryId = 'del_' + randomUUID().replace(/-/g, '').slice(0, 16);
-    const timestamp = Date.now();
+    const metadata: WebhookDeliveryMetadata = delivery ?? {
+      deliveryId: 'del_' + randomUUID().replace(/-/g, ''),
+      timestamp: Date.now(),
+      signatureVersion: WEBHOOK_SIGNATURE_VERSION,
+    };
+    const { deliveryId, timestamp, signatureVersion } = metadata;
+
+    // Trace context and span propagation
+    const active = traceContext ?? getActiveTrace();
+    const traceCtx = active ? createChildContext(active) : extractTraceContext({});
+    const span = new Span(traceCtx, 'webhook.deliver', {
+      'webhook.subscription_id': sub.id,
+      'webhook.event': event,
+      'webhook.attempt': attemptNum,
+      'webhook.url': sub.url,
+      'webhook.delivery_id': deliveryId,
+    });
 
     const payload: WebhookPayload = {
       id: deliveryId,
@@ -566,8 +752,7 @@ export class WebhookService {
     };
 
     const payloadStr = JSON.stringify(payload);
-    const hmac = createHmac('sha256', sub.secret);
-    const signature = hmac.update(`${timestamp}.${payloadStr}`).digest('hex');
+    const signature = signWebhookPayload(sub.secret, timestamp, deliveryId, payloadStr, signatureVersion);
 
     let success = false;
     let statusCode: number | null = null;
@@ -577,12 +762,22 @@ export class WebhookService {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s HTTP timeout
 
+      const outgoingHeaders: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'X-Webhook-Timestamp': timestamp.toString(),
+        'X-Webhook-Signature': signature,
+        'X-Webhook-Event': event,
+        'X-Webhook-Delivery-Id': deliveryId,
+      };
+      injectTraceHeaders(traceCtx, outgoingHeaders);
+
       const response = await fetch(sub.url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'X-Webhook-Timestamp': timestamp.toString(),
           'X-Webhook-Signature': signature,
+          'X-Webhook-Signature-Version': signatureVersion,
           'X-Webhook-Event': event,
           'X-Webhook-Delivery-Id': deliveryId,
         },
@@ -602,34 +797,44 @@ export class WebhookService {
       errorMessage = err instanceof Error ? err.message : String(err);
     }
 
+    span.setAttribute('http.status_code', statusCode ?? 0);
+    if (success) {
+      span.end('ok');
+    } else {
+      if (errorMessage) span.setAttribute('error.message', sanitizeString(errorMessage));
+      span.end('error');
+    }
+
     const attemptRecord: WebhookDeliveryAttempt = {
       id: deliveryId,
       subscriptionId: sub.id,
       event,
       url: sub.url,
-      payload: eventData,
+      payload: sanitizeObject(eventData),
       timestamp: new Date().toISOString(),
       statusCode,
       success,
-      errorMessage,
+      errorMessage: errorMessage ? sanitizeString(errorMessage) : null,
       attempt: attemptNum,
     };
 
     if (success) {
-      console.log(`[Webhook success] Event: ${event}, Sub: ${sub.id}, Url: ${sub.url}`);
+      console.log(sanitizeString(`[Webhook success] Event: ${event}, Sub: ${sub.id}, Url: ${sub.url}`));
       return true;
     }
 
     console.warn(
-      `[Webhook failure] Attempt ${attemptNum}/${this.maxRetries} to ${sub.url} failed. Error: ${errorMessage}`
+      sanitizeString(
+        `[Webhook failure] Attempt ${attemptNum}/${this.maxRetries} to ${sub.url} failed. Error: ${errorMessage}`
+      )
     );
 
     if (attemptNum < this.maxRetries) {
-      const backoffDelay = this.baseDelay * Math.pow(2, attemptNum - 1);
-      
+      const backoffDelay = this.computeBackoffDelay(attemptNum);
+
       const retryPromise = new Promise<boolean>((resolve) => {
         setTimeout(() => {
-          this.deliverWithRetry(sub, event, eventData, attemptNum + 1).then(resolve, () => resolve(false));
+          this.deliverWithRetry(sub, event, eventData, attemptNum + 1, metadata).then(resolve, () => resolve(false));
         }, backoffDelay);
       });
 
@@ -637,11 +842,13 @@ export class WebhookService {
       retryPromise.finally(() => {
         this.pendingDeliveries.delete(retryPromise);
       });
-      
+
       return retryPromise;
     } else {
       console.error(
-        `[Webhook dead-letter] All retries (${this.maxRetries}) exhausted for ${sub.url}. Writing to DLQ.`
+        sanitizeString(
+          `[Webhook dead-letter] All retries (${this.maxRetries}) exhausted for ${sub.url}. Writing to DLQ.`
+        )
       );
       await this.logToDeadLetter(attemptRecord);
       return false;

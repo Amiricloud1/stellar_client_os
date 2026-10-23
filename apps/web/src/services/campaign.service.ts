@@ -6,6 +6,10 @@ import { pushNotificationService } from "./push-notification.service";
 import { campaignImpactNftService } from "./campaign-impact-nft.service";
 import type { CampaignWebhookEvent } from "@/types/webhook";
 import type { CampaignLocalizedContent } from "@/lib/translation";
+import {
+  campaignMetricsCache,
+  type CampaignMetricsCache,
+} from "./campaign-metrics-cache.service";
 
 export type CampaignStatus = "DRAFT" | "PENDING_VERIFICATION" | "ACTIVE" | "PAUSED" | "COMPLETED" | "FAILED";
 
@@ -384,6 +388,54 @@ export interface CampaignQueryInput {
   network?: "testnet" | "mainnet";
 }
 
+/** Shared pagination contract (issue #59). */
+export const CAMPAIGN_DEFAULT_PAGE_SIZE = 20;
+export const CAMPAIGN_MAX_PAGE_SIZE = 100;
+
+export const CAMPAIGN_SORT_FIELDS: readonly CampaignSortField[] = [
+  "createdAt",
+  "updatedAt",
+  "name",
+  "status",
+  "goalAmount",
+  "raisedAmount",
+  "sponsorCount",
+  "treeCount",
+];
+
+/** Metadata returned alongside every paginated list response. */
+export interface PageInfo {
+  limit: number;
+  offset: number;
+  total: number;
+  hasMore: boolean;
+  sort: { field: CampaignSortField; direction: SortDirection };
+}
+
+export interface CampaignPage {
+  items: CampaignRecord[];
+  pageInfo: PageInfo;
+}
+
+export function isCampaignSortField(value: unknown): value is CampaignSortField {
+  return typeof value === "string" && (CAMPAIGN_SORT_FIELDS as readonly string[]).includes(value);
+}
+
+/**
+ * Resolve the effective page size, clamping to the shared bounds. Non-finite
+ * or missing values fall back to the default; fractional values are floored.
+ */
+export function resolveCampaignPageSize(limit?: number): number {
+  if (limit === undefined || !Number.isFinite(limit)) return CAMPAIGN_DEFAULT_PAGE_SIZE;
+  return Math.min(Math.max(Math.floor(limit), 1), CAMPAIGN_MAX_PAGE_SIZE);
+}
+
+/** Resolve the effective offset, treating negative/non-finite values as 0. */
+export function resolveCampaignOffset(offset?: number): number {
+  if (offset === undefined || !Number.isFinite(offset)) return 0;
+  return Math.max(Math.floor(offset), 0);
+}
+
 export class InMemoryCampaignDataSource implements CampaignDataSource {
   private campaigns = new Map<string, CampaignRecord>();
 
@@ -416,6 +468,7 @@ export class InMemoryCampaignDataSource implements CampaignDataSource {
     // Commit first: the map write is the durable boundary. Side effects below
     // only run once the record is committed.
     this.campaigns.set(campaign.id, saved);
+    invalidateCampaignMetrics(saved.id);
 
     if (existing && campaign.sponsorCount > 0) {
       if ((existing.treeCount ?? 0) < (campaign.treeCount ?? 0)) {
@@ -944,7 +997,7 @@ gpsLocations: input.gpsLocations,
   };
   campaign.statusHistory[0].campaignId = campaign.id;
   campaign.statusHistory[0].id = `${campaign.id}:${now}:0`;
-  return dataSource.saveCampaign(campaign);
+  return persistCampaign(dataSource, campaign);
 }
 
 export async function reviewCampaignNonprofitPartner(
@@ -1078,7 +1131,17 @@ export async function findDuplicateCampaigns(
   });
 }
 
-export async function queryCampaigns(input: CampaignQueryInput = {}, dataSource = getCampaignDataSource()): Promise<CampaignRecord[]> {
+/**
+ * Paginate and sort campaigns using the shared list contract (issue #59):
+ * - page size is clamped to [1, CAMPAIGN_MAX_PAGE_SIZE] (default 20)
+ * - ordering is stable: the requested field, then `id` ascending as a
+ *   deterministic tie-breaker so pages never overlap or skip records
+ * - unknown sort fields fall back to `createdAt` DESC
+ */
+export async function queryCampaignsPage(
+  input: CampaignQueryInput = {},
+  dataSource = getCampaignDataSource(),
+): Promise<CampaignPage> {
   const filter = input.filter ?? {};
   let campaigns = await dataSource.getCampaigns(input.network);
   campaigns = campaigns.filter((campaign) => {
@@ -1095,12 +1158,33 @@ export async function queryCampaigns(input: CampaignQueryInput = {}, dataSource 
     return true;
   });
 
-  const field = input.sort?.field ?? "createdAt";
-  const direction = input.sort?.direction === "ASC" ? 1 : -1;
+  const field: CampaignSortField = isCampaignSortField(input.sort?.field)
+    ? input.sort!.field!
+    : "createdAt";
+  const sortDirection: SortDirection = input.sort?.direction === "ASC" ? "ASC" : "DESC";
+  const direction = sortDirection === "ASC" ? 1 : -1;
   campaigns.sort((a, b) => compareValues(a, b, field) * direction || a.id.localeCompare(b.id));
-  const offset = Math.max(input.offset ?? 0, 0);
-  const limit = Math.min(Math.max(input.limit ?? 20, 1), 100);
-  return campaigns.slice(offset, offset + limit);
+
+  const total = campaigns.length;
+  const offset = resolveCampaignOffset(input.offset);
+  const limit = resolveCampaignPageSize(input.limit);
+  const items = campaigns.slice(offset, offset + limit);
+
+  return {
+    items,
+    pageInfo: {
+      limit,
+      offset,
+      total,
+      hasMore: offset + items.length < total,
+      sort: { field, direction: sortDirection },
+    },
+  };
+}
+
+/** Backwards-compatible wrapper returning only the page items. */
+export async function queryCampaigns(input: CampaignQueryInput = {}, dataSource = getCampaignDataSource()): Promise<CampaignRecord[]> {
+  return (await queryCampaignsPage(input, dataSource)).items;
 }
 
 const allowedTransitions: Record<CampaignStatus, CampaignStatus[]> = {
@@ -1513,4 +1597,37 @@ export async function transferCarbonCreditCertificate(
     return updatedCertificate;
   }
   return null;
+}
+
+/**
+ * Apply an authoritative chain correction to a campaign's totals.
+ *
+ * Chain reorgs and reconciliation jobs can revise the on-chain raised amount,
+ * sponsor count, or tree count after the fact. Any such correction must
+ * invalidate the cached metrics so subsequent reads observe the corrected
+ * totals rather than a stale snapshot. Returns the updated campaign, or
+ * `null` when the campaign is unknown.
+ */
+export async function applyCampaignChainCorrection(
+  campaignId: string,
+  correction: {
+    raisedAmount?: string;
+    sponsorCount?: number;
+    treeCount?: number;
+    co2Sequestration?: string;
+  },
+  dataSource: CampaignDataSource = getCampaignDataSource(),
+  now = Date.now(),
+): Promise<CampaignRecord | null> {
+  const campaign = await getCampaign(campaignId, dataSource);
+  if (!campaign) return null;
+  const corrected: CampaignRecord = {
+    ...campaign,
+    raisedAmount: correction.raisedAmount ?? campaign.raisedAmount,
+    sponsorCount: correction.sponsorCount ?? campaign.sponsorCount,
+    treeCount: correction.treeCount ?? campaign.treeCount,
+    co2Sequestration: correction.co2Sequestration ?? campaign.co2Sequestration,
+    updatedAt: now,
+  };
+  return persistCampaign(dataSource, corrected);
 }

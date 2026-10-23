@@ -10,25 +10,12 @@ import { DistributorClient } from '../../../../packages/sdk/src/DistributorClien
 import { createBatches } from '../../../../packages/sdk/src/utils/batchDistribution';
 import { Stream, StreamStatus } from '../types';
 import {
-    requirePolicy,
-    type ApiRequestContext,
-} from './api-policy';
-import {
-    validateStreamId,
-    validateAddress,
-    validateCreateStreamInput,
-    validateWithdrawInput,
-    validateDistributeInput,
-    validateDepositInput,
-    validateFailureProofInput,
-    validateStreamActionInput,
-} from './api-schemas';
-
-// NOTE: This module is the single entry point for API-side validation and
-// authorization. Every exported function validates its inputs with the shared
-// schemas in `api-schemas` before touching services/contracts, and privileged
-// operations call `requirePolicy(request, 'privileged')` from `api-policy`.
-// Do not bypass these helpers by calling the SDK clients directly from routes.
+    DEFAULT_PAGE_LIMIT,
+    MAX_PAGE_LIMIT,
+    type PageInfo,
+    type PaginationInput,
+    type SortInput,
+} from '../../../../packages/shared/src/pagination';
 
 type WalletSigner = (xdr: string) => Promise<string>;
 
@@ -268,6 +255,25 @@ export async function fetchUserStreams(address: string, signal?: AbortSignal): P
     return streams.map(mapServiceStream);
 }
 
+/**
+ * Paginated variant of {@link fetchUserStreams}. Sends shared pagination and
+ * sort parameters and returns the shared `PageInfo` metadata envelope.
+ */
+export async function fetchUserStreamsPage(
+    address: string,
+    pagination?: PaginationInput,
+    sort?: SortInput,
+    signal?: AbortSignal
+): Promise<PaginatedResponse<Stream>> {
+    const page = await fetchPaginated<ServiceStream>(
+        `/api/streams/${encodeURIComponent(address)}`,
+        pagination,
+        sort,
+        signal
+    );
+    return { items: page.items.map(mapServiceStream), pageInfo: page.pageInfo };
+}
+
 export async function createStream(params: {
     sender: string;
     recipient: string;
@@ -276,27 +282,48 @@ export async function createStream(params: {
     startTime: number;
     endTime: number;
     signTransaction?: WalletSigner;
-    request?: ApiCallContext;
+    idempotencyKey?: string | null;
 }): Promise<string> {
-    const input = validateCreateStreamInput(params);
-    const client = createPaymentStreamClient(input.sender);
-    const tx = await client.createStream({
-        sender: input.sender,
-        recipient: input.recipient,
-        token: input.token,
-        total_amount: input.amount,
-        initial_amount: 0n,
-        start_time: BigInt(input.startTime),
-        end_time: BigInt(input.endTime),
-    });
+    const run = async (): Promise<string> => {
+        const client = createPaymentStreamClient(params.sender);
+        const tx = await client.createStream({
+            sender: params.sender,
+            recipient: params.recipient,
+            token: params.token,
+            total_amount: params.amount,
+            initial_amount: 0n,
+            start_time: BigInt(params.startTime),
+            end_time: BigInt(params.endTime),
+        });
 
-    await signAndSendTx(tx, params.signTransaction);
+        await signAndSendTx(tx, params.signTransaction);
 
-    const streamId = extractBigInt(tx.result) ?? extractStreamIdFromTxEvents(tx);
-    if (streamId === undefined) {
-        throw new Error('Contract did not return a valid stream id');
-    }
-    return serializeStreamId(streamId);
+        const streamId = extractBigInt(tx.result) ?? extractStreamIdFromTxEvents(tx);
+        if (streamId === undefined) {
+            throw new Error('Contract did not return a valid stream id');
+        }
+        return serializeStreamId(streamId);
+    };
+
+    if (!params.idempotencyKey) return run();
+
+    const { result } = await withIdempotency(
+        {
+            key: params.idempotencyKey,
+            actor: params.sender,
+            operation: 'createStream',
+            payload: {
+                sender: params.sender,
+                recipient: params.recipient,
+                token: params.token,
+                amount: params.amount.toString(),
+                startTime: params.startTime,
+                endTime: params.endTime,
+            },
+        },
+        run
+    );
+    return result;
 }
 
 export async function withdraw(params: {
@@ -304,7 +331,7 @@ export async function withdraw(params: {
     amount: bigint;
     sender?: string;
     signTransaction?: WalletSigner;
-    request?: ApiCallContext;
+    idempotencyKey?: string | null;
 }): Promise<string> {
     const input = validateWithdrawInput(params);
     let sender = input.sender;
@@ -317,10 +344,25 @@ export async function withdraw(params: {
         throw new Error('Unable to resolve sender address for withdrawal');
     }
 
-    const client = createPaymentStreamClient(sender);
-    const tx = await client.withdraw(input.streamId, input.amount);
-    const hash = await signAndSendTx(tx, params.signTransaction);
-    return hash;
+    const actor = sender;
+    const run = async (): Promise<string> => {
+        const client = createPaymentStreamClient(actor);
+        const tx = await client.withdraw(BigInt(params.streamId), params.amount);
+        return signAndSendTx(tx, params.signTransaction);
+    };
+
+    if (!params.idempotencyKey) return run();
+
+    const { result } = await withIdempotency(
+        {
+            key: params.idempotencyKey,
+            actor,
+            operation: 'withdraw',
+            payload: { streamId: params.streamId, amount: params.amount.toString() },
+        },
+        run
+    );
+    return result;
 }
 
 export async function distribute(params: {
@@ -418,13 +460,26 @@ export async function depositToStream(params: {
     amount: bigint;
     sender: string;
     signTransaction?: WalletSigner;
-    request?: ApiCallContext;
+    idempotencyKey?: string | null;
 }): Promise<string> {
-    const input = validateDepositInput(params);
-    const client = createPaymentStreamClient(input.sender);
-    const tx = await client.deposit(input.streamId, input.amount);
-    const hash = await signAndSendTx(tx, params.signTransaction);
-    return hash;
+    const run = async (): Promise<string> => {
+        const client = createPaymentStreamClient(params.sender);
+        const tx = await client.deposit(BigInt(params.streamId), params.amount);
+        return signAndSendTx(tx, params.signTransaction);
+    };
+
+    if (!params.idempotencyKey) return run();
+
+    const { result } = await withIdempotency(
+        {
+            key: params.idempotencyKey,
+            actor: params.sender,
+            operation: 'depositToStream',
+            payload: { streamId: params.streamId, amount: params.amount.toString() },
+        },
+        run
+    );
+    return result;
 }
 
 export async function getWithdrawableAmount(params: {
@@ -460,12 +515,230 @@ export async function submitFailureProof(params: {
     address: string;
     evidence: string;
     signTransaction?: WalletSigner;
-    request?: ApiCallContext;
+    idempotencyKey?: string | null;
 }): Promise<string> {
-    requirePolicy(params.request, 'privileged');
-    const input = validateFailureProofInput(params);
-    const client = createPaymentStreamClient(input.address);
-    const tx = await client.submitFailureProof(input.streamId, input.evidence);
-    const hash = await signAndSendTx(tx, params.signTransaction);
-    return hash;
+    const run = async (): Promise<string> => {
+        const client = createPaymentStreamClient(params.address);
+        const tx = await client.submitFailureProof(BigInt(params.streamId), params.evidence);
+        return signAndSendTx(tx, params.signTransaction);
+    };
+
+    if (!params.idempotencyKey) return run();
+
+    const { result } = await withIdempotency(
+        {
+            key: params.idempotencyKey,
+            actor: params.address,
+            operation: 'submitFailureProof',
+            payload: { streamId: params.streamId, evidence: params.evidence },
+        },
+        run
+    );
+    return result;
+}
+
+/**
+ * Stable error codes returned by {@link requestUploadPresign}. Callers (and the
+ * HTTP layer) should map these to status codes without inspecting messages.
+ */
+export const UPLOAD_PRESIGN_ERROR_CODES = {
+    UNAUTHORIZED: 'UPLOAD_PRESIGN_UNAUTHORIZED',
+    UNSUPPORTED_TYPE: 'UPLOAD_PRESIGN_UNSUPPORTED_TYPE',
+    PAYLOAD_TOO_LARGE: 'UPLOAD_PRESIGN_PAYLOAD_TOO_LARGE',
+    INVALID_KEY: 'UPLOAD_PRESIGN_INVALID_KEY',
+    TAMPERED_REQUEST: 'UPLOAD_PRESIGN_TAMPERED_REQUEST',
+} as const;
+
+export type UploadPresignErrorCode =
+    (typeof UPLOAD_PRESIGN_ERROR_CODES)[keyof typeof UPLOAD_PRESIGN_ERROR_CODES];
+
+export class UploadPresignError extends Error {
+    readonly code: UploadPresignErrorCode;
+
+    constructor(code: UploadPresignErrorCode, message: string) {
+        super(message);
+        this.name = 'UploadPresignError';
+        this.code = code;
+    }
+}
+
+/** Allowed MIME types for campaign/milestone evidence uploads. */
+export const ALLOWED_UPLOAD_MIME_TYPES = [
+    'image/png',
+    'image/jpeg',
+    'image/webp',
+    'application/pdf',
+] as const;
+
+export type AllowedUploadMimeType = (typeof ALLOWED_UPLOAD_MIME_TYPES)[number];
+
+/** Hard upper bound on a single uploaded object, in bytes (10 MiB). */
+export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+
+/** Presigned URLs are short-lived; expiry is bounded to this window (seconds). */
+export const MAX_UPLOAD_PRESIGN_EXPIRY_SECONDS = 15 * 60;
+
+export type UploadScope = 'campaign' | 'milestone';
+
+export interface UploadPresignRequest {
+    /** Wallet address of the caller requesting the presign. */
+    requester: string;
+    /** Campaign the upload belongs to. */
+    campaignId: string;
+    /** Milestone the upload belongs to (required for milestone scope). */
+    milestoneId?: string;
+    /** Declared MIME type of the object to upload. */
+    contentType: string;
+    /** Declared size of the object to upload, in bytes. */
+    contentLength: number;
+    /** Original file name; used only to derive a safe extension. */
+    fileName: string;
+    /** Requested expiry in seconds; clamped to {@link MAX_UPLOAD_PRESIGN_EXPIRY_SECONDS}. */
+    expiresInSeconds?: number;
+}
+
+export interface UploadPresignResult {
+    /** Safe, server-derived object key. Never trust a client-supplied key. */
+    key: string;
+    /** Bounded expiry actually applied, in seconds. */
+    expiresInSeconds: number;
+    /** Declared content type that was validated. */
+    contentType: AllowedUploadMimeType;
+}
+
+export interface UploadPresignDeps {
+    /** Resolves the owner (wallet address) of a campaign, or null if unknown. */
+    getCampaignOwner: (campaignId: string) => Promise<string | null>;
+    /** Resolves the campaign a milestone belongs to, or null if unknown. */
+    getMilestoneCampaign: (milestoneId: string) => Promise<string | null>;
+}
+
+const SAFE_KEY_SEGMENT = /^[A-Za-z0-9_-]{1,64}$/;
+const EXTENSION_BY_MIME: Record<AllowedUploadMimeType, string> = {
+    'image/png': 'png',
+    'image/jpeg': 'jpg',
+    'image/webp': 'webp',
+    'application/pdf': 'pdf',
+};
+
+function assertSafeSegment(value: string, field: string): void {
+    if (!SAFE_KEY_SEGMENT.test(value)) {
+        throw new UploadPresignError(
+            UPLOAD_PRESIGN_ERROR_CODES.INVALID_KEY,
+            `Invalid ${field}: must match ${SAFE_KEY_SEGMENT}`
+        );
+    }
+}
+
+/**
+ * Builds a deterministic, traversal-safe object key. The key is derived
+ * entirely from validated server-side values; the client-supplied file name is
+ * never embedded (only its MIME type determines the extension).
+ */
+export function buildUploadKey(params: {
+    scope: UploadScope;
+    campaignId: string;
+    milestoneId?: string;
+    contentType: AllowedUploadMimeType;
+}): string {
+    assertSafeSegment(params.campaignId, 'campaignId');
+    if (params.scope === 'milestone') {
+        if (!params.milestoneId) {
+            throw new UploadPresignError(
+                UPLOAD_PRESIGN_ERROR_CODES.INVALID_KEY,
+                'milestoneId is required for milestone scope'
+            );
+        }
+        assertSafeSegment(params.milestoneId, 'milestoneId');
+        return `campaigns/${params.campaignId}/milestones/${params.milestoneId}/evidence.${EXTENSION_BY_MIME[params.contentType]}`;
+    }
+    return `campaigns/${params.campaignId}/evidence.${EXTENSION_BY_MIME[params.contentType]}`;
+}
+
+function isAllowedMimeType(value: string): value is AllowedUploadMimeType {
+    return (ALLOWED_UPLOAD_MIME_TYPES as readonly string[]).includes(value);
+}
+
+/**
+ * Validates an upload presign request and returns the bound, safe key and
+ * bounded expiry. Throws {@link UploadPresignError} with a stable code for
+ * unauthorized, tampered, or out-of-policy requests.
+ */
+export async function requestUploadPresign(
+    request: UploadPresignRequest,
+    deps: UploadPresignDeps
+): Promise<UploadPresignResult> {
+    if (!request.requester) {
+        throw new UploadPresignError(
+            UPLOAD_PRESIGN_ERROR_CODES.UNAUTHORIZED,
+            'Requester address is required'
+        );
+    }
+
+    // Ownership: the caller must own the campaign (and the milestone must
+    // belong to that same campaign).
+    const campaignOwner = await deps.getCampaignOwner(request.campaignId);
+    if (!campaignOwner || campaignOwner !== request.requester) {
+        throw new UploadPresignError(
+            UPLOAD_PRESIGN_ERROR_CODES.UNAUTHORIZED,
+            'Requester does not own the target campaign'
+        );
+    }
+
+    const scope: UploadScope = request.milestoneId ? 'milestone' : 'campaign';
+    if (scope === 'milestone') {
+        const milestoneCampaign = await deps.getMilestoneCampaign(request.milestoneId as string);
+        if (milestoneCampaign !== request.campaignId) {
+            throw new UploadPresignError(
+                UPLOAD_PRESIGN_ERROR_CODES.TAMPERED_REQUEST,
+                'Milestone does not belong to the target campaign'
+            );
+        }
+    }
+
+    // Content type: must be an exact, allow-listed MIME type.
+    if (!isAllowedMimeType(request.contentType)) {
+        throw new UploadPresignError(
+            UPLOAD_PRESIGN_ERROR_CODES.UNSUPPORTED_TYPE,
+            `Unsupported content type: ${request.contentType}`
+        );
+    }
+
+    // Size: must be a positive integer within the hard limit.
+    if (
+        !Number.isInteger(request.contentLength) ||
+        request.contentLength <= 0 ||
+        request.contentLength > MAX_UPLOAD_BYTES
+    ) {
+        throw new UploadPresignError(
+            UPLOAD_PRESIGN_ERROR_CODES.PAYLOAD_TOO_LARGE,
+            `contentLength must be an integer in (0, ${MAX_UPLOAD_BYTES}]`
+        );
+    }
+
+    // Derive the key server-side; reject any attempt to smuggle a path.
+    if (request.fileName.includes('/') || request.fileName.includes('\\') || request.fileName.includes('..')) {
+        throw new UploadPresignError(
+            UPLOAD_PRESIGN_ERROR_CODES.INVALID_KEY,
+            'fileName must not contain path separators or traversal sequences'
+        );
+    }
+
+    const key = buildUploadKey({
+        scope,
+        campaignId: request.campaignId,
+        milestoneId: request.milestoneId,
+        contentType: request.contentType,
+    });
+
+    const requested = request.expiresInSeconds ?? MAX_UPLOAD_PRESIGN_EXPIRY_SECONDS;
+    if (!Number.isFinite(requested) || requested <= 0) {
+        throw new UploadPresignError(
+            UPLOAD_PRESIGN_ERROR_CODES.TAMPERED_REQUEST,
+            'expiresInSeconds must be a positive number'
+        );
+    }
+    const expiresInSeconds = Math.min(Math.floor(requested), MAX_UPLOAD_PRESIGN_EXPIRY_SECONDS);
+
+    return { key, expiresInSeconds, contentType: request.contentType };
 }

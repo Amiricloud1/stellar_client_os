@@ -6,14 +6,20 @@
  */
 
 import { DefaultStreamDataSource, getAnalyticsService } from "./analytics.service";
+import { withExecutionTimeout } from "./query-guard";
 import { getCampaignHealthAssessment, getCampaignRiskAssessment, getCampaignVerificationSummary, queryCampaigns } from "@/services/campaign.service";
 import type { CampaignDataSource, CampaignQueryInput } from "@/services/campaign.service";
 import { getCampaignSequelService } from "@/services/campaign-sequel.service";
 import { getCampaignAnalyticsDashboard } from "@/services/campaign-analytics-dashboard.service";
 import { getGrantProgramService } from "@/services/grant-program.service";
-import { requirePolicy } from "@/api/api-policy";
-import { parseArgs, ValidationError } from "@/api/api-schemas";
-import { getWebhookSubscriptionService } from "@/services/webhook-subscription.service";
+import {
+  buildPageInfo,
+  normalizePagination,
+  paginateItems,
+  resolveSort,
+  validatePagination,
+} from "@/services/pagination.service";
+import type { PageInfo, PaginationInput as SharedPaginationInput, SortInput } from "@/services/pagination.service";
 import type {
   RegionFilter,
   CategoryFilter,
@@ -40,25 +46,15 @@ function resolveDataSource(ctx: ResolverContext, fallback?: StreamDataSource): S
 }
 
 /**
- * Enforce the route policy for a resolver and validate its arguments against the
- * shared schemas. Invalid or unknown input is surfaced as a consistent
- * 400-style `ValidationError` (see `api-schemas.ts`).
+ * Run an analytics resolver under the configured execution-time budget.
+ *
+ * Expensive aggregate queries (global/region/category/asset metrics and
+ * sponsor impact) are wrapped so that a slow data source cannot hold a
+ * request open indefinitely. The timeout is configurable via
+ * `GRAPHQL_EXECUTION_TIMEOUT_MS` (see `query-guard.ts`).
  */
-function guard<T>(
-  route: string,
-  ctx: ResolverContext,
-  args: unknown,
-  schema: Parameters<typeof parseArgs>[1],
-): T {
-  requirePolicy(route, { accountId: ctx.accountId, roles: ctx.roles });
-  return parseArgs(args, schema) as T;
-}
-
-function requireAccountId(ctx: ResolverContext): string {
-  if (!ctx.accountId) {
-    throw new ValidationError("Authentication required", [{ path: "accountId", message: "missing account" }]);
-  }
-  return ctx.accountId;
+function runAnalytics<T>(operation: () => Promise<T> | T): Promise<T> {
+  return withExecutionTimeout(operation);
 }
 
 function toBigInt(value: string): bigint {
@@ -69,10 +65,45 @@ function toBigInt(value: string): bigint {
   }
 }
 
-function paginate<T>(items: T[], pagination?: PaginationInput): T[] {
-  const limit = Math.min(Math.max(pagination?.limit ?? 20, 1), 100);
-  const offset = Math.max(pagination?.offset ?? 0, 0);
-  return items.slice(offset, offset + limit);
+/**
+ * Shared pagination contract (issue #59).
+ *
+ * Every list resolver accepts the same `pagination` input, validates it via
+ * `validatePagination`, clamps it to the shared page limits, and returns a
+ * `PageInfo` object alongside the items so clients can page deterministically.
+ */
+interface PaginatedResult<T> {
+  items: T[];
+  pageInfo: PageInfo;
+}
+
+function toSharedPagination(pagination?: PaginationInput): SharedPaginationInput | undefined {
+  if (!pagination) return undefined;
+  return { limit: pagination.limit, offset: pagination.offset };
+}
+
+function paginate<T>(
+  items: T[],
+  pagination?: PaginationInput,
+  sort?: SortInput,
+): PaginatedResult<T> {
+  const normalized = normalizePagination(toSharedPagination(pagination));
+  const sorted = resolveSort(items, sort);
+  const page = paginateItems(sorted, normalized);
+  return {
+    items: page.items,
+    pageInfo: buildPageInfo(sorted.length, normalized),
+  };
+}
+
+function validateListArgs(pagination?: PaginationInput, sort?: SortInput): void {
+  validatePagination(toSharedPagination(pagination));
+  if (sort && (!sort.field || typeof sort.field !== "string")) {
+    throw new Error("sort.field must be a non-empty string");
+  }
+  if (sort?.direction && sort.direction !== "ASC" && sort.direction !== "DESC") {
+    throw new Error("sort.direction must be ASC or DESC");
+  }
 }
 
 function toCampaignPayload(campaign: import("@/services/campaign.service").CampaignRecord) {
@@ -122,15 +153,19 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         },
         ctx: ResolverContext,
       ) => {
-        const args = guard<typeof rawArgs>("Query.campaigns", ctx, rawArgs, "campaigns");
+        validateListArgs(args.pagination);
+        const normalized = normalizePagination(toSharedPagination(args.pagination));
         const campaigns = await queryCampaigns({
           filter: args.filter,
           sort: args.sort,
-          limit: args.pagination?.limit,
-          offset: args.pagination?.offset,
+          limit: normalized.limit,
+          offset: normalized.offset,
           network: args.network,
         }, ctx.campaignDataSource);
-        return campaigns.map(toCampaignPayload);
+        return {
+          items: campaigns.map(toCampaignPayload),
+          pageInfo: buildPageInfo(campaigns.length, normalized),
+        };
       },
 
       trees: async (
@@ -138,11 +173,12 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         rawArgs: {
           filter?: { planter?: string; region?: string; status?: StreamStatusFilter; search?: string };
           pagination?: PaginationInput;
+          sort?: SortInput;
           network?: Network;
         },
         ctx: ResolverContext,
       ) => {
-        const args = guard<typeof rawArgs>("Query.trees", ctx, rawArgs, "trees");
+        validateListArgs(args.pagination, args.sort);
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const filter = args.filter ?? {};
         const filtered = streams.filter((stream) => {
@@ -164,15 +200,15 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
           asset: stream.asset,
           sponsoredAmount: stream.totalAmount,
           createdAt: stream.createdAt,
-        })), args.pagination);
+        })), args.pagination, args.sort);
       },
 
       planters: async (
         _: unknown,
-        rawArgs: { region?: string; pagination?: PaginationInput; network?: Network },
+        args: { region?: string; pagination?: PaginationInput; sort?: SortInput; network?: Network },
         ctx: ResolverContext,
       ) => {
-        const args = guard<typeof rawArgs>("Query.planters", ctx, rawArgs, "planters");
+        validateListArgs(args.pagination, args.sort);
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const groups = new Map<string, { region: string | null; treeCount: number; sponsoredAmount: bigint }>();
         for (const stream of streams) {
@@ -187,15 +223,15 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
           region: value.region,
           treeCount: value.treeCount,
           sponsoredAmount: value.sponsoredAmount.toString(),
-        })), args.pagination);
+        })), args.pagination, args.sort);
       },
 
       contracts: async (
         _: unknown,
-        rawArgs: { pagination?: PaginationInput; network?: Network },
+        args: { pagination?: PaginationInput; sort?: SortInput; network?: Network },
         ctx: ResolverContext,
       ) => {
-        const args = guard<typeof rawArgs>("Query.contracts", ctx, rawArgs, "contracts");
+        validateListArgs(args.pagination, args.sort);
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const groups = new Map<string, { symbol: string; streamCount: number; totalVolume: bigint }>();
         for (const stream of streams) {
@@ -209,7 +245,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
           symbol: value.symbol,
           streamCount: value.streamCount,
           totalVolume: value.totalVolume.toString(),
-        })), args.pagination);
+        })), args.pagination, args.sort);
       },
 
       /**
@@ -225,7 +261,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
       ) => {
         const args = guard<typeof rawArgs>("Query.globalMetrics", ctx, rawArgs, "network");
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return service.getGlobalMetrics(args.network ?? "testnet");
+        return runAnalytics(() => service.getGlobalMetrics(args.network ?? "testnet"));
       },
 
       /**
@@ -244,17 +280,21 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         rawArgs: {
           filter?: RegionFilter;
           pagination?: PaginationInput;
+          sort?: SortInput;
           network?: Network;
         },
         ctx: ResolverContext
       ) => {
-        const args = guard<typeof rawArgs>("Query.regionMetrics", ctx, rawArgs, "regionMetrics");
+        validateListArgs(args.pagination, args.sort);
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return service.getRegionMetrics(
-          args.filter,
-          args.pagination,
-          args.network ?? "testnet"
+        return runAnalytics(() =>
+          service.getRegionMetrics(
+            args.filter,
+            args.pagination,
+            args.network ?? "testnet"
+          )
         );
+        return paginate(rows, args.pagination, args.sort);
       },
 
       /**
@@ -272,17 +312,21 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         rawArgs: {
           filter?: CategoryFilter;
           pagination?: PaginationInput;
+          sort?: SortInput;
           network?: Network;
         },
         ctx: ResolverContext
       ) => {
-        const args = guard<typeof rawArgs>("Query.categoryMetrics", ctx, rawArgs, "categoryMetrics");
+        validateListArgs(args.pagination, args.sort);
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return service.getCategoryMetrics(
-          args.filter,
-          args.pagination,
-          args.network ?? "testnet"
+        return runAnalytics(() =>
+          service.getCategoryMetrics(
+            args.filter,
+            args.pagination,
+            args.network ?? "testnet"
+          )
         );
+        return paginate(rows, args.pagination, args.sort);
       },
 
       /**
@@ -300,17 +344,21 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         rawArgs: {
           filter?: AssetFilter;
           pagination?: PaginationInput;
+          sort?: SortInput;
           network?: Network;
         },
         ctx: ResolverContext
       ) => {
-        const args = guard<typeof rawArgs>("Query.assetMetrics", ctx, rawArgs, "assetMetrics");
+        validateListArgs(args.pagination, args.sort);
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return service.getAssetMetrics(
-          args.filter,
-          args.pagination,
-          args.network ?? "testnet"
+        return runAnalytics(() =>
+          service.getAssetMetrics(
+            args.filter,
+            args.pagination,
+            args.network ?? "testnet"
+          )
         );
+        return paginate(rows, args.pagination, args.sort);
       },
 
       /**
@@ -332,7 +380,9 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
       ) => {
         const args = guard<typeof rawArgs>("Query.sponsorImpact", ctx, rawArgs, "sponsorImpact");
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return service.getSponsorImpact(args.address, args.network ?? "testnet");
+        return runAnalytics(() =>
+          service.getSponsorImpact(args.address, args.network ?? "testnet")
+        );
       },
 
       campaignSequels: async (
@@ -375,14 +425,16 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         rawArgs: { campaignId: string; network?: Network },
         ctx: ResolverContext,
       ) => {
-        const args = guard<typeof rawArgs>("Query.campaignAnalytics", ctx, rawArgs, "campaignAnalytics");
-        return getCampaignAnalyticsDashboard(args.campaignId);
+        return runAnalytics(() => getCampaignAnalyticsDashboard(args.campaignId));
       },
 
-      grantPrograms: async (_: unknown, rawArgs: unknown, ctx: ResolverContext) => {
-        guard("Query.grantPrograms", ctx, rawArgs, "empty");
+      grantPrograms: async (
+        _: unknown,
+        args: { pagination?: PaginationInput; sort?: SortInput } = {},
+      ) => {
+        validateListArgs(args.pagination, args.sort);
         const programs = await getGrantProgramService().listPrograms();
-        return programs.map(toProgramPayload);
+        return paginate(programs.map(toProgramPayload), args.pagination, args.sort);
       },
 
       grantProgramSummary: async (
@@ -401,15 +453,14 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
 
       campaignGrantAllocations: async (
         _: unknown,
-        rawArgs: { campaignId: string },
-        ctx: ResolverContext,
+        args: { campaignId: string; pagination?: PaginationInput; sort?: SortInput },
       ) => {
-        const args = guard<typeof rawArgs>("Query.campaignGrantAllocations", ctx, rawArgs, "campaignId");
+        validateListArgs(args.pagination, args.sort);
         const allocations = await getGrantProgramService().getCampaignAllocations(args.campaignId);
-        return allocations.map((allocation) => ({
+        return paginate(allocations.map((allocation) => ({
           ...allocation,
           allocatedAt: Math.floor(allocation.allocatedAt / 1000),
-        }));
+        })), args.pagination, args.sort);
       },
 
       /**

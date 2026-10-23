@@ -50,7 +50,13 @@ export type ErrorClass =
  * Represents a parsed Soroban contract error with context
  */
 export interface ParsedContractError {
-  type: "contract_error" | "simulation_error" | "transaction_error" | "unknown";
+  type:
+    | "contract_error"
+    | "simulation_error"
+    | "transaction_error"
+    | "authorization_error"
+    | "chain_identity_error"
+    | "unknown";
   code?: number;
   message: string;
   details?: string;
@@ -535,6 +541,7 @@ export class FundableStellarError extends Error {
   public readonly details?: string;
   public readonly suggestion?: string;
   public readonly operation?: string;
+  public readonly sdkCode?: SdkErrorCode;
 
   constructor(parsed: ParsedContractError) {
     super(parsed.message);
@@ -545,6 +552,7 @@ export class FundableStellarError extends Error {
     this.details = parsed.details;
     this.suggestion = parsed.suggestion;
     this.operation = parsed.operation;
+    this.sdkCode = parsed.sdkCode;
 
     // Set prototype for instanceof checks
     Object.setPrototypeOf(this, FundableStellarError.prototype);
@@ -591,6 +599,139 @@ export class FundableStellarError extends Error {
 }
 
 /**
+ * Error raised when the authenticated caller does not own the resource.
+ * Maps to {@link SDK_ERROR_CODES.UNAUTHORIZED_OWNER}.
+ */
+export class UnauthorizedOwnerError extends FundableStellarError {
+  constructor(operation?: string, details?: string) {
+    super({
+      type: "authorization_error",
+      sdkCode: SDK_ERROR_CODES.UNAUTHORIZED_OWNER,
+      message: "You are not authorized to access this resource",
+      details,
+      suggestion: "Ensure you are signed in as the account that owns this resource.",
+      operation,
+    });
+    this.name = "UnauthorizedOwnerError";
+    Object.setPrototypeOf(this, UnauthorizedOwnerError.prototype);
+  }
+}
+
+/**
+ * Error raised when the caller's profile is not verified for the requested action.
+ * Maps to {@link SDK_ERROR_CODES.UNVERIFIED_PROFILE}.
+ */
+export class UnverifiedProfileError extends FundableStellarError {
+  constructor(operation?: string, details?: string) {
+    super({
+      type: "authorization_error",
+      sdkCode: SDK_ERROR_CODES.UNVERIFIED_PROFILE,
+      message: "Your profile must be verified before performing this action",
+      details,
+      suggestion: "Complete identity verification in your profile settings and try again.",
+      operation,
+    });
+    this.name = "UnverifiedProfileError";
+    Object.setPrototypeOf(this, UnverifiedProfileError.prototype);
+  }
+}
+
+/**
+ * Error raised when a caller attempts to access a resource owned by another account.
+ * Maps to {@link SDK_ERROR_CODES.CROSS_ACCOUNT_ACCESS}.
+ */
+export class CrossAccountAccessError extends FundableStellarError {
+  constructor(operation?: string, details?: string) {
+    super({
+      type: "authorization_error",
+      sdkCode: SDK_ERROR_CODES.CROSS_ACCOUNT_ACCESS,
+      message: "This resource belongs to a different account",
+      details,
+      suggestion: "Sign in with the account that owns this resource.",
+      operation,
+    });
+    this.name = "CrossAccountAccessError";
+    Object.setPrototypeOf(this, CrossAccountAccessError.prototype);
+  }
+}
+
+/**
+ * Error raised when an in-flight transaction flow was started on a different
+ * network than the one currently selected. The flow must be aborted and restarted.
+ * Maps to {@link SDK_ERROR_CODES.CHAIN_IDENTITY_MISMATCH}.
+ */
+export class ChainIdentityMismatchError extends FundableStellarError {
+  public readonly expectedNetwork?: string;
+  public readonly actualNetwork?: string;
+
+  constructor(
+    expectedNetwork?: string,
+    actualNetwork?: string,
+    operation?: string,
+  ) {
+    super({
+      type: "chain_identity_error",
+      sdkCode: SDK_ERROR_CODES.CHAIN_IDENTITY_MISMATCH,
+      message: "The network changed while this transaction was in progress",
+      details:
+        expectedNetwork !== undefined || actualNetwork !== undefined
+          ? `Expected network: ${expectedNetwork ?? "unknown"}, current network: ${
+              actualNetwork ?? "unknown"
+            }`
+          : undefined,
+      suggestion:
+        "The transaction was aborted because the network changed. Restart the flow on the current network.",
+      operation,
+    });
+    this.name = "ChainIdentityMismatchError";
+    this.expectedNetwork = expectedNetwork;
+    this.actualNetwork = actualNetwork;
+    Object.setPrototypeOf(this, ChainIdentityMismatchError.prototype);
+  }
+}
+
+/**
+ * Error raised when an in-flight transaction flow is stale (superseded or
+ * invalidated by a network switch) and can no longer be safely completed.
+ * Maps to {@link SDK_ERROR_CODES.STALE_TRANSACTION_FLOW}.
+ */
+export class StaleTransactionFlowError extends FundableStellarError {
+  constructor(operation?: string, details?: string) {
+    super({
+      type: "chain_identity_error",
+      sdkCode: SDK_ERROR_CODES.STALE_TRANSACTION_FLOW,
+      message: "This transaction flow is no longer valid",
+      details,
+      suggestion: "Start a new transaction to continue.",
+      operation,
+    });
+    this.name = "StaleTransactionFlowError";
+    Object.setPrototypeOf(this, StaleTransactionFlowError.prototype);
+  }
+}
+
+/**
+ * Error raised when the user must re-confirm a transaction after a network
+ * switch before it can be signed or submitted.
+ * Maps to {@link SDK_ERROR_CODES.CONFIRMATION_REQUIRED}.
+ */
+export class ConfirmationRequiredError extends FundableStellarError {
+  constructor(operation?: string, details?: string) {
+    super({
+      type: "chain_identity_error",
+      sdkCode: SDK_ERROR_CODES.CONFIRMATION_REQUIRED,
+      message: "Please re-confirm this transaction on the current network",
+      details,
+      suggestion:
+        "The network changed. Review and confirm the transaction again before continuing.",
+      operation,
+    });
+    this.name = "ConfirmationRequiredError";
+    Object.setPrototypeOf(this, ConfirmationRequiredError.prototype);
+  }
+}
+
+/**
  * Wrapper function to safely execute contract operations and handle errors
  * @param operation Async function that executes a contract operation
  * @param operationName Name of the operation for error context
@@ -607,4 +748,188 @@ export async function executeWithErrorHandling<T>(
     const fundableError = new FundableStellarError(parsed);
     throw fundableError;
   }
+}
+
+/**
+ * Outcome of a transaction submission attempt, as far as the SDK can tell.
+ *
+ * - `confirmed`: the transaction was included in a ledger and succeeded.
+ * - `failed`: the transaction was included in a ledger and failed (it will
+ *   never succeed if resubmitted with the same sequence number and hash).
+ * - `pending`: the transaction is known to the network but not yet included
+ *   (e.g. it is still in the mempool / not found yet). It is safe to keep
+ *   polling; resubmission should reuse the same transaction envelope.
+ * - `unknown`: the submission timed out or the RPC returned an ambiguous
+ *   response. The transaction may or may not have been applied. Callers MUST
+ *   NOT blindly resubmit; they should first query the transaction status by
+ *   hash (see `classifyTransactionStatus`).
+ */
+export type TransactionStatus = "confirmed" | "failed" | "pending" | "unknown";
+
+/**
+ * Structured error raised when a transaction submission cannot be resolved
+ * to a definitive outcome (confirmed or failed).
+ *
+ * Semantics:
+ * - `status` is the best-known classification at the time the error was
+ *   raised. It is `"unknown"` for ambiguous timeouts and `"pending"` when the
+ *   network acknowledged the transaction but it has not yet been included.
+ * - `hash` is the transaction hash (hex) when known. It should be used to
+ *   query the network for the authoritative status before any resubmission.
+ * - `retryable` is `true` only when it is safe to retry. It is `false` for
+ *   `"confirmed"` and `"failed"` outcomes, because resubmitting a confirmed
+ *   operation would double-apply it and resubmitting a failed one is futile.
+ *
+ * Never resubmit a transaction whose `status` is `"confirmed"` or `"failed"`.
+ */
+export class TransactionResubmissionError extends Error {
+  public readonly status: TransactionStatus;
+  public readonly hash?: string;
+  public readonly retryable: boolean;
+  public readonly details?: string;
+  public readonly suggestion?: string;
+  public readonly originalError?: unknown;
+
+  constructor(params: {
+    status: TransactionStatus;
+    hash?: string;
+    message?: string;
+    details?: string;
+    suggestion?: string;
+    originalError?: unknown;
+  }) {
+    const message =
+      params.message ??
+      `Transaction status is ${params.status}; outcome could not be confirmed`;
+    super(message);
+    this.name = "TransactionResubmissionError";
+    this.status = params.status;
+    this.hash = params.hash;
+    this.retryable = params.status === "pending" || params.status === "unknown";
+    this.details = params.details;
+    this.suggestion =
+      params.suggestion ??
+      (this.retryable
+        ? "Query the transaction status by hash before resubmitting. Do not resubmit blindly."
+        : "Do not resubmit: the transaction outcome is already final.");
+    this.originalError = params.originalError;
+
+    // Set prototype for instanceof checks
+    Object.setPrototypeOf(this, TransactionResubmissionError.prototype);
+  }
+
+  toString(): string {
+    let result = `${this.name}: ${this.message} [Status: ${this.status}]`;
+    if (this.hash) {
+      result += ` [Hash: ${this.hash}]`;
+    }
+    if (this.details) {
+      result += `\nDetails: ${this.details}`;
+    }
+    if (this.suggestion) {
+      result += `\nSuggestion: ${this.suggestion}`;
+    }
+    return result;
+  }
+}
+
+/**
+ * Minimal shape of a transaction status response, compatible with the
+ * Soroban RPC `getTransaction` result without importing the full type.
+ */
+export interface TransactionStatusResponse {
+  status?: string;
+  hash?: string;
+  resultXdr?: string;
+  ledger?: number;
+}
+
+/**
+ * Classifies a transaction status response (or a thrown error) into a
+ * {@link TransactionStatus}.
+ *
+ * This is the single source of truth used by the resubmission flow to decide
+ * whether a retry is safe. It is intentionally conservative: anything that
+ * cannot be positively identified as confirmed, failed, or pending is treated
+ * as `"unknown"`.
+ *
+ * Recognised inputs:
+ * - A `TransactionStatusResponse`-like object with a `status` field
+ *   (`SUCCESS`, `FAILED`, `NOT_FOUND`, `PENDING`, ...).
+ * - A thrown `Error` whose message indicates a timeout / not-found / failure.
+ * - `null` / `undefined` (treated as `"unknown"`).
+ */
+export function classifyTransactionStatus(
+  input: TransactionStatusResponse | Error | string | null | undefined,
+): TransactionStatus {
+  if (input === null || input === undefined) {
+    return "unknown";
+  }
+
+  if (typeof input === "string") {
+    return classifyStatusString(input);
+  }
+
+  if (input instanceof Error) {
+    return classifyStatusString(input.message || "");
+  }
+
+  if (typeof input === "object" && "status" in input) {
+    const status = (input as TransactionStatusResponse).status;
+    if (typeof status === "string") {
+      return classifyStatusString(status);
+    }
+  }
+
+  return "unknown";
+}
+
+/**
+ * Maps a raw status string (from RPC or an error message) to a
+ * {@link TransactionStatus}. Exported for testing and advanced callers.
+ */
+export function classifyStatusString(raw: string): TransactionStatus {
+  const value = raw.trim().toLowerCase();
+
+  if (value === "success" || value === "confirmed" || value === "included") {
+    return "confirmed";
+  }
+
+  if (value === "failed" || value === "failure" || value === "error") {
+    return "failed";
+  }
+
+  if (
+    value === "not_found" ||
+    value === "not found" ||
+    value === "pending" ||
+    value === "queued" ||
+    value === "trying"
+  ) {
+    return "pending";
+  }
+
+  // Substring heuristics for free-form error messages.
+  if (value.includes("timeout") || value.includes("timed out")) {
+    return "unknown";
+  }
+  if (value.includes("not found") || value.includes("not_found")) {
+    return "pending";
+  }
+  if (value.includes("success")) {
+    return "confirmed";
+  }
+  if (value.includes("fail")) {
+    return "failed";
+  }
+
+  return "unknown";
+}
+
+/**
+ * Returns `true` only when it is safe to resubmit a transaction with the
+ * given status. Confirmed and failed transactions must never be resubmitted.
+ */
+export function isSafeToResubmit(status: TransactionStatus): boolean {
+  return status === "pending" || status === "unknown";
 }

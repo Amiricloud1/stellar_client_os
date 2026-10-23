@@ -20,6 +20,17 @@ import {
   sumTokenAmounts,
   formatTokenAmount,
 } from "@/types/campaign-backers";
+import {
+  DEFAULT_PAGE_SIZE,
+  MAX_PAGE_SIZE,
+  PageInfo,
+  PaginatedResult,
+  PaginationParams,
+  SortDirection,
+  buildPageInfo,
+  normalizePagination,
+  resolveSort,
+} from "@/types/pagination";
 import { calculateSponsorshipPricing } from "./campaign-sponsorship.service";
 
 /**
@@ -40,6 +51,45 @@ import { calculateSponsorshipPricing } from "./campaign-sponsorship.service";
  * and campaign-collaboration.service until a persistent data source lands.
  */
 export type BackerActionResult<T> = { ok: true; value: T } | { ok: false; error: string };
+
+/**
+ * Sortable fields for the campaign backers list endpoint. Ordering is always
+ * stable: every comparator falls back to the backer address (ascending) so
+ * equal keys never produce a nondeterministic page boundary.
+ */
+export const BACKER_SORT_FIELDS = [
+  "rank",
+  "totalAmount",
+  "contributionCount",
+  "firstContributedAt",
+  "lastContributedAt",
+  "backerAddress",
+] as const;
+
+export type BackerSortField = (typeof BACKER_SORT_FIELDS)[number];
+
+export const DEFAULT_BACKER_SORT: BackerSortField = "rank";
+export const DEFAULT_BACKER_SORT_DIRECTION: SortDirection = "asc";
+
+export interface ListBackersOptions extends PaginationParams {
+  viewerAddress?: string;
+  creatorAddress?: string;
+  includePrivate?: boolean;
+  sortBy?: BackerSortField | string;
+  sortDirection?: SortDirection | string;
+}
+
+export type ListBackersResult = PaginatedResult<TopBackerEntry> & {
+  campaignId: string;
+  totalBackers: number;
+  privateBackers: number;
+  totalAmount: string;
+  featuredCount: number;
+  updatedAt: number;
+};
+
+export const isBackerSortField = (value: unknown): value is BackerSortField =>
+  typeof value === "string" && (BACKER_SORT_FIELDS as readonly string[]).includes(value);
 
 export interface BackerAggregate {
   backerAddress: string;
@@ -422,6 +472,58 @@ class CampaignBackersService {
     };
   }
 
+  /**
+   * Paginated, sortable backers list (issue #59).
+   *
+   * Applies the shared pagination contract: page size is clamped to
+   * {@link MAX_PAGE_SIZE}, ordering is stable (ties broken by backer address),
+   * and the response carries {@link PageInfo} metadata. Unknown sort fields are
+   * rejected rather than silently ignored so clients fail loudly.
+   */
+  listBackers(campaignId: string, options: ListBackersOptions = {}, now = Date.now()): ListBackersResult {
+    const id = campaignId?.trim() ?? "";
+    const sortBy = options.sortBy ?? DEFAULT_BACKER_SORT;
+    if (!isBackerSortField(sortBy)) {
+      throw new Error(`Unknown sort field: ${String(sortBy)}`);
+    }
+    const direction = resolveSort(options.sortDirection, DEFAULT_BACKER_SORT_DIRECTION);
+    const pagination = normalizePagination(options, { defaultLimit: DEFAULT_PAGE_SIZE, maxLimit: MAX_PAGE_SIZE });
+
+    // Pull the full privacy-aware board (featured pinned, rank assigned) then
+    // re-sort for the requested field before slicing the page.
+    const board = this.getTopBackers(
+      id,
+      {
+        viewerAddress: options.viewerAddress,
+        creatorAddress: options.creatorAddress,
+        includePrivate: options.includePrivate,
+        limit: MAX_PAGE_SIZE,
+      },
+      now,
+    );
+
+    const sorted = [...board.backers].sort((a, b) => {
+      const cmp = compareBackers(a, b, sortBy);
+      if (cmp !== 0) return direction === "desc" ? -cmp : cmp;
+      // Stable tie-breaker independent of direction.
+      return a.backerAddress.localeCompare(b.backerAddress);
+    });
+
+    const start = (pagination.page - 1) * pagination.limit;
+    const items = sorted.slice(start, start + pagination.limit);
+
+    return {
+      items,
+      pageInfo: buildPageInfo(sorted.length, pagination),
+      campaignId: id,
+      totalBackers: board.totalBackers,
+      privateBackers: board.privateBackers,
+      totalAmount: board.totalAmount,
+      featuredCount: board.featuredCount,
+      updatedAt: now,
+    };
+  }
+
   /** Test helper — wipes every in-memory collection. */
   reset(): void {
     this.contributions.clear();
@@ -430,6 +532,32 @@ class CampaignBackersService {
     this.creators.clear();
   }
 }
+
+const compareBackers = (a: TopBackerEntry, b: TopBackerEntry, field: BackerSortField): number => {
+  switch (field) {
+    case "rank":
+      return a.rank - b.rank;
+    case "totalAmount": {
+      const left = a.totalAmount === null ? null : parseTokenAmount(a.totalAmount);
+      const right = b.totalAmount === null ? null : parseTokenAmount(b.totalAmount);
+      // Hidden amounts sort last regardless of direction.
+      if (left === null && right === null) return 0;
+      if (left === null) return 1;
+      if (right === null) return -1;
+      return left < right ? -1 : left > right ? 1 : 0;
+    }
+    case "contributionCount":
+      return a.contributionCount - b.contributionCount;
+    case "firstContributedAt":
+      return a.firstContributedAt - b.firstContributedAt;
+    case "lastContributedAt":
+      return a.lastContributedAt - b.lastContributedAt;
+    case "backerAddress":
+      return a.backerAddress.localeCompare(b.backerAddress);
+    default:
+      return 0;
+  }
+};
 
 export const backersService = new CampaignBackersService();
 

@@ -9,6 +9,11 @@
 
 import { type KeyValueStorage, readJSON, writeJSON } from "./storage";
 import type { OfflineWishlist } from "./wishlist";
+import {
+  classifySyncError,
+  type SyncTelemetry,
+  type SyncTelemetryEventMap,
+} from "./telemetry";
 
 export type WishlistOperationType = "add" | "remove";
 
@@ -16,6 +21,12 @@ export interface WishlistOperation {
   type: WishlistOperationType;
   campaignId: string;
   queuedAt: number;
+  /**
+   * Number of failed flush attempts for this operation. Additive and optional
+   * so queues persisted by older builds (without the field) remain readable —
+   * a missing value is treated as `0`.
+   */
+  attempts?: number;
 }
 
 interface PersistedQueue {
@@ -81,6 +92,21 @@ export class WishlistSyncQueue {
     await this.persist(operations);
   }
 
+  /**
+   * Increment the attempt counter of the given campaign ids. Operations stay
+   * queued; the counter feeds retry telemetry and never affects flush order.
+   */
+  async markFailed(campaignIds: readonly string[]): Promise<void> {
+    if (campaignIds.length === 0) return;
+    const failed = new Set(campaignIds);
+    const operations = (await this.pending()).map((op) =>
+      failed.has(op.campaignId)
+        ? { ...op, attempts: (op.attempts ?? 0) + 1 }
+        : op,
+    );
+    await this.persist(operations);
+  }
+
   async clear(): Promise<void> {
     await this.persist([]);
   }
@@ -101,6 +127,13 @@ export interface WishlistSyncEngineOptions {
   queue: WishlistSyncQueue;
   remote: WishlistRemote;
   onSyncError?: (error: unknown, operation: WishlistOperation) => void;
+  /**
+   * Optional privacy-safe telemetry sink. When omitted the engine records
+   * nothing, preserving the pre-telemetry behavior.
+   */
+  telemetry?: SyncTelemetry;
+  /** Injectable clock used for flush latency. Defaults to `Date.now`. */
+  clock?: () => number;
 }
 
 export interface SyncResult {
@@ -120,12 +153,16 @@ export class WishlistSyncEngine {
     error: unknown,
     operation: WishlistOperation,
   ) => void;
+  private readonly telemetry?: SyncTelemetry;
+  private readonly clock: () => number;
 
   constructor(options: WishlistSyncEngineOptions) {
     this.wishlist = options.wishlist;
     this.queue = options.queue;
     this.remote = options.remote;
     this.onSyncError = options.onSyncError;
+    this.telemetry = options.telemetry;
+    this.clock = options.clock ?? Date.now;
   }
 
   /** Persist locally and queue an add. Returns whether it was newly added. */
@@ -149,9 +186,11 @@ export class WishlistSyncEngine {
    * and each campaign is written at most once.
    */
   async sync(): Promise<SyncResult> {
+    const startedAt = this.clock();
     const operations = await this.queue.pending();
+    const retried = operations.filter((op) => (op.attempts ?? 0) > 0).length;
     const synced: string[] = [];
-    let failed = 0;
+    const failedIds: string[] = [];
 
     for (const operation of operations) {
       try {
@@ -162,13 +201,44 @@ export class WishlistSyncEngine {
         }
         synced.push(operation.campaignId);
       } catch (error) {
-        failed += 1;
+        failedIds.push(operation.campaignId);
+        this.record("failure", {
+          failureClass: classifySyncError(error),
+          attempt: (operation.attempts ?? 0) + 1,
+        });
         this.onSyncError?.(error, operation);
       }
     }
 
+    await this.queue.markFailed(failedIds);
     await this.queue.markSynced(synced);
-    return { attempted: operations.length, synced: synced.length, failed };
+    this.record("flush", {
+      queueDepth: operations.length,
+      synced: synced.length,
+      failed: failedIds.length,
+      latencyMs: Math.max(0, this.clock() - startedAt),
+      retries: retried,
+    });
+    return {
+      attempted: operations.length,
+      synced: synced.length,
+      failed: failedIds.length,
+    };
+  }
+
+  /**
+   * Record into the telemetry sink without letting a faulty sink break the
+   * flush — telemetry is best-effort by design.
+   */
+  private record<E extends keyof SyncTelemetryEventMap>(
+    event: E,
+    metrics: SyncTelemetryEventMap[E],
+  ): void {
+    try {
+      this.telemetry?.record(event, metrics);
+    } catch {
+      /* telemetry must never break sync */
+    }
   }
 }
 

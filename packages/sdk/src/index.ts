@@ -23,10 +23,7 @@ export {
 } from "./generated/distributor/src/index.js";
 
 // Re-export generated types for Planter
-export {
-  PlanterInfo,
-  ReferralInfo,
-} from "./generated/planter/src/index.js";
+export { PlanterInfo, ReferralInfo } from "./generated/planter/src/index.js";
 
 // Export high-level clients
 export * from "./PaymentStreamClient.js";
@@ -89,6 +86,72 @@ export {
   type CongestionLevel as GasEstimatorCongestionLevel,
 } from "./utils/GasEstimator.js";
 export * from "./utils/rpcConnectionOptions.js";
+export {
+  TransactionResubmissionManager,
+  TransactionResubmissionError,
+  isTransactionResubmissionError,
+  DEFAULT_RESUBMISSION_OPTIONS,
+  type TransactionResubmissionOptions,
+  type TransactionResubmissionResult,
+  type TransactionResubmissionStatus,
+  type TransactionStatusLookup,
+  type TransactionStatusLookupResult,
+  type TransactionStatusLookupOutcome,
+  type TransactionResubmissionErrorCode,
+} from "./utils/transactionResubmission.js";
+
+// Export security and operational modules (issues #106-#109)
+export {
+  AuditLogger,
+  AccessController,
+  PrivilegedActionRecorder,
+  AuditError,
+  DEFAULT_ACCESS_POLICY,
+  sanitizeMetadata,
+  type AuditOutcome,
+  type AuditAction,
+  type ActorRole,
+  type AuditEventInput,
+  type AuditRecord,
+  type AuditRecordParams,
+  type AccessPolicy,
+  type IdGenerator as AuditIdGenerator,
+  type AuditLoggerOptions,
+  type Clock as AuditClock,
+} from "./audit.js";
+export {
+  RetentionPolicy,
+  RetentionManager,
+  RetentionError,
+  DEFAULT_RETENTION_RULES,
+  type PersonalDataCategory,
+  type RetentionRule,
+  type PersonalRecord,
+  type DeletionRequest,
+  type DeletionRecord,
+  type RetentionClock,
+  type RetentionIdGenerator,
+} from "./retention.js";
+export {
+  validateCredentials,
+  CredentialError,
+  isTestnetRpcUrl,
+  isMainnetRpcUrl,
+  NETWORK_PASSPHRASES,
+  type DeploymentNetwork,
+  type DeploymentCredentials,
+} from "./deployment-credentials.js";
+export {
+  runLoadProfile,
+  recoveryCheck,
+  type LoadProfile,
+  type BurstProfile,
+  type SoakProfile,
+  type LoadProfileSpec,
+  type Thresholds,
+  type LoadTarget,
+  type LoadTestResult,
+} from "./load-test.js";
 
 // Export tax reporting utilities (issue #792)
 export * from "./tax.js";
