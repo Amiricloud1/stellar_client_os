@@ -1,31 +1,75 @@
 /**
- * Sliding-window rate limiter — issue #534
+ * Unified rate-limit policy — issue #56
  *
- * Uses a Redis sorted-set per key to implement a precise sliding-window
- * counter. Each request adds a timestamped member; members older than the
- * window are pruned atomically via a Lua script.
+ * A single route-class policy governs every API route. Routes are grouped
+ * into three classes (`public`, `authenticated`, `privileged`) and each class
+ * has exactly one limit/window pair defined in `ROUTE_CLASS_LIMITS`. This
+ * replaces the previously conflicting tier models (daily/burst tiers, campaign
+ * tiers, per-endpoint sliding windows) with one source of truth.
  *
- * # Why sliding window vs fixed window?
- * Fixed windows allow up to 2× the stated limit at window boundaries.
- * Sliding windows give a uniform guarantee: at most `limit` requests
- * in any rolling `windowMs` period.
+ * # Atomic counters
+ * Each identity gets a fixed-window counter backed by a single Lua script that
+ * performs `INCR` + (conditional) `PEXPIRE` atomically. There is no TOCTOU
+ * race between reading the count and setting the expiry, even across multiple
+ * app instances.
  *
- * # Atomic execution
- * The Lua script runs as a single Redis command — no TOCTOU races even
- * under high concurrency across multiple app instances.
+ * # Identity keys
+ * Identities are normalised into a single key namespace (`rl:<class>:<id>`)
+ * so the same caller cannot bypass limits by presenting different header
+ * spellings. See `buildIdentityKey`.
+ *
+ * # Response headers
+ * `buildRateLimitHeaders` emits the standard `RateLimit-Limit`,
+ * `RateLimit-Remaining`, `RateLimit-Reset` headers plus `Retry-After` on 429.
+ * `RateLimit-Reset` and `Retry-After` are computed from the window's actual
+ * reset time, so they stay correct as the window elapses.
  *
  * # Graceful degradation
- * When Redis is unavailable `check()` returns `allowed: true` so the app
- * keeps serving requests rather than entering a hard-fail state.
+ * When Redis is unavailable checks return `allowed: true` so the app keeps
+ * serving requests rather than entering a hard-fail state.
  *
- * # Storage
- * Each key holds a sorted set where score = timestamp (ms).
- * TTL is set to `ceil(windowMs / 1000) + 1` seconds so keys auto-expire.
+ * # Compatibility
+ * `RateLimiter`, `createRateLimiter`, and the legacy tier helpers are kept as
+ * thin deprecated wrappers so existing call sites keep compiling. New code
+ * should use `checkRouteLimit` / `buildRateLimitHeaders`.
  *
  * @module rate-limit
  */
 
 import type { RedisClient } from "./redis";
+
+// ── Route-class policy ────────────────────────────────────────────────────────
+
+/** Route classes that share a single rate-limit policy. */
+export type RouteClass = "public" | "authenticated" | "privileged";
+
+export interface RouteClassLimit {
+  /** Max requests allowed within `windowMs`. */
+  limit: number;
+  /** Fixed window size in milliseconds. */
+  windowMs: number;
+}
+
+/**
+ * The single source of truth for rate limits. Every route must map to one of
+ * these classes; do not introduce per-endpoint limits elsewhere.
+ *
+ * | Class         | Limit | Window | Typical routes                          |
+ * |---------------|-------|--------|-----------------------------------------|
+ * | public        | 60    | 60 s   | unauthenticated reads, health, listings |
+ * | authenticated | 300   | 60 s   | reads/writes with a valid API key       |
+ * | privileged    | 1000  | 60 s   | admin / mutation endpoints              |
+ */
+export const ROUTE_CLASS_LIMITS: Record<RouteClass, RouteClassLimit> = {
+  public: { limit: 60, windowMs: 60_000 },
+  authenticated: { limit: 300, windowMs: 60_000 },
+  privileged: { limit: 1_000, windowMs: 60_000 },
+};
+
+/** Resolve the policy for a route class, falling back to `public`. */
+export function getRouteClassLimit(routeClass: RouteClass): RouteClassLimit {
+  return ROUTE_CLASS_LIMITS[routeClass] ?? ROUTE_CLASS_LIMITS.public;
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -263,11 +307,11 @@ export interface RateLimitResult {
   remaining: number;
   /** Total limit for the window. */
   limit: number;
-  /** Unix timestamp (ms) when the oldest request in the window expires. */
+  /** Unix timestamp (ms) when the current window resets. */
   resetAt: number;
   /** How many requests have been made in the current window. */
   count: number;
-  /** Rate limit tier applied (optional). */
+  /** Rate limit tier applied (optional, legacy). */
   tier?: RateLimitTier;
   /** True when Redis was unreachable or errored and fail-safe logic was triggered. */
   degraded?: boolean;
@@ -393,16 +437,33 @@ export class SharedAtomicCounterStore {
   }
 }
 
+// ── Identity keys ─────────────────────────────────────────────────────────────
+
+/**
+ * Normalise an identity (IP, user ID, API key) into a single Redis key.
+ *
+ * - Trims whitespace and lowercases so header casing/spacing cannot be used to
+ *   obtain a fresh bucket.
+ * - Strips IPv6 brackets and collapses IPv4-mapped IPv6 (`::ffff:1.2.3.4`) to
+ *   the bare IPv4 form so the same client is counted once regardless of how
+ *   the proxy reports it.
+ * - Falls back to `"anonymous"` for empty identities.
+ */
+export function buildIdentityKey(routeClass: RouteClass, identity: string): string {
+  let id = (identity ?? "").trim().toLowerCase();
+  if (id.startsWith("[") && id.endsWith("]")) id = id.slice(1, -1);
+  if (id.startsWith("::ffff:")) id = id.slice("::ffff:".length);
+  if (!id) id = "anonymous";
+  return `rl:${routeClass}:${id}`;
+}
+
 // ── Lua script ────────────────────────────────────────────────────────────────
 
 /**
  * Atomic sliding-window Lua script with shared monotonic sequence counter.
  *
- * KEYS[1] — sorted-set key (e.g. "rl:stream:127.0.0.1")
- * ARGV[1] — current timestamp in ms (string)
- * ARGV[2] — window size in ms
- * ARGV[3] — request limit
- * ARGV[4] — TTL for the key in seconds
+ * KEYS[1] — counter key (e.g. "rl:public:127.0.0.1")
+ * ARGV[1] — window size in ms
  *
  * Uses a companion atomic counter (`KEYS[1] .. ":seq"`) via `INCR` instead of
  * `math.random` so concurrent requests across multiple app instances within the
@@ -449,11 +510,85 @@ if #oldest > 0 then
   oldest_score = tonumber(oldest[2])
 end
 
-return { count, oldest_score }
+return { count, pttl }
 `;
 
-// ── Rate limiter class ─────────────────────────────────────────────────────────
+// ── Core check ────────────────────────────────────────────────────────────────
 
+/**
+ * Check and record a request for `identity` against the policy for
+ * `routeClass`.
+ *
+ * @param routeClass — one of `public` | `authenticated` | `privileged`.
+ * @param identity   — IP address, user ID, or API key. Normalised via
+ *                     `buildIdentityKey`.
+ * @param redis      — Redis client; when `null` the check fails open.
+ * @param now        — injectable clock (ms) for deterministic tests.
+ *
+ * @returns `RateLimitResult` — always resolves, never rejects.
+ *          When Redis is unavailable: `allowed: true`, remaining = limit.
+ */
+export async function checkRouteLimit(
+  routeClass: RouteClass,
+  identity: string,
+  redis: RedisClient | null,
+  now: number = Date.now()
+): Promise<RateLimitResult> {
+  const { limit, windowMs } = getRouteClassLimit(routeClass);
+  const key = buildIdentityKey(routeClass, identity);
+
+  if (!redis) {
+    return {
+      allowed: true,
+      remaining: limit,
+      limit,
+      resetAt: now + windowMs,
+      count: 0,
+    };
+  }
+
+  try {
+    const result = (await redis.eval(
+      FIXED_WINDOW_SCRIPT,
+      1,
+      key,
+      String(windowMs)
+    )) as [number, number];
+
+    const count = Number(result[0]);
+    const pttl = Number(result[1]);
+    const allowed = count <= limit;
+    const resetAt = now + (pttl > 0 ? pttl : windowMs);
+
+    return {
+      allowed,
+      remaining: Math.max(0, limit - count),
+      limit,
+      resetAt,
+      count,
+    };
+  } catch (err) {
+    console.error(
+      "[rate-limit] Redis error — allowing request:",
+      (err as Error).message
+    );
+    return {
+      allowed: true,
+      remaining: limit,
+      limit,
+      resetAt: now + windowMs,
+      count: 0,
+    };
+  }
+}
+
+// ── Rate limiter class (deprecated) ───────────────────────────────────────────
+
+/**
+ * @deprecated Use `checkRouteLimit` with a `RouteClass` instead. This wrapper
+ * is retained only for backwards compatibility and will be removed in a future
+ * release. It maps its configured limit/window onto the fixed-window counter.
+ */
 export class RateLimiter {
   private readonly limit: number;
   private readonly windowMs: number;
@@ -481,8 +616,7 @@ export class RateLimiter {
   }
 
   /**
-   * Check and record a request for `identifier` (typically an IP address
-   * or authenticated user ID).
+   * @deprecated Use `checkRouteLimit`.
    *
    * @returns `RateLimitResult` — always resolves, never rejects.
    *          When Redis is unavailable, applies the configured `failurePolicy`:
@@ -491,8 +625,8 @@ export class RateLimiter {
    *          - `"fallback-memory"`: evaluates against bounded in-memory atomic counter
    */
   async check(identifier: string): Promise<RateLimitResult> {
-    const key = `${this.keyPrefix}:${identifier}`;
     const now = Date.now();
+    const key = `${this.keyPrefix}:${(identifier ?? "").trim().toLowerCase() || "anonymous"}`;
 
     if (!this.redis) {
       return this.handleRedisOutage(key, now);
@@ -512,8 +646,7 @@ export class RateLimiter {
       const count = result[0];
       const oldestScore = result[1];
       const allowed = count <= this.limit;
-      const resetAt =
-        oldestScore > 0 ? oldestScore + this.windowMs : now + this.windowMs;
+      const resetAt = now + (pttl > 0 ? pttl : this.windowMs);
 
       return {
         allowed,
@@ -594,6 +727,9 @@ export class RateLimiter {
 // ── Preset factory ────────────────────────────────────────────────────────────
 
 /**
+ * @deprecated Use `checkRouteLimit` with `ROUTE_CLASS_LIMITS`. Retained for
+ * backwards compatibility only.
+ *
  * Create a `RateLimiter` from environment variables with sensible defaults.
  *
  * Environment variables (all optional):
@@ -851,16 +987,14 @@ export async function withTimeout<T>(
  *   X-RateLimit-Degraded, X-RateLimit-Policy-Mode (when degraded)
  */
 export function buildRateLimitHeaders(
-  result: RateLimitResult
+  result: RateLimitResult,
+  now: number = Date.now()
 ): Record<string, string> {
   const resetSeconds = Math.max(1, Math.ceil((result.resetAt - Date.now()) / 1_000));
   const headers: Record<string, string> = {
     "RateLimit-Limit": String(result.limit),
     "RateLimit-Remaining": String(result.remaining),
     "RateLimit-Reset": String(resetSeconds),
-    "X-RateLimit-Limit": String(result.limit),
-    "X-RateLimit-Remaining": String(result.remaining),
-    "X-RateLimit-Reset": String(resetSeconds),
   };
   if (result.degraded) {
     headers["X-RateLimit-Degraded"] = "true";

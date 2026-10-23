@@ -20,12 +20,84 @@ import Redis from "ioredis";
 
 export type RedisClient = Redis;
 
+/**
+ * Atomic fixed-window counter script (issue #56).
+ *
+ * KEYS[1] = fully-qualified rate-limit key (route class + identity)
+ * ARGV[1] = window length in milliseconds
+ *
+ * Returns { count, ttlMs } where ttlMs is the remaining window in ms.
+ * INCR and PEXPIRE run atomically so a key can never be left without a TTL,
+ * which would otherwise pin a counter forever and lock out an identity.
+ */
+export const RATE_LIMIT_LUA_SCRIPT = `
+local count = redis.call('INCR', KEYS[1])
+local ttl = redis.call('PTTL', KEYS[1])
+if ttl < 0 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+  ttl = tonumber(ARGV[1])
+end
+return { count, ttl }
+`;
+
+export interface RateLimitScriptResult {
+  count: number;
+  ttlMs: number;
+}
+
+/**
+ * Minimal interface the rate limiter depends on. Tests inject a deterministic
+ * in-memory implementation so they never touch a live Redis instance.
+ */
+export interface RateLimitStore {
+  evalScript(
+    key: string,
+    windowMs: number
+  ): Promise<RateLimitScriptResult | null>;
+}
+
 let _client: Redis | null = null;
 let _attempted = false;
+
+/**
+ * Run the atomic INCR+PEXPIRE script against the shared client.
+ * Returns null when Redis is unavailable so callers can fail open.
+ */
+export async function evalScript(
+  key: string,
+  windowMs: number
+): Promise<RateLimitScriptResult | null> {
+  const client = getRedisClient();
+  if (!client) return null;
+
+  try {
+    const raw = (await client.eval(
+      RATE_LIMIT_LUA_SCRIPT,
+      1,
+      key,
+      String(Math.max(1, Math.floor(windowMs)))
+    )) as [number | string, number | string];
+
+    const count = Number(raw?.[0] ?? 0);
+    const ttlMs = Number(raw?.[1] ?? windowMs);
+    if (!Number.isFinite(count) || !Number.isFinite(ttlMs)) return null;
+    return { count, ttlMs: Math.max(0, ttlMs) };
+  } catch (err) {
+    if (process.env.NODE_ENV !== "test") {
+      console.error("[redis] evalScript failed:", (err as Error).message);
+    }
+    return null;
+  }
+}
 
 export function getRedisClient(): Redis | null {
   if (_attempted) return _client;
   _attempted = true;
+
+  // Deterministic test mode: never open a live connection during tests.
+  if (process.env.NODE_ENV === "test" && !process.env.REDIS_URL) {
+    return null;
+  }
 
   const url =
     process.env.REDIS_URL ??

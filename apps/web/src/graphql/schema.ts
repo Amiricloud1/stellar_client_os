@@ -726,11 +726,104 @@ export const typeDefs = /* GraphQL */`
     endTime: Int!
   }
 
+  """
+  A webhook subscription owned by the authenticated account.
+
+  Auth policy: privileged (requires an authenticated account; only the owning
+  account may read or mutate its subscriptions — see issue #69).
+
+  The signing secret is NEVER exposed on this type. It is returned exactly once
+  by the createWebhookSubscription and rotateWebhookSecret mutations.
+  """
+  type WebhookSubscription {
+    """Unique subscription identifier."""
+    id: ID!
+    """Owning account identifier (never another account's id)."""
+    ownerId: ID!
+    """HTTPS endpoint that receives webhook deliveries."""
+    url: String!
+    """Event types this subscription is subscribed to."""
+    events: [String!]!
+    """Whether the subscription is currently active."""
+    active: Boolean!
+    """Unix timestamp (seconds) when the subscription was created."""
+    createdAt: Int!
+    """Unix timestamp (seconds) of the last secret rotation, if any."""
+    secretRotatedAt: Int
+    """Unix timestamp (seconds) when the subscription was revoked, if any."""
+    revokedAt: Int
+  }
+
+  """
+  Result of creating a webhook subscription. The plaintext signing secret is
+  revealed only here, exactly once, and is never retrievable afterwards.
+  """
+  type WebhookSubscriptionCreated {
+    """The public subscription record (contains no secret)."""
+    subscription: WebhookSubscription!
+    """
+    The plaintext signing secret. Shown only on creation; store it securely.
+    """
+    secret: String!
+  }
+
+  """
+  Result of rotating a webhook subscription's signing secret. The new secret
+  is revealed only here, exactly once.
+  """
+  type WebhookSecretRotation {
+    """The public subscription record (contains no secret)."""
+    subscription: WebhookSubscription!
+    """The new plaintext signing secret. Shown only on rotation."""
+    secret: String!
+  }
+
   type Mutation {
     """
     Clones an indexed stream so a creator can start from an existing campaign.
+
+    Auth policy: authenticated (requires a valid account session).
     """
     cloneCampaign(id: ID!, network: Network): CloneResult
+
+    """
+    Creates a webhook subscription for the authenticated account and returns
+    the signing secret exactly once.
+
+    Auth policy: privileged (authenticated account; subscription is always
+    scoped to the caller's account — cross-account creation is rejected).
+    """
+    createWebhookSubscription(
+      url: String!
+      events: [String!]!
+    ): WebhookSubscriptionCreated!
+
+    """
+    Rotates the signing secret for a subscription owned by the authenticated
+    account, returning the new secret exactly once. Previous secret is
+    invalidated immediately.
+
+    Auth policy: privileged (owner only; non-owners receive NOT_FOUND).
+    """
+    rotateWebhookSecret(id: ID!): WebhookSecretRotation!
+
+    """
+    Revokes a webhook subscription owned by the authenticated account. Revoked
+    subscriptions stop receiving deliveries and cannot be rotated.
+
+    Auth policy: privileged (owner only; non-owners receive NOT_FOUND).
+    """
+    revokeWebhookSubscription(id: ID!): WebhookSubscription!
+  }
+
+  extend type Query {
+    """
+    Lists the webhook subscriptions owned by the authenticated account. Public
+    records only — secrets are never included.
+
+    Auth policy: privileged (returns only the caller's own subscriptions).
+    """
+    webhookSubscriptions: [WebhookSubscription!]!
   }
 `;
 

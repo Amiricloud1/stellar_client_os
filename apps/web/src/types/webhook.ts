@@ -25,6 +25,7 @@ export type CampaignWebhookEvent = (typeof CAMPAIGN_WEBHOOK_EVENTS)[number];
  */
 export interface WebhookSubscription {
   id: string;
+  accountId: string; // Owning account; used to enforce cross-account isolation
   url: string;
   events: string[]; // e.g., ["stream.status_updated", "milestone.funds_released"] or ["*"]
   secret: string; // Used for HMAC-SHA256 signature
@@ -32,6 +33,30 @@ export interface WebhookSubscription {
   updatedAt: string; // ISO string; bumped on every successful mutation
   version: number; // Optimistic-concurrency token; starts at 1
   idempotencyKey: string | null; // Client-supplied key for idempotent creation
+}
+
+/**
+ * Public representation of a webhook subscription.
+ * The `secret` is intentionally omitted; it is only revealed on creation or rotation.
+ */
+export type WebhookSubscriptionPublic = Omit<WebhookSubscription, "secret">;
+
+/**
+ * Returned only when a subscription is created. This is the sole point (besides
+ * rotation) at which the signing secret is disclosed to the caller.
+ */
+export interface WebhookSubscriptionCreated extends WebhookSubscriptionPublic {
+  secret: string;
+}
+
+/**
+ * Result of rotating a subscription's signing secret. The new secret is disclosed
+ * exactly once; subsequent reads of the subscription will not include it.
+ */
+export interface WebhookSecretRotationResult {
+  subscriptionId: string;
+  secret: string;
+  rotatedAt: string; // ISO string
 }
 
 export interface WebhookPayload {

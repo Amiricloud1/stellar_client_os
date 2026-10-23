@@ -240,15 +240,17 @@ function createDistributorClient(publicKey: string): DistributorClient {
 }
 
 export async function fetchStream(streamId: number, signal?: AbortSignal): Promise<Stream | null> {
+    const id = validateStreamId(streamId);
     throwIfAborted(signal);
-    const stream = await stellarService.getStream(BigInt(streamId));
+    const stream = await stellarService.getStream(id);
     throwIfAborted(signal);
     return stream ? mapServiceStream(stream) : null;
 }
 
 export async function fetchUserStreams(address: string, signal?: AbortSignal): Promise<Stream[]> {
+    const account = validateAddress(address);
     throwIfAborted(signal);
-    const streams = await stellarService.getStreams(address);
+    const streams = await stellarService.getStreams(account);
     throwIfAborted(signal);
     return streams.map(mapServiceStream);
 }
@@ -331,9 +333,10 @@ export async function withdraw(params: {
     signTransaction?: WalletSigner;
     idempotencyKey?: string | null;
 }): Promise<string> {
-    let sender = params.sender;
+    const input = validateWithdrawInput(params);
+    let sender = input.sender;
     if (!sender) {
-        const stream = await stellarService.getStream(BigInt(params.streamId));
+        const stream = await stellarService.getStream(input.streamId);
         sender = stream?.recipient;
     }
 
@@ -368,17 +371,20 @@ export async function distribute(params: {
     recipients: string[];
     amounts: bigint[] | bigint;
     signTransaction?: WalletSigner;
+    request?: ApiCallContext;
 }): Promise<void> {
-    const client = createDistributorClient(params.sender);
+    requirePolicy(params.request, 'privileged');
+    const input = validateDistributeInput(params);
+    const client = createDistributorClient(input.sender);
     const BATCH_SIZE = 100;
 
-    if (typeof params.amounts === 'bigint') {
-        const recipientBatches = createBatches(params.recipients, BATCH_SIZE);
+    if (typeof input.amounts === 'bigint') {
+        const recipientBatches = createBatches(input.recipients, BATCH_SIZE);
         for (const batch of recipientBatches) {
             const tx = await client.distributeEqual({
-                sender: params.sender,
-                token: params.token,
-                total_amount: params.amounts,
+                sender: input.sender,
+                token: input.token,
+                total_amount: input.amounts,
                 recipients: batch,
             });
             await signAndSendTx(tx, params.signTransaction);
@@ -386,17 +392,13 @@ export async function distribute(params: {
         return;
     }
 
-    if (params.amounts.length !== params.recipients.length) {
-        throw new Error('Recipients and amounts length mismatch');
-    }
-
-    const recipientBatches = createBatches(params.recipients, BATCH_SIZE);
-    const amountBatches = createBatches(params.amounts, BATCH_SIZE);
+    const recipientBatches = createBatches(input.recipients, BATCH_SIZE);
+    const amountBatches = createBatches(input.amounts, BATCH_SIZE);
 
     for (let i = 0; i < recipientBatches.length; i++) {
         const tx = await client.distributeWeighted({
-            sender: params.sender,
-            token: params.token,
+            sender: input.sender,
+            token: input.token,
             recipients: recipientBatches[i],
             amounts: amountBatches[i],
         });
@@ -405,35 +407,50 @@ export async function distribute(params: {
 }
 
 export async function fetchAccountInfo(address: string, signal?: AbortSignal): Promise<AccountInfo | null> {
+    const account = validateAddress(address);
     throwIfAborted(signal);
     try {
-        return await stellarService.getAccount(address, signal);
+        return await stellarService.getAccount(account, signal);
     } catch {
         return null;
     }
 }
-export async function pauseStream(params: { id: string; address: string; signTransaction: (xdr: string) => Promise<string> }) {
+export async function pauseStream(params: {
+    id: string;
+    address: string;
+    signTransaction: (xdr: string) => Promise<string>;
+    request?: ApiCallContext;
+}) {
+    requirePolicy(params.request, 'privileged');
+    const input = validateStreamActionInput(params);
     const client = new PaymentStreamClient({
         networkPassphrase: NETWORK_PASSPHRASE,
         rpcUrl: SOROBAN_RPC_URL,
         contractId: PAYMENT_STREAM_CONTRACT_ID,
-        publicKey: params.address,
+        publicKey: input.address,
     });
 
-    const tx = await client.pauseStream(BigInt(params.id));
+    const tx = await client.pauseStream(input.id);
 
     await signAndSendTx(tx, params.signTransaction);
 }
 
-export async function resumeStream(params: { id: string; address: string; signTransaction: (xdr: string) => Promise<string> }) {
+export async function resumeStream(params: {
+    id: string;
+    address: string;
+    signTransaction: (xdr: string) => Promise<string>;
+    request?: ApiCallContext;
+}) {
+    requirePolicy(params.request, 'privileged');
+    const input = validateStreamActionInput(params);
     const client = new PaymentStreamClient({
         networkPassphrase: NETWORK_PASSPHRASE,
         rpcUrl: SOROBAN_RPC_URL,
         contractId: PAYMENT_STREAM_CONTRACT_ID,
-        publicKey: params.address,
+        publicKey: input.address,
     });
 
-    const tx = await client.resumeStream(BigInt(params.id));
+    const tx = await client.resumeStream(input.id);
 
     await signAndSendTx(tx, params.signTransaction);
 }
@@ -468,19 +485,27 @@ export async function depositToStream(params: {
 export async function getWithdrawableAmount(params: {
     streamId: number;
 }): Promise<string> {
-    const amount = await stellarService.getWithdrawableAmount(BigInt(params.streamId));
+    const streamId = validateStreamId(params.streamId);
+    const amount = await stellarService.getWithdrawableAmount(streamId);
     return amount.toString();
 }
 
-export async function cancelStream(params: { id: string; address: string; signTransaction: (xdr: string) => Promise<string> }) {
+export async function cancelStream(params: {
+    id: string;
+    address: string;
+    signTransaction: (xdr: string) => Promise<string>;
+    request?: ApiCallContext;
+}) {
+    requirePolicy(params.request, 'privileged');
+    const input = validateStreamActionInput(params);
     const client = new PaymentStreamClient({
         networkPassphrase: NETWORK_PASSPHRASE,
         rpcUrl: SOROBAN_RPC_URL,
         contractId: PAYMENT_STREAM_CONTRACT_ID,
-        publicKey: params.address,
+        publicKey: input.address,
     });
 
-    const tx = await client.cancelStream(BigInt(params.id));
+    const tx = await client.cancelStream(input.id);
 
     await signAndSendTx(tx, params.signTransaction);
 }

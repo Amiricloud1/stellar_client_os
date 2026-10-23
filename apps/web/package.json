@@ -9,6 +9,7 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
+    "test:ci": "vitest run --reporter=default --reporter=junit --outputFile=./test-results/vitest-junit.xml",
     "test:watch": "vitest",
     "validate:openapi": "redocly lint ../../docs/openapi.yaml",
     "test:contract": "vitest run src/__tests__/contract",

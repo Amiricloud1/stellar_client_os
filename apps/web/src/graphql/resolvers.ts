@@ -35,6 +35,10 @@ interface ResolverContext {
   /** Optional custom data source — used in tests to inject fixtures. */
   dataSource?: StreamDataSource;
   campaignDataSource?: CampaignDataSource;
+  /** Authenticated account id, populated by the API auth middleware. */
+  accountId?: string;
+  /** Roles granted to the authenticated account. */
+  roles?: string[];
 }
 
 function resolveDataSource(ctx: ResolverContext, fallback?: StreamDataSource): StreamDataSource {
@@ -141,7 +145,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
     Query: {
       campaigns: async (
         _: unknown,
-        args: {
+        rawArgs: {
           filter?: CampaignQueryInput["filter"];
           sort?: CampaignQueryInput["sort"];
           pagination?: PaginationInput;
@@ -166,7 +170,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
 
       trees: async (
         _: unknown,
-        args: {
+        rawArgs: {
           filter?: { planter?: string; region?: string; status?: StreamStatusFilter; search?: string };
           pagination?: PaginationInput;
           sort?: SortInput;
@@ -252,9 +256,10 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
        */
       globalMetrics: async (
         _: unknown,
-        args: { network?: Network },
+        rawArgs: { network?: Network },
         ctx: ResolverContext
       ) => {
+        const args = guard<typeof rawArgs>("Query.globalMetrics", ctx, rawArgs, "network");
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
         return runAnalytics(() => service.getGlobalMetrics(args.network ?? "testnet"));
       },
@@ -272,7 +277,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
        */
       regionMetrics: async (
         _: unknown,
-        args: {
+        rawArgs: {
           filter?: RegionFilter;
           pagination?: PaginationInput;
           sort?: SortInput;
@@ -304,7 +309,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
        */
       categoryMetrics: async (
         _: unknown,
-        args: {
+        rawArgs: {
           filter?: CategoryFilter;
           pagination?: PaginationInput;
           sort?: SortInput;
@@ -336,7 +341,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
        */
       assetMetrics: async (
         _: unknown,
-        args: {
+        rawArgs: {
           filter?: AssetFilter;
           pagination?: PaginationInput;
           sort?: SortInput;
@@ -370,9 +375,10 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
        */
       sponsorImpact: async (
         _: unknown,
-        args: { address: string; network?: Network },
+        rawArgs: { address: string; network?: Network },
         ctx: ResolverContext
       ) => {
+        const args = guard<typeof rawArgs>("Query.sponsorImpact", ctx, rawArgs, "sponsorImpact");
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
         return runAnalytics(() =>
           service.getSponsorImpact(args.address, args.network ?? "testnet")
@@ -381,9 +387,10 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
 
       campaignSequels: async (
         _: unknown,
-        args: { campaignId: string; relation?: "SEQUEL" | "PREQUEL" | "SPINOFF" | "RELATED" },
+        rawArgs: { campaignId: string; relation?: "SEQUEL" | "PREQUEL" | "SPINOFF" | "RELATED" },
         ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.campaignSequels", ctx, rawArgs, "campaignSequels");
         const sequels = await getCampaignSequelService(ctx.campaignDataSource).getSequels(args.campaignId, {
           relation: args.relation,
         });
@@ -398,9 +405,10 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
 
       nextInSeries: async (
         _: unknown,
-        args: { campaignId: string },
+        rawArgs: { campaignId: string },
         ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.nextInSeries", ctx, rawArgs, "campaignId");
         const result = await getCampaignSequelService(ctx.campaignDataSource).getNextInSeries(args.campaignId);
         if (!result) return null;
         return {
@@ -414,7 +422,8 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
 
       campaignAnalytics: async (
         _: unknown,
-        args: { campaignId: string; network?: Network },
+        rawArgs: { campaignId: string; network?: Network },
+        ctx: ResolverContext,
       ) => {
         return runAnalytics(() => getCampaignAnalyticsDashboard(args.campaignId));
       },
@@ -430,8 +439,10 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
 
       grantProgramSummary: async (
         _: unknown,
-        args: { programId: string; campaignId: string },
+        rawArgs: { programId: string; campaignId: string },
+        ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.grantProgramSummary", ctx, rawArgs, "grantProgramSummary");
         const summary = await getGrantProgramService().getProgramSummary(args.programId, args.campaignId);
         if (!summary) return null;
         return {
@@ -451,13 +462,29 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
           allocatedAt: Math.floor(allocation.allocatedAt / 1000),
         })), args.pagination, args.sort);
       },
+
+      /**
+       * List webhook subscriptions owned by the authenticated account.
+       * Secrets are never returned after creation (issue #69).
+       */
+      webhookSubscriptions: async (
+        _: unknown,
+        rawArgs: { pagination?: PaginationInput },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Query.webhookSubscriptions", ctx, rawArgs, "pagination");
+        const accountId = requireAccountId(ctx);
+        const subscriptions = await getWebhookSubscriptionService().listSubscriptions(accountId);
+        return paginate(subscriptions.map(toWebhookPayload), args.pagination);
+      },
     },
     Mutation: {
       cloneCampaign: async (
         _: unknown,
-        args: { id: string; network?: Network },
+        rawArgs: { id: string; network?: Network },
         ctx: ResolverContext
       ) => {
+        const args = guard<typeof rawArgs>("Mutation.cloneCampaign", ctx, rawArgs, "cloneCampaign");
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const campaign = streams.find((stream) => stream.id === args.id);
         if (!campaign) throw new Error(`Campaign ${args.id} not found`);
@@ -473,13 +500,14 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
        */
       updateCampaign: async (
         _: unknown,
-        args: {
+        rawArgs: {
           id: string;
           input: { name?: string; description?: string; goalAmount?: string; deadline?: number };
           network?: Network;
         },
         ctx: ResolverContext
       ) => {
+        const args = guard<typeof rawArgs>("Mutation.updateCampaign", ctx, rawArgs, "updateCampaign");
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const campaign = streams.find((stream) => stream.id === args.id);
         if (!campaign) throw new Error(`Campaign ${args.id} not found`);
@@ -494,6 +522,68 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
           endTime: args.input.deadline ?? campaign.endTime,
         };
       },
+
+      /**
+       * Create a webhook subscription for the authenticated account.
+       * The signing secret is returned exactly once, on creation (issue #69).
+       */
+      createWebhookSubscription: async (
+        _: unknown,
+        rawArgs: { input: { url: string; events: string[]; description?: string } },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Mutation.createWebhookSubscription", ctx, rawArgs, "createWebhookSubscription");
+        const accountId = requireAccountId(ctx);
+        const { subscription, secret } = await getWebhookSubscriptionService().createSubscription(accountId, args.input);
+        return { ...toWebhookPayload(subscription), secret };
+      },
+
+      /**
+       * Rotate the signing secret for a subscription owned by the authenticated
+       * account. The new secret is returned exactly once (issue #69).
+       */
+      rotateWebhookSecret: async (
+        _: unknown,
+        rawArgs: { id: string },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Mutation.rotateWebhookSecret", ctx, rawArgs, "webhookId");
+        const accountId = requireAccountId(ctx);
+        const { subscription, secret } = await getWebhookSubscriptionService().rotateSecret(accountId, args.id);
+        return { ...toWebhookPayload(subscription), secret };
+      },
+
+      /**
+       * Revoke a subscription owned by the authenticated account. Cross-account
+       * access is rejected by the service (issue #69).
+       */
+      revokeWebhookSubscription: async (
+        _: unknown,
+        rawArgs: { id: string },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Mutation.revokeWebhookSubscription", ctx, rawArgs, "webhookId");
+        const accountId = requireAccountId(ctx);
+        const subscription = await getWebhookSubscriptionService().revokeSubscription(accountId, args.id);
+        return toWebhookPayload(subscription);
+      },
     },
+  };
+}
+
+/**
+ * Map a stored subscription to its public GraphQL shape. The signing secret is
+ * intentionally omitted — it is only ever returned from create/rotate.
+ */
+function toWebhookPayload(subscription: import("@/services/webhook-subscription.service").WebhookSubscription) {
+  return {
+    id: subscription.id,
+    url: subscription.url,
+    events: subscription.events,
+    description: subscription.description ?? null,
+    status: subscription.status,
+    createdAt: Math.floor(subscription.createdAt / 1000),
+    updatedAt: Math.floor(subscription.updatedAt / 1000),
+    lastDeliveredAt: subscription.lastDeliveredAt ? Math.floor(subscription.lastDeliveredAt / 1000) : null,
   };
 }

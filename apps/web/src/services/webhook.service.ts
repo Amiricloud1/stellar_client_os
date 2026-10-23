@@ -144,6 +144,42 @@ export function verifyWebhookSignature(options: VerifyWebhookSignatureOptions): 
   return { valid: false, reason: 'signature_mismatch' };
 }
 
+/**
+ * Subscription representation safe to return from read operations.
+ * The signing secret is intentionally omitted; it is only ever revealed once,
+ * in the result of {@link WebhookService.createSubscription} or
+ * {@link WebhookService.rotateSecret}.
+ */
+export type WebhookSubscriptionPublic = Omit<WebhookSubscription, 'secret'>;
+
+/** Result of creating a subscription: the only time the secret is disclosed. */
+export interface WebhookSubscriptionCreated extends WebhookSubscriptionPublic {
+  secret: string;
+}
+
+/** Result of rotating a subscription secret. */
+export interface WebhookSecretRotation {
+  subscription: WebhookSubscriptionPublic;
+  secret: string;
+}
+
+/** Thrown when a subscription does not exist or is not owned by the caller. */
+export class WebhookSubscriptionNotFoundError extends Error {
+  constructor(id: string) {
+    super(`Webhook subscription not found: ${id}`);
+    this.name = 'WebhookSubscriptionNotFoundError';
+  }
+}
+
+function toPublicSubscription(sub: WebhookSubscription): WebhookSubscriptionPublic {
+  const { secret: _secret, ...publicSub } = sub;
+  return publicSub;
+}
+
+function generateSecret(): string {
+  return randomUUID().replace(/-/g, '');
+}
+
 const IDEMPOTENCY_FIELDS = [
   'idempotencyKey',
   'idempotency_key',
@@ -319,9 +355,21 @@ export class WebhookService {
   }
 
   /**
-   * Register a new subscription
+   * Register a new subscription owned by `accountId`.
+   *
+   * The returned object is the only place the signing secret is disclosed.
+   * Subsequent reads return {@link WebhookSubscriptionPublic} without it.
    */
-  async createSubscription(url: string, events: string[], secret?: string): Promise<WebhookSubscription> {
+  async createSubscription(
+    accountId: string,
+    url: string,
+    events: string[],
+    secret?: string,
+  ): Promise<WebhookSubscriptionCreated> {
+    if (!accountId) {
+      throw new Error('Subscription must be associated with an account');
+    }
+
     // Validate URL
     try {
       new URL(url);
@@ -336,23 +384,47 @@ export class WebhookService {
     const subscriptions = await this.getSubscriptions();
     const newSubscription: WebhookSubscription = {
       id: 'sub_' + randomUUID().replace(/-/g, '').slice(0, 16),
+      accountId,
       url,
       events,
-      secret: secret || randomUUID().replace(/-/g, ''),
+      secret: secret || generateSecret(),
       createdAt: new Date().toISOString(),
     };
 
     subscriptions.push(newSubscription);
     await this.writeJsonAtomic(this.subscriptionsPath, subscriptions);
-    return newSubscription;
+    return { ...toPublicSubscription(newSubscription), secret: newSubscription.secret };
   }
 
   /**
-   * Delete subscription by ID
+   * List subscriptions owned by `accountId`. Secrets are never included.
    */
-  async deleteSubscription(id: string): Promise<boolean> {
-    const subscriptions = await this.getSubscriptions();
-    const index = subscriptions.findIndex((sub) => sub.id === id);
+  async getSubscriptions(accountId: string): Promise<WebhookSubscriptionPublic[]> {
+    const subscriptions = await this.readAllSubscriptions();
+    return subscriptions
+      .filter((sub) => sub.accountId === accountId)
+      .map(toPublicSubscription);
+  }
+
+  /**
+   * Fetch a single subscription owned by `accountId`. Secrets are never included.
+   * Throws {@link WebhookSubscriptionNotFoundError} for unknown or foreign IDs so
+   * cross-account probes cannot distinguish "missing" from "not yours".
+   */
+  async getSubscription(accountId: string, id: string): Promise<WebhookSubscriptionPublic> {
+    const sub = await this.findOwnedSubscription(accountId, id);
+    return toPublicSubscription(sub);
+  }
+
+  /**
+   * Delete a subscription owned by `accountId`.
+   * Returns false when the subscription does not exist or belongs to another account.
+   */
+  async deleteSubscription(accountId: string, id: string): Promise<boolean> {
+    const subscriptions = await this.readAllSubscriptions();
+    const index = subscriptions.findIndex(
+      (sub) => sub.id === id && sub.accountId === accountId,
+    );
     if (index === -1) {
       return false;
     }
@@ -360,6 +432,77 @@ export class WebhookService {
     subscriptions.splice(index, 1);
     await this.writeJsonAtomic(this.subscriptionsPath, subscriptions);
     return true;
+  }
+
+  /**
+   * Revoke a subscription owned by `accountId`.
+   *
+   * Revocation is a hard delete: the subscription stops receiving deliveries and
+   * its secret can no longer be used. Throws {@link WebhookSubscriptionNotFoundError}
+   * when the subscription is unknown or owned by another account.
+   */
+  async revokeSubscription(accountId: string, id: string): Promise<void> {
+    const deleted = await this.deleteSubscription(accountId, id);
+    if (!deleted) {
+      throw new WebhookSubscriptionNotFoundError(id);
+    }
+  }
+
+  /**
+   * Rotate the signing secret for a subscription owned by `accountId`.
+   *
+   * The previous secret is invalidated immediately: deliveries are signed with
+   * the new secret from the next dispatch onward. The new secret is returned
+   * exactly once. Throws {@link WebhookSubscriptionNotFoundError} on cross-account
+   * access.
+   */
+  async rotateSecret(accountId: string, id: string): Promise<WebhookSecretRotation> {
+    const subscriptions = await this.readAllSubscriptions();
+    const index = subscriptions.findIndex(
+      (sub) => sub.id === id && sub.accountId === accountId,
+    );
+    if (index === -1) {
+      throw new WebhookSubscriptionNotFoundError(id);
+    }
+
+    const rotated: WebhookSubscription = {
+      ...subscriptions[index],
+      secret: generateSecret(),
+      secretRotatedAt: new Date().toISOString(),
+    };
+    subscriptions[index] = rotated;
+    await this.writeJsonAtomic(this.subscriptionsPath, subscriptions);
+
+    return { subscription: toPublicSubscription(rotated), secret: rotated.secret };
+  }
+
+  /** Read the raw subscription records (including secrets) from storage. */
+  private async readAllSubscriptions(): Promise<WebhookSubscription[]> {
+    try {
+      const data = await fs.readFile(this.subscriptionsPath, 'utf-8');
+      return JSON.parse(data) as WebhookSubscription[];
+    } catch (err: unknown) {
+      if ((err as { code?: string }).code === 'ENOENT') {
+        return [];
+      }
+      console.error('Failed to read webhook subscriptions:', err);
+      throw err;
+    }
+  }
+
+  /** Resolve a subscription only when it is owned by `accountId`. */
+  private async findOwnedSubscription(
+    accountId: string,
+    id: string,
+  ): Promise<WebhookSubscription> {
+    const subscriptions = await this.readAllSubscriptions();
+    const sub = subscriptions.find(
+      (candidate) => candidate.id === id && candidate.accountId === accountId,
+    );
+    if (!sub) {
+      throw new WebhookSubscriptionNotFoundError(id);
+    }
+    return sub;
   }
 
   // ============================================
