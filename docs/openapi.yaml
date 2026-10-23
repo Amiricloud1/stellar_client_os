@@ -23,13 +23,9 @@ info:
     ## Rate Limits & Throttling
     All endpoints enforce sliding-window rate limiting (60 req/min for Read APIs,
     30 req/min for Creation APIs, 10 req/min for Execution APIs).
-    Rate limit headers (`RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`, `Retry-After`)
-    are included on all responses. For detailed policy, see `docs/campaign-api-rate-limits.md`.
->>>>>>> upstream/main
-  license:
-=======
     Standard rate-limiting headers (`RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`)
     are returned on all responses. Exceeded limits return `429 Too Many Requests` with a `Retry-After` header.
+    For detailed policy, see `docs/campaign-api-rate-limits.md`.
 
     ### API Versioning & Deprecation Policy
 
@@ -47,17 +43,6 @@ info:
     - **Sunset window:** A minimum of 90 days notice is provided before any
       operation is removed. Clients should monitor the `Deprecation` and `Sunset`
       response headers where present.
-  license:
-=======
-    GraphQL analytics, webhook subscriptions, campaign metadata IPFS pinning,
-    creator stats, and verification SLA guarantees.
-
-    ## Rate Limits & Throttling
-    All endpoints enforce sliding-window rate limiting (60 req/min for Read APIs,
-    30 req/min for Creation APIs, 10 req/min for Execution APIs).
-    Rate limit headers (`RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`, `Retry-After`)
-    are included on all responses. For detailed policy, see `docs/campaign-api-rate-limits.md`.
->>>>>>> upstream/main
   license:
     name: MIT
     url: https://opensource.org/license/mit/
@@ -93,9 +78,9 @@ tags:
   - name: Webhooks
     description: Subscription registration and event dispatch
   - name: MobilePush
-    description: Mobile push subscription and milestone notifications
+    description: Mobile push notification subscriptions and milestone delivery
   - name: CampaignAudit
-    description: Immutable campaign verification audit trail
+    description: Immutable on-chain verification audit trail for campaigns
 
 x-api-version: 1.0.0
 
@@ -1134,10 +1119,6 @@ components:
           type: string
           format: uri
           example: https://fundable.network/pricing
-    CampaignStatus:
-=======
-    CampaignStatus:
-=======
     CampaignStatus:
       type: string
       enum: [DRAFT, PENDING_VERIFICATION, ACTIVE, PAUSED, COMPLETED, FAILED]

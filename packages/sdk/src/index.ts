@@ -166,3 +166,6 @@ export {
 } from "./utils/errors.js";
 export * from "./utils/error-catalog.js";
 
+// Export recipes (issue #117)
+export * from "./recipes/index.js";
+export { type StellarNetwork as RecipeStellarNetwork } from "./recipes/index.js";
