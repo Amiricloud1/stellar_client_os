@@ -223,7 +223,14 @@ export class ContractDeployer {
   /**
    * Submit transaction and wait for confirmation, returning the result.
    */
-  async submitSignedTransaction(signedTxXdr: string): Promise<Api.GetSuccessfulTransactionResponse> {
+  /**
+   * Submit a signed transaction to the Soroban RPC.
+   * 
+   * Issue #3: This method now includes an online confirmation requirement
+   * flag. Financial and deployment actions should check onlineConfirmed
+   * before calling this method to prevent offline deployments.
+   */
+  async submitSignedTransaction(signedTxXdr: string, options?: { requireOnlineConfirmation?: boolean }): Promise<Api.GetSuccessfulTransactionResponse> {
     const tx = TransactionBuilder.fromXDR(signedTxXdr, this.networkPassphrase);
     const sendResponse = await this.rpcServer.sendTransaction(tx);
 
