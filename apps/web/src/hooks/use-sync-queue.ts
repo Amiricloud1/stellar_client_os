@@ -22,7 +22,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-export type SyncItemStatus = "pending" | "syncing" | "synced" | "failed" | "conflict";
+export type SyncItemStatus = "pending" | "syncing" | "synced" | "failed" | "conflict" | "draft";
 
 export type SyncFailureType = "transient" | "permanent" | "stale" | "duplicate" | "conflict";
 
@@ -69,6 +69,17 @@ export interface SyncQueueItem {
   payload?: unknown;
   /** Conflict metadata if status === "conflict" or failureType === "conflict" | "stale". */
   conflictDetails?: ConflictDetails;
+  /**
+   * For draft items (deployment, financial actions): Unix timestamp (ms) when
+   * user confirmed they are online. Must be set before deployment is allowed.
+   * Prevents deploying while offline. Issue #3 fix.
+   */
+  onlineConfirmedAt?: number;
+  /**
+   * For draft items: whether this is a financial or deployment action that
+   * requires online confirmation. Default: false. Issue #3 fix.
+   */
+  requiresOnlineConfirmation?: boolean;
 }
 
 export interface SyncQueueOptions {
@@ -125,6 +136,16 @@ export interface SyncQueueState {
   resolveConflict: (id: string, resolution: ConflictResolution) => Promise<void>;
   /** Update an item's user payload without losing input, resetting it to pending. */
   updatePayload: (id: string, newPayload: unknown, newLabel?: string) => void;
+  /**
+   * Mark a draft item as online-confirmed. Required before deployment for items
+   * with requiresOnlineConfirmation=true. Issue #3 fix. Returns true if successful.
+   */
+  confirmOnline: (id: string) => boolean;
+  /**
+   * Check if a draft item can be deployed: requires isOnline=true AND
+   * (requiresOnlineConfirmation=false OR onlineConfirmedAt is set). Issue #3 fix.
+   */
+  canDeployDraft: (id: string) => boolean;
   /** Clear all synced items from the queue. */
   clearSynced: () => void;
   /** Clear the entire queue (pending, failed, synced, conflicts). */
@@ -592,6 +613,52 @@ export function useSyncQueue(options: SyncQueueOptions = {}): SyncQueueState {
   const conflictItems = queue.filter((i) => i.status === "conflict");
   const syncedItems = queue.filter((i) => i.status === "synced");
 
+  // ── Online Confirmation for Draft Deployments (Issue #3) ──────────────────
+  
+  /**
+   * Mark a draft item as online-confirmed. Required before deployment for
+   * financial or deployment actions. Issue #3 fix.
+   */
+  const confirmOnline = useCallback(
+    (id: string): boolean => {
+      const item = queueRef.current.find((i) => i.id === id);
+      if (!item || !item.requiresOnlineConfirmation) {
+        return false;
+      }
+      
+      setQueue((prev) =>
+        prev.map((i) =>
+          i.id === id
+            ? { ...i, onlineConfirmedAt: Date.now() }
+            : i
+        )
+      );
+      return true;
+    },
+    []
+  );
+
+  /**
+   * Check if a draft item can be deployed: requires isOnline=true AND
+   * (requiresOnlineConfirmation=false OR onlineConfirmedAt is set).
+   * Issue #3 fix.
+   */
+  const canDeployDraft = useCallback(
+    (id: string): boolean => {
+      const item = queueRef.current.find((i) => i.id === id);
+      if (!item) return false;
+
+      // If not a draft requiring confirmation, allow if online
+      if (!item.requiresOnlineConfirmation) {
+        return isOnline;
+      }
+
+      // For drafts requiring confirmation: must be online AND confirmed
+      return isOnline && (item.onlineConfirmedAt ?? 0) > 0;
+    },
+    [isOnline]
+  );
+
   return {
     queue,
     pendingItems,
@@ -610,6 +677,8 @@ export function useSyncQueue(options: SyncQueueOptions = {}): SyncQueueState {
     retryItem,
     resolveConflict,
     updatePayload,
+    confirmOnline,
+    canDeployDraft,
     clearSynced,
     clearAll,
   };
