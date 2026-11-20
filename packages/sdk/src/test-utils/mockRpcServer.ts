@@ -163,6 +163,39 @@ export interface MockGetEventsArgs {
 }
 
 /**
+ * Deterministic outage configuration for the mocked getEvents method.
+ *
+ * Models an RPC / consumer outage so bounded-queue and backpressure tests can
+ * prove that memory stays bounded while the consumer is down and that the
+ * consumer recovers its throughput once the outage ends.
+ *
+ * All counters are call-based (never wall-clock based) so tests are fully
+ * deterministic.
+ */
+export interface MockGetEventsOutageConfig {
+  /**
+   * Number of initial getEvents calls that fail with a thrown error
+   * (default: 0). Models a hard RPC outage.
+   */
+  failCalls?: number;
+  /**
+   * Number of getEvents calls, after the failing calls, that return an empty
+   * page (no events) while still reporting a healthy `latestLedger`
+   * (default: 0). Models a partial outage / stalled consumer.
+   */
+  emptyCalls?: number;
+  /**
+   * When true, every getEvents call fails until `recoverGetEvents()` is
+   * called. Models an outage of unbounded duration.
+   */
+  permanent?: boolean;
+  /** Error message thrown while the outage is active. */
+  message?: string;
+  /** Latest ledger reported on empty pages during the outage (default: 1000). */
+  latestLedger?: number;
+}
+
+/**
  * Deterministic lifecycle configuration for a single transaction.
  *
  * Controls how many polls return PENDING / NOT_FOUND before the transaction
@@ -315,16 +348,41 @@ export function createLifecycleGetTransaction(
  * of events. Supports both `startLedger` and `cursor` pagination so tests can
  * exercise the same paging logic used against a real RPC server.
  *
+ * An optional `outage` config can be supplied to simulate an RPC / consumer
+ * outage: the first `failCalls` calls reject, the next `emptyCalls` calls
+ * return an empty page, and every subsequent call serves events normally.
+ * This lets tests prove bounded-queue backpressure during the outage and
+ * recovery throughput afterwards.
+ *
  * @param events - Full ordered list of events to page through.
  * @param pageSize - Maximum number of events returned per call (default: 100).
  * @param latestLedger - Latest closed ledger reported on each response.
+ * @param outage - Optional deterministic outage configuration.
  */
 export function createPaginatedGetEvents(
   events: MockContractEvent[],
   pageSize = 100,
   latestLedger = 1000,
+  outage?: MockGetEventsOutageConfig,
 ): (...args: [MockGetEventsArgs]) => Promise<MockGetEventsResponse> {
+  const failCalls = outage?.failCalls ?? 0;
+  const emptyCalls = outage?.emptyCalls ?? 0;
+  const permanent = outage?.permanent ?? false;
+  const outageMessage = outage?.message ?? 'getEvents RPC error';
+  const outageLedger = outage?.latestLedger ?? latestLedger;
+  let call = 0;
+
   return async (args: MockGetEventsArgs = {}): Promise<MockGetEventsResponse> => {
+    const callIndex = call;
+    call += 1;
+
+    if (permanent || callIndex < failCalls) {
+      throw new Error(outageMessage);
+    }
+    if (callIndex < failCalls + emptyCalls) {
+      return { events: [], latestLedger: outageLedger, cursor: args.cursor };
+    }
+
     const limit = Math.max(1, Math.min(args.limit ?? pageSize, pageSize));
 
     let startIndex = 0;
@@ -548,6 +606,61 @@ const mock = {
     },
 
     /**
+     * Simulates a bounded RPC / consumer outage on getEvents.
+     *
+     * The first `failCalls` calls reject, the next `emptyCalls` calls return
+     * an empty page (partial outage), and every subsequent call serves the
+     * supplied events normally — proving recovery throughput deterministically.
+     *
+     * @example
+     * // 3 failures, then 2 empty pages, then events flow again
+     * rpc.scenarios.getEventsOutage(events, { failCalls: 3, emptyCalls: 2 });
+     */
+    getEventsOutage(
+      events: MockContractEvent[] = [],
+      outage: MockGetEventsOutageConfig = {},
+      opts?: { pageSize?: number; latestLedger?: number },
+    ): void {
+      mock.getEvents.mockImplementation(
+        createPaginatedGetEvents(
+          events,
+          opts?.pageSize ?? 100,
+          opts?.latestLedger ?? 1000,
+          outage,
+        ),
+      );
+    },
+
+    /**
+     * Simulates an outage of unbounded duration: every getEvents call rejects
+     * until `recoverGetEvents()` is called. Use this to assert that a bounded
+     * queue sheds load (backpressure) instead of growing without limit.
+     */
+    getEventsPermanentOutage(
+      message = 'getEvents RPC error',
+      latestLedger = 1000,
+    ): void {
+      mock.getEvents.mockImplementation(
+        createPaginatedGetEvents([], 100, latestLedger, {
+          permanent: true,
+          message,
+          latestLedger,
+        }),
+      );
+    },
+
+    /**
+     * Ends a permanent outage by restoring a healthy, empty getEvents
+     * responder. Call this to prove the consumer recovers after an outage.
+     */
+    recoverGetEvents(latestLedger = 1000): void {
+      mock.getEvents.mockReset().mockResolvedValue({
+        events: [],
+        latestLedger,
+      } satisfies MockGetEventsResponse);
+    },
+
+    /**
      * Wires up the complete deterministic transaction lifecycle:
      * account load → simulation → submission → confirmation polling.
      *
@@ -696,6 +809,28 @@ export function resetMockRpcServer(): void {
       }
     }
   });
+}
+
+/**
+ * Installs a deterministic getEvents outage on the shared mock server.
+ *
+ * Convenience wrapper around `scenarios.getEventsOutage()` for tests that
+ * only need to simulate an RPC / consumer outage without touching other RPC
+ * methods.
+ *
+ * ```ts
+ * beforeEach(() => {
+ *   resetMockRpcServer();
+ *   installGetEventsOutage(events, { failCalls: 2 });
+ * });
+ * ```
+ */
+export function installGetEventsOutage(
+  events: MockContractEvent[] = [],
+  outage: MockGetEventsOutageConfig = {},
+  opts?: { pageSize?: number; latestLedger?: number },
+): void {
+  mock.scenarios.getEventsOutage(events, outage, opts);
 }
 
 /**

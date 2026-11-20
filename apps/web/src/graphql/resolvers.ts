@@ -7,6 +7,10 @@
 
 import { DefaultStreamDataSource, getAnalyticsService } from "./analytics.service";
 import { withExecutionTimeout } from "./query-guard";
+import { getDeploymentRegistryService } from "@/services/deployment-registry.service";
+import { getContractEventMappingService } from "@/services/contract-event-mapping.service";
+import { getProjectionReplayService } from "@/services/projection-replay.service";
+import { getEventConsumerMetricsService } from "@/services/event-consumer-metrics.service";
 import { getCampaignHealthAssessment, getCampaignRiskAssessment, getCampaignVerificationSummary, queryCampaigns } from "@/services/campaign.service";
 import type { CampaignDataSource, CampaignQueryInput } from "@/services/campaign.service";
 import { getCampaignSequelService } from "@/services/campaign-sequel.service";
@@ -63,6 +67,27 @@ function toBigInt(value: string): bigint {
   } catch {
     return 0n;
   }
+}
+
+/**
+ * Require an authenticated account for operator-only fields.
+ *
+ * Deployment registry mutations, projection replays and consumer metrics are
+ * operational surfaces: they expose deployment state and can trigger
+ * state-rebuilding work, so they are restricted to authenticated operators.
+ * Unauthenticated callers receive an explicit authorization error rather than
+ * an empty result (issues #218, #220, #222).
+ */
+function requireOperator(ctx: ResolverContext): string {
+  const accountId = ctx.accountId;
+  if (!accountId) {
+    throw new Error("Unauthorized: an authenticated operator account is required");
+  }
+  const roles = ctx.roles ?? [];
+  if (roles.length > 0 && !roles.includes("operator") && !roles.includes("admin")) {
+    throw new Error("Forbidden: operator role required");
+  }
+  return accountId;
 }
 
 /**
@@ -477,6 +502,93 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         const subscriptions = await getWebhookSubscriptionService().listSubscriptions(accountId);
         return paginate(subscriptions.map(toWebhookPayload), args.pagination);
       },
+
+      /**
+       * Validated contract deployment registry (issue #218).
+       *
+       * Returns every recorded deployment with its network, address,
+       * deployment ledger, spec version and lifecycle state. Operators can
+       * filter by network or lifecycle state.
+       */
+      contractDeployments: async (
+        _: unknown,
+        rawArgs: {
+          filter?: { network?: Network; state?: string; specVersion?: string };
+          pagination?: PaginationInput;
+          sort?: SortInput;
+        },
+        ctx: ResolverContext,
+      ) => {
+        requireOperator(ctx);
+        validateListArgs(rawArgs.pagination, rawArgs.sort);
+        const deployments = await getDeploymentRegistryService().listDeployments(rawArgs.filter);
+        return paginate(deployments.map(toDeploymentPayload), rawArgs.pagination, rawArgs.sort);
+      },
+
+      /**
+       * A single deployment record by network + address (issue #218).
+       * Returns null when the pair is not registered.
+       */
+      contractDeployment: async (
+        _: unknown,
+        rawArgs: { network: Network; address: string },
+        ctx: ResolverContext,
+      ) => {
+        requireOperator(ctx);
+        const args = guard<typeof rawArgs>("Query.contractDeployment", ctx, rawArgs, "contractDeployment");
+        const deployment = await getDeploymentRegistryService().getDeployment(args.network, args.address);
+        return deployment ? toDeploymentPayload(deployment) : null;
+      },
+
+      /**
+       * Canonical contract-event domain mappings (issue #219).
+       *
+       * Supported event versions are mapped to their projection; unknown
+       * versions are reported as `UNKNOWN` with the raw payload retained so
+       * operators can inspect and backfill them.
+       */
+      contractEventMappings: async (
+        _: unknown,
+        rawArgs: {
+          filter?: { contract?: string; eventName?: string; version?: string };
+          pagination?: PaginationInput;
+          sort?: SortInput;
+        },
+        ctx: ResolverContext,
+      ) => {
+        requireOperator(ctx);
+        validateListArgs(rawArgs.pagination, rawArgs.sort);
+        const mappings = await getContractEventMappingService().listMappings(rawArgs.filter);
+        return paginate(mappings.map(toEventMappingPayload), rawArgs.pagination, rawArgs.sort);
+      },
+
+      /**
+       * Projection replay status across event-schema versions (issue #220).
+       * Returns the latest replay run, or null when none has been started.
+       */
+      projectionReplayStatus: async (
+        _: unknown,
+        rawArgs: { replayId: string },
+        ctx: ResolverContext,
+      ) => {
+        requireOperator(ctx);
+        const args = guard<typeof rawArgs>("Query.projectionReplayStatus", ctx, rawArgs, "replayId");
+        const status = await getProjectionReplayService().getReplayStatus(args.replayId);
+        return status ? toReplayStatusPayload(status) : null;
+      },
+
+      /**
+       * Bounded event-consumer queue and concurrency metrics (issue #222).
+       * Exposes queue depth, capacity, in-flight work and backpressure state.
+       */
+      eventConsumerMetrics: async (
+        _: unknown,
+        rawArgs: { consumer?: string },
+        ctx: ResolverContext,
+      ) => {
+        requireOperator(ctx);
+        return getEventConsumerMetricsService().getMetrics(rawArgs.consumer);
+      },
     },
     Mutation: {
       cloneCampaign: async (
@@ -567,7 +679,117 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         const subscription = await getWebhookSubscriptionService().revokeSubscription(accountId, args.id);
         return toWebhookPayload(subscription);
       },
+
+      /**
+       * Register or update a contract deployment (issue #218).
+       *
+       * The registry validates the network/address pair and the deployment
+       * ledger before persisting. Duplicate registrations for the same
+       * network + address are rejected by the service.
+       */
+      registerContractDeployment: async (
+        _: unknown,
+        rawArgs: {
+          input: {
+            network: Network;
+            address: string;
+            deploymentLedger: number;
+            specVersion: string;
+            state?: string;
+          };
+        },
+        ctx: ResolverContext,
+      ) => {
+        requireOperator(ctx);
+        const args = guard<typeof rawArgs>("Mutation.registerContractDeployment", ctx, rawArgs, "registerContractDeployment");
+        const deployment = await getDeploymentRegistryService().registerDeployment(args.input);
+        return toDeploymentPayload(deployment);
+      },
+
+      /**
+       * Transition a deployment's lifecycle state (issue #218).
+       * Invalid transitions surface as explicit errors from the service.
+       */
+      updateContractDeploymentState: async (
+        _: unknown,
+        rawArgs: { network: Network; address: string; state: string },
+        ctx: ResolverContext,
+      ) => {
+        requireOperator(ctx);
+        const args = guard<typeof rawArgs>("Mutation.updateContractDeploymentState", ctx, rawArgs, "updateContractDeploymentState");
+        const deployment = await getDeploymentRegistryService().updateDeploymentState(
+          args.network,
+          args.address,
+          args.state,
+        );
+        return toDeploymentPayload(deployment);
+      },
+
+      /**
+       * Start a deterministic projection replay across event-schema versions
+       * (issue #220). The service rebuilds state from retained raw events and
+       * compares outputs before cutover; the returned status can be polled via
+       * `projectionReplayStatus`.
+       */
+      startProjectionReplay: async (
+        _: unknown,
+        rawArgs: { input: { fromVersion: string; toVersion: string; dryRun?: boolean } },
+        ctx: ResolverContext,
+      ) => {
+        requireOperator(ctx);
+        const args = guard<typeof rawArgs>("Mutation.startProjectionReplay", ctx, rawArgs, "startProjectionReplay");
+        const status = await getProjectionReplayService().startReplay(args.input);
+        return toReplayStatusPayload(status);
+      },
     },
+  };
+}
+
+/**
+ * Map a deployment record to its public GraphQL shape (issue #218).
+ */
+function toDeploymentPayload(deployment: import("@/services/deployment-registry.service").ContractDeployment) {
+  return {
+    network: deployment.network,
+    address: deployment.address,
+    deploymentLedger: deployment.deploymentLedger,
+    specVersion: deployment.specVersion,
+    state: deployment.state,
+    registeredAt: Math.floor(deployment.registeredAt / 1000),
+    updatedAt: Math.floor(deployment.updatedAt / 1000),
+  };
+}
+
+/**
+ * Map a canonical event mapping to its public GraphQL shape (issue #219).
+ * Unknown versions retain the raw payload for operator inspection.
+ */
+function toEventMappingPayload(mapping: import("@/services/contract-event-mapping.service").ContractEventMapping) {
+  return {
+    contract: mapping.contract,
+    eventName: mapping.eventName,
+    version: mapping.version,
+    projection: mapping.projection,
+    status: mapping.status,
+    rawPayload: mapping.rawPayload ?? null,
+  };
+}
+
+/**
+ * Map a projection replay status to its public GraphQL shape (issue #220).
+ */
+function toReplayStatusPayload(status: import("@/services/projection-replay.service").ProjectionReplayStatus) {
+  return {
+    replayId: status.replayId,
+    fromVersion: status.fromVersion,
+    toVersion: status.toVersion,
+    state: status.state,
+    dryRun: status.dryRun,
+    processedEvents: status.processedEvents,
+    mismatches: status.mismatches,
+    startedAt: Math.floor(status.startedAt / 1000),
+    completedAt: status.completedAt ? Math.floor(status.completedAt / 1000) : null,
+    error: status.error ?? null,
   };
 }
 

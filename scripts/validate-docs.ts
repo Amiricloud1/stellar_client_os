@@ -15,6 +15,7 @@ export interface ValidationConfig {
   allowedPackages?: string[];
   externalOrCredentialExceptions?: string[];
   allowedMissingPaths?: string[];
+  operationalDocPaths?: string[];
 }
 
 export const DEFAULT_ALLOWED_PACKAGES = [
@@ -51,6 +52,26 @@ export const DEFAULT_ALLOWED_MISSING_PATHS = [
 ];
 
 /**
+ * Operational documentation paths for the deployment registry, canonical
+ * event mappings, projection replay/cutover, and bounded-queue tuning.
+ * These are referenced from contributor and runbook docs and must remain
+ * valid even when the operational artifacts themselves are generated at
+ * runtime (e.g. registry snapshots or replay reports).
+ */
+export const OPERATIONAL_DOC_PATHS = [
+  "docs/operations/deployment-registry.md",
+  "docs/operations/event-mappings.md",
+  "docs/operations/projection-replay.md",
+  "docs/operations/queue-tuning.md",
+  "docs/operations/README.md",
+  "docs/operations/runbooks",
+  "docs/operations/runbooks/deployment-registry.md",
+  "docs/operations/runbooks/event-mappings.md",
+  "docs/operations/runbooks/projection-replay.md",
+  "docs/operations/runbooks/queue-tuning.md",
+];
+
+/**
  * Validates documentation files for:
  * 1. Package name references against workspace and approved external dependencies.
  * 2. Repository scripts (`pnpm run <script>` or `npm run <script>`).
@@ -83,6 +104,21 @@ export function validateDocs(config?: Partial<ValidationConfig>): {
     ...DEFAULT_ALLOWED_MISSING_PATHS,
     ...(config?.allowedMissingPaths || []),
   ]);
+
+  const operationalDocPaths = new Set([
+    ...OPERATIONAL_DOC_PATHS,
+    ...(config?.operationalDocPaths || []),
+  ]);
+
+  function isOperationalDocPath(rawPath: string): boolean {
+    const normalized = rawPath.replace(/\\/g, "/").replace(/^\.\//, "");
+    for (const opPath of operationalDocPaths) {
+      if (normalized === opPath || normalized.startsWith(`${opPath}/`)) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   const docFiles: string[] = [];
   function collectMarkdownFiles(dir: string) {
@@ -144,6 +180,9 @@ export function validateDocs(config?: Partial<ValidationConfig>): {
         const rawPath = m[0].replace(/[),:;`'"]+$/, "");
         const baseName = path.basename(rawPath);
         if (credentialExceptions.has(baseName) || allowedMissingPaths.has(baseName)) {
+          continue;
+        }
+        if (isOperationalDocPath(rawPath)) {
           continue;
         }
         const resolved = path.resolve(path.dirname(filePath), rawPath);

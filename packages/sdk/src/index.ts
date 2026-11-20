@@ -54,6 +54,21 @@ export * from "./CampaignEscrowClient.js";
 // Export deployment module, disambiguating names also exported by generated bindings.
 export { ContractDeployer } from "./deployer/ContractDeployer.js";
 export * from "./deployer/errors.js";
+// Deployment registry (issue #218). Additive: existing deployer exports are unchanged.
+export {
+  DeploymentRegistry,
+  DeploymentRegistryError,
+  isDeploymentRegistryError,
+  DEFAULT_DEPLOYMENT_REGISTRY_OPTIONS,
+  type DeploymentRecord,
+  type DeploymentLifecycleState,
+  type DeploymentRegistryOptions,
+  type DeploymentRegistryErrorCode,
+  type DeploymentRecordInput,
+  type DeploymentTransitionInput,
+  type DeploymentRegistryQuery,
+  type DeploymentRegistryClock,
+} from "./deployer/DeploymentRegistry.js";
 export {
   type ContractDeployResult,
   type Deployer,
@@ -71,6 +86,33 @@ export * from "./utils/batchDistribution.js";
 export * from "./utils/events.js";
 export * from "./utils/soroban-transaction-helper.js";
 export * from "./utils/SorobanEventParser.js";
+// Canonical contract-event domain mappings (issue #219) and deterministic
+// projection replay across event-schema versions (issue #220). Additive:
+// existing event parser exports are unchanged.
+export {
+  EventDomainMapper,
+  EventMappingError,
+  isEventMappingError,
+  SUPPORTED_EVENT_SCHEMA_VERSIONS,
+  type EventSchemaVersion,
+  type EventDomain,
+  type CanonicalEvent,
+  type UnknownEventRecord,
+  type EventMappingResult,
+  type EventDomainProjection,
+  type EventMappingErrorCode,
+} from "./utils/EventDomainMapper.js";
+export {
+  ProjectionReplayEngine,
+  ProjectionReplayError,
+  isProjectionReplayError,
+  type ProjectionReplayOptions,
+  type ProjectionReplayReport,
+  type ProjectionReplayMismatch,
+  type ProjectionReplayStatus,
+  type ProjectionReplayErrorCode,
+  type ProjectionReducer,
+} from "./utils/ProjectionReplayEngine.js";
 export * from "./utils/networkDetection.js";
 export * from "./utils/streamHistory.js";
 export * from "./utils/BalanceWatcher.js";
@@ -86,6 +128,19 @@ export {
   type CongestionLevel as GasEstimatorCongestionLevel,
 } from "./utils/GasEstimator.js";
 export * from "./utils/rpcConnectionOptions.js";
+// Bounded queues and concurrency for event consumers (issue #222). Additive:
+// existing RPC/event utilities are unchanged.
+export {
+  BoundedEventQueue,
+  BoundedQueueError,
+  isBoundedQueueError,
+  DEFAULT_BOUNDED_QUEUE_OPTIONS,
+  type BoundedQueueOptions,
+  type BoundedQueueStats,
+  type BoundedQueueErrorCode,
+  type BoundedQueueState,
+  type QueueOverflowPolicy,
+} from "./utils/BoundedEventQueue.js";
 export {
   TransactionResubmissionManager,
   TransactionResubmissionError,
