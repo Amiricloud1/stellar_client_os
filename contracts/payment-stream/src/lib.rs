@@ -23,7 +23,16 @@ pub enum DataKey {
     Metrics(u64),
     Delegate(u64),
     /// Global emergency-pause circuit breaker flag (instance storage).
+    /// DEPRECATED: Use selective pause flags (PausedDeposits, PausedPayouts, PausedClaims, PausedAdmin) instead.
     Paused,
+    /// Selective pause flag for deposit operations (instance storage).
+    PausedDeposits,
+    /// Selective pause flag for payout/withdrawal operations (instance storage).
+    PausedPayouts,
+    /// Selective pause flag for claim/withdraw operations (instance storage).
+    PausedClaims,
+    /// Selective pause flag for admin operations (instance storage).
+    PausedAdmin,
     /// Configured DEX router address used by `deposit_with_swap` (instance storage).
     DexRouter,
     /// Running counter used to allocate dispute ids (instance storage).
@@ -244,6 +253,16 @@ pub struct EmergencyUnpausedEvent {
     pub unpaused_at: u64,
 }
 
+/// Operation pause state changed event data
+#[contractevent(topics = ["OperationPauseChanged"])]
+#[derive(Clone)]
+pub struct OperationPauseChangedEvent {
+    pub operation: Symbol,
+    pub paused: bool,
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
 /// Emitted when an ID counter (`StreamCount` or `DisputeCount`) has reached
 /// `u64::MAX` and a creation attempt is rejected instead of overflowing.
 #[contractevent(topics = ["ContractFull"])]
@@ -397,6 +416,38 @@ impl PaymentStreamContract {
     /// entry point that should be halted during an incident.
     fn assert_not_paused(env: &Env) {
         let paused: bool = env.storage().instance().get(&DataKey::Paused).unwrap_or(false);
+        if paused {
+            panic_with_error!(env, Error::ContractPaused);
+        }
+    }
+
+    /// Guard: panics with `ContractPaused` when deposit operations are paused.
+    fn assert_deposits_allowed(env: &Env) {
+        let paused: bool = env.storage().instance().get(&DataKey::PausedDeposits).unwrap_or(false);
+        if paused {
+            panic_with_error!(env, Error::ContractPaused);
+        }
+    }
+
+    /// Guard: panics with `ContractPaused` when payout operations are paused.
+    fn assert_payouts_allowed(env: &Env) {
+        let paused: bool = env.storage().instance().get(&DataKey::PausedPayouts).unwrap_or(false);
+        if paused {
+            panic_with_error!(env, Error::ContractPaused);
+        }
+    }
+
+    /// Guard: panics with `ContractPaused` when claim/withdrawal operations are paused.
+    fn assert_claims_allowed(env: &Env) {
+        let paused: bool = env.storage().instance().get(&DataKey::PausedClaims).unwrap_or(false);
+        if paused {
+            panic_with_error!(env, Error::ContractPaused);
+        }
+    }
+
+    /// Guard: panics with `ContractPaused` when admin operations are paused.
+    fn assert_admin_allowed(env: &Env) {
+        let paused: bool = env.storage().instance().get(&DataKey::PausedAdmin).unwrap_or(false);
         if paused {
             panic_with_error!(env, Error::ContractPaused);
         }
@@ -579,6 +630,84 @@ impl PaymentStreamContract {
         .publish(&env);
     }
 
+    /// Set an individual operation pause flag (admin only).
+    ///
+    /// Pauses or unpauses a specific operation type without affecting others.
+    /// Valid operation symbols: "deposits", "payouts", "claims", "admin"
+    ///
+    /// # Authorization
+    /// Requires the admin address to sign this call.
+    ///
+    /// # Errors
+    /// - `Error::Unauthorized` – caller is not admin.
+    ///
+    /// # Events
+    /// Emits `OperationPauseChanged` with the operation, paused state, admin address, and timestamp.
+    pub fn set_operation_pause(env: Env, operation: Symbol, paused: bool) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+
+        let data_key = match operation.to_string().as_str() {
+            "deposits" => DataKey::PausedDeposits,
+            "payouts" => DataKey::PausedPayouts,
+            "claims" => DataKey::PausedClaims,
+            "admin" => DataKey::PausedAdmin,
+            _ => panic_with_error!(&env, Error::InvalidAmount), // Reuse InvalidAmount for invalid operation
+        };
+
+        env.storage().instance().set(&data_key, &paused);
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+
+        let now = env.ledger().timestamp();
+        OperationPauseChangedEvent {
+            operation,
+            paused,
+            admin,
+            timestamp: now,
+        }
+        .publish(&env);
+    }
+
+    /// Check if a specific operation type is paused.
+    ///
+    /// Valid operation symbols: "deposits", "payouts", "claims", "admin"
+    pub fn is_operation_paused(env: Env, operation: Symbol) -> bool {
+        let data_key = match operation.to_string().as_str() {
+            "deposits" => DataKey::PausedDeposits,
+            "payouts" => DataKey::PausedPayouts,
+            "claims" => DataKey::PausedClaims,
+            "admin" => DataKey::PausedAdmin,
+            _ => return false,
+        };
+
+        env.storage().instance().get(&data_key).unwrap_or(false)
+    }
+
+    /// Migrate from old binary `Paused` flag to selective pause flags.
+    ///
+    /// If the old `Paused` flag is set, this sets all four selective flags to true.
+    /// This ensures backward compatibility for contracts that were using the
+    /// emergency pause mechanism.
+    fn migrate_pause_flags(env: &Env) {
+        let old_paused: bool = env.storage().instance().get(&DataKey::Paused).unwrap_or(false);
+
+        if old_paused {
+            env.storage().instance().set(&DataKey::PausedDeposits, &true);
+            env.storage().instance().set(&DataKey::PausedPayouts, &true);
+            env.storage().instance().set(&DataKey::PausedClaims, &true);
+            env.storage().instance().set(&DataKey::PausedAdmin, &true);
+            env.storage()
+                .instance()
+                .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        }
+    }
+
     /// Returns `true` when the global emergency pause is active.
     pub fn is_paused(env: Env) -> bool {
         env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
@@ -712,6 +841,7 @@ impl PaymentStreamContract {
         params: Vec<StreamParams>,
     ) -> Vec<u64> {
         Self::assert_not_paused(&env);
+        Self::assert_deposits_allowed(&env); // Creating streams is a deposit operation
         // The sender authorises the entire batch exactly once.
         sender.require_auth();
 
@@ -790,6 +920,8 @@ impl PaymentStreamContract {
         cliff_duration: u64,
     ) -> u64 {
         Self::assert_not_paused(&env);
+        Self::assert_deposits_allowed(&env);
+        Self::migrate_pause_flags(&env);
 
         // Validate inputs
         if total_amount <= 0 {
@@ -905,6 +1037,8 @@ impl PaymentStreamContract {
     /// Deposit tokens to an existing stream
     pub fn deposit(env: Env, stream_id: u64, amount: i128) {
         Self::assert_not_paused(&env);
+        Self::assert_deposits_allowed(&env);
+        Self::migrate_pause_flags(&env);
         Self::acquire_stream_lock(&env, stream_id);
         let mut stream: Stream = Self::get_stream(env.clone(), stream_id);
 
@@ -1006,8 +1140,10 @@ impl PaymentStreamContract {
         min_amount_out: i128,
         swap_path: Vec<Address>,
     ) {
-        // 0. Emergency circuit breaker — same policy as `deposit`
+        // 0. Emergency circuit breaker and selective pause check
         Self::assert_not_paused(&env);
+        Self::assert_deposits_allowed(&env);
+        Self::migrate_pause_flags(&env);
 
         // 1. Load stream and validate status
         let mut stream: Stream = Self::get_stream(env.clone(), stream_id);
@@ -1380,6 +1516,8 @@ impl PaymentStreamContract {
     ///   transfer.
     pub fn withdraw(env: Env, stream_id: u64, amount: i128) {
         Self::assert_not_paused(&env);
+        Self::assert_claims_allowed(&env);
+        Self::migrate_pause_flags(&env);
         Self::acquire_stream_lock(&env, stream_id);
         let mut stream: Stream = Self::get_stream(env.clone(), stream_id);
 
@@ -1443,6 +1581,8 @@ impl PaymentStreamContract {
     /// Withdraw the maximum available amount from a stream
     pub fn withdraw_max(env: Env, stream_id: u64) {
         Self::assert_not_paused(&env);
+        Self::assert_claims_allowed(&env);
+        Self::migrate_pause_flags(&env);
         let available = Self::withdrawable_amount(env.clone(), stream_id);
         if available <= 0 {
             panic_with_error!(&env, Error::InsufficientWithdrawable);
@@ -1571,6 +1711,9 @@ impl PaymentStreamContract {
     /// * [`Error::ReentrancyGuard`] — reentrant call detected during token
     ///   transfer.
     pub fn cancel_stream(env: Env, stream_id: u64) {
+        Self::assert_not_paused(&env);
+        Self::assert_payouts_allowed(&env);
+        Self::migrate_pause_flags(&env);
         Self::acquire_stream_lock(&env, stream_id);
         let mut stream: Stream = Self::get_stream(env.clone(), stream_id);
 

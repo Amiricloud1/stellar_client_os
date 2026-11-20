@@ -25,6 +25,9 @@ export {
 // Re-export generated types for Planter
 export { PlanterInfo, ReferralInfo } from "./generated/planter/src/index.js";
 
+// Export operation registry client and utilities
+export * from "./OperationRegistryClient.js";
+
 // Export high-level clients
 export * from "./PaymentStreamClient.js";
 export {
