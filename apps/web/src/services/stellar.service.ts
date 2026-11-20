@@ -59,9 +59,153 @@ const DEFAULT_TIMEOUT = 30; // seconds
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_BASE_FEE = '100'; // stroops
 
+/**
+ * Explicit lifecycle states for a submitted transaction.
+ *
+ * The timeline is:
+ *   pending_wallet_approval -> submitted -> confirmed -> settled
+ *
+ * Failure / recovery states:
+ *   rejected          - user declined the wallet prompt
+ *   submission_failed - RPC rejected the submission (e.g. bad sequence)
+ *   timeout           - submitted but not confirmed within the wait window
+ *   dropped           - RPC no longer knows about the hash (evicted)
+ *   failed            - ledger confirmed the transaction as failed
+ */
+export type TransactionLifecycleState =
+  | 'pending_wallet_approval'
+  | 'submitted'
+  | 'confirmed'
+  | 'settled'
+  | 'rejected'
+  | 'submission_failed'
+  | 'timeout'
+  | 'dropped'
+  | 'failed';
+
+export interface TransactionLifecycleEvent {
+  state: TransactionLifecycleState;
+  /** Unix epoch milliseconds when this state was entered. */
+  timestamp: number;
+  /** Optional human-readable detail (error message, ledger, etc.). */
+  detail?: string;
+  /** Ledger sequence, populated once the transaction is confirmed. */
+  ledger?: number;
+}
+
+export interface TransactionLifecycle {
+  /** Transaction hash. Empty until the transaction has been submitted. */
+  hash: string;
+  state: TransactionLifecycleState;
+  /** Ordered history of state transitions. */
+  events: TransactionLifecycleEvent[];
+  /** Contract method that produced this transaction (for reconciliation). */
+  method?: string;
+  /** Contract id that produced this transaction (for reconciliation). */
+  contractId?: string;
+  /** Last time this record was reconciled against the network. */
+  lastCheckedAt?: number;
+}
+
+const TERMINAL_STATES: ReadonlySet<TransactionLifecycleState> = new Set([
+  'settled',
+  'rejected',
+  'submission_failed',
+  'dropped',
+  'failed',
+]);
+
+export function isTerminalLifecycleState(state: TransactionLifecycleState): boolean {
+  return TERMINAL_STATES.has(state);
+}
+
+const LIFECYCLE_STORAGE_PREFIX = 'fundable:tx-lifecycle:';
+
+/**
+ * Pluggable persistence for transaction lifecycles. The default implementation
+ * uses `localStorage` when available so state survives a page reload; tests and
+ * non-browser environments can supply an in-memory store.
+ */
+export interface TransactionLifecycleStore {
+  get(hash: string): TransactionLifecycle | null;
+  set(hash: string, lifecycle: TransactionLifecycle): void;
+  remove(hash: string): void;
+  list(): TransactionLifecycle[];
+}
+
+export class InMemoryTransactionLifecycleStore implements TransactionLifecycleStore {
+  private readonly records = new Map<string, TransactionLifecycle>();
+
+  get(hash: string): TransactionLifecycle | null {
+    return this.records.get(hash) ?? null;
+  }
+
+  set(hash: string, lifecycle: TransactionLifecycle): void {
+    this.records.set(hash, lifecycle);
+  }
+
+  remove(hash: string): void {
+    this.records.delete(hash);
+  }
+
+  list(): TransactionLifecycle[] {
+    return Array.from(this.records.values());
+  }
+}
+
+export class LocalStorageTransactionLifecycleStore implements TransactionLifecycleStore {
+  constructor(private readonly storage: Storage) {}
+
+  get(hash: string): TransactionLifecycle | null {
+    const raw = this.storage.getItem(LIFECYCLE_STORAGE_PREFIX + hash);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as TransactionLifecycle;
+    } catch {
+      return null;
+    }
+  }
+
+  set(hash: string, lifecycle: TransactionLifecycle): void {
+    this.storage.setItem(LIFECYCLE_STORAGE_PREFIX + hash, JSON.stringify(lifecycle));
+  }
+
+  remove(hash: string): void {
+    this.storage.removeItem(LIFECYCLE_STORAGE_PREFIX + hash);
+  }
+
+  list(): TransactionLifecycle[] {
+    const records: TransactionLifecycle[] = [];
+    for (let i = 0; i < this.storage.length; i++) {
+      const key = this.storage.key(i);
+      if (!key || !key.startsWith(LIFECYCLE_STORAGE_PREFIX)) continue;
+      const raw = this.storage.getItem(key);
+      if (!raw) continue;
+      try {
+        records.push(JSON.parse(raw) as TransactionLifecycle);
+      } catch {
+        // Ignore corrupt entries.
+      }
+    }
+    return records;
+  }
+}
+
+function createDefaultLifecycleStore(): TransactionLifecycleStore {
+  if (typeof window !== 'undefined' && typeof window.localStorage !== 'undefined') {
+    try {
+      return new LocalStorageTransactionLifecycleStore(window.localStorage);
+    } catch {
+      // localStorage can throw in private mode; fall back to memory.
+    }
+  }
+  return new InMemoryTransactionLifecycleStore();
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+=======
 
 /**
  * StellarService provides methods for interacting with Stellar network
@@ -76,6 +220,8 @@ export class StellarService {
   private readonly carbonCertificateContractId: string;
   private readonly defaultTimeout: number;
   private readonly maxRetries: number;
+  private readonly lifecycleStore: TransactionLifecycleStore;
+  private readonly lifecycleListeners = new Set<(lifecycle: TransactionLifecycle) => void>();
 
   constructor(config: StellarServiceConfig) {
     this.rpcServer = new RpcServer(
@@ -93,6 +239,113 @@ export class StellarService {
       (config.contracts as { carbonCertificate?: string }).carbonCertificate ?? '';
     this.defaultTimeout = config.defaultTimeout ?? DEFAULT_TIMEOUT;
     this.maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
+    this.lifecycleStore = config.lifecycleStore ?? createDefaultLifecycleStore();
+  }
+
+  // ============================================
+  // Transaction Lifecycle Tracking
+  // ============================================
+
+  /**
+   * Subscribe to lifecycle transitions. Returns an unsubscribe function.
+   */
+  onTransactionLifecycle(listener: (lifecycle: TransactionLifecycle) => void): () => void {
+    this.lifecycleListeners.add(listener);
+    return () => this.lifecycleListeners.delete(listener);
+  }
+
+  /**
+   * Get the persisted lifecycle for a transaction hash, if any.
+   */
+  getTransactionLifecycle(hash: string): TransactionLifecycle | null {
+    return this.lifecycleStore.get(hash);
+  }
+
+  /**
+   * List all persisted lifecycles (e.g. to render a pending-transactions panel).
+   */
+  listTransactionLifecycles(): TransactionLifecycle[] {
+    return this.lifecycleStore.list();
+  }
+
+  private recordLifecycle(
+    hash: string,
+    state: TransactionLifecycleState,
+    detail?: string,
+    ledger?: number,
+    context?: { method?: string; contractId?: string }
+  ): TransactionLifecycle {
+    const existing = this.lifecycleStore.get(hash);
+    const event: TransactionLifecycleEvent = {
+      state,
+      timestamp: Date.now(),
+      ...(detail !== undefined ? { detail } : {}),
+      ...(ledger !== undefined ? { ledger } : {}),
+    };
+    const lifecycle: TransactionLifecycle = {
+      hash,
+      state,
+      events: [...(existing?.events ?? []), event],
+      method: context?.method ?? existing?.method,
+      contractId: context?.contractId ?? existing?.contractId,
+      lastCheckedAt: Date.now(),
+    };
+    this.lifecycleStore.set(hash, lifecycle);
+    for (const listener of this.lifecycleListeners) {
+      try {
+        listener(lifecycle);
+      } catch {
+        // Listener errors must not break transaction processing.
+      }
+    }
+    return lifecycle;
+  }
+
+  /**
+   * Reconcile a persisted lifecycle against the network after a reload.
+   *
+   * - If the transaction is unknown to RPC and the wait window has elapsed,
+   *   it is marked `dropped`.
+   * - If RPC reports SUCCESS, it is marked `confirmed` (and `settled` once the
+   *   ledger is final).
+   * - If RPC reports FAILED, it is marked `failed`.
+   * - If RPC still reports NOT_FOUND within the wait window, the state is left
+   *   as `submitted` so the UI can keep polling.
+   */
+  async reconcileTransactionLifecycle(hash: string): Promise<TransactionLifecycle | null> {
+    const existing = this.lifecycleStore.get(hash);
+    if (!existing) return null;
+    if (isTerminalLifecycleState(existing.state)) return existing;
+
+    const submittedAt = existing.events.find((e) => e.state === 'submitted')?.timestamp;
+    const elapsed = submittedAt ? Date.now() - submittedAt : 0;
+    const withinWindow = elapsed <= this.defaultTimeout * 1000;
+
+    let response: Awaited<ReturnType<typeof this.rpcServer.getTransaction>>;
+    try {
+      response = await this.rpcServer.getTransaction(hash);
+    } catch (error) {
+      // Transient RPC failure: keep the current state so the caller can retry.
+      return this.recordLifecycle(hash, existing.state, `reconcile error: ${(error as Error).message}`);
+    }
+
+    if (response.status === Api.GetTransactionStatus.SUCCESS) {
+      const confirmed = this.recordLifecycle(hash, 'confirmed', undefined, response.ledger);
+      return this.recordLifecycle(hash, 'settled', undefined, response.ledger, {
+        method: confirmed.method,
+        contractId: confirmed.contractId,
+      });
+    }
+
+    if (response.status === Api.GetTransactionStatus.FAILED) {
+      return this.recordLifecycle(hash, 'failed', 'ledger confirmed failure');
+    }
+
+    // NOT_FOUND
+    if (!withinWindow) {
+      return this.recordLifecycle(hash, 'dropped', 'transaction not found after wait window');
+    }
+    return existing;
   }
 
   // ============================================
@@ -899,11 +1152,23 @@ export class StellarService {
         // Prepare transaction with simulation result
         const preparedTx = assembleTransaction(tx, simulation).build();
 
+        // Track wallet approval before signing so a rejection is observable.
+        const hash = preparedTx.hash().toString('hex');
+        this.recordLifecycle(hash, 'pending_wallet_approval', undefined, undefined, {
+          method,
+          contractId,
+        });
+
         // Sign the transaction
-        preparedTx.sign(signerKeypair);
+        try {
+          preparedTx.sign(signerKeypair);
+        } catch (signError) {
+          this.recordLifecycle(hash, 'rejected', (signError as Error).message);
+          throw signError;
+        }
 
         // Submit and wait for result
-        const result = await this.submitAndWait(preparedTx);
+        const result = await this.submitAndWait(preparedTx, { method, contractId });
 
         return result as TransactionResult<T>;
       } catch (error) {
@@ -922,7 +1187,10 @@ export class StellarService {
   /**
    * Submit transaction and wait for confirmation
    */
-  private async submitAndWait(tx: Transaction | FeeBumpTransaction): Promise<TransactionResult<unknown>> {
+  private async submitAndWait(
+    tx: Transaction | FeeBumpTransaction,
+    context?: { method?: string; contractId?: string }
+  ): Promise<TransactionResult<unknown>> {
     return withSpan('stellar.rpc.submitTransaction', async (span) => {
       span.setAttribute('rpc.service', 'stellar.soroban');
       span.setAttribute('rpc.method', 'sendTransaction');
@@ -933,13 +1201,17 @@ export class StellarService {
 
       if (sendResponse.status === 'ERROR') {
         span.setStatus('error');
+        const resultCodes = sendResponse.errorResult
+          ? [sendResponse.errorResult.result().switch().name]
+          : undefined;
+        this.recordLifecycle(hash, 'submission_failed', resultCodes?.join(','), undefined, context);
         throw new TransactionError('Transaction submission failed', {
           txHash: hash,
-          resultCodes: sendResponse.errorResult
-            ? [sendResponse.errorResult.result().switch().name]
-            : undefined,
+          resultCodes,
         });
       }
+
+      this.recordLifecycle(hash, 'submitted', undefined, undefined, context);
 
       // Poll for transaction result
       let getResponse = await withRetry(() => this.rpcServer.getTransaction(hash), { maxRetries: this.maxRetries });
@@ -949,6 +1221,7 @@ export class StellarService {
       while (getResponse.status === Api.GetTransactionStatus.NOT_FOUND) {
         if (Date.now() - startTime > maxWaitTime) {
           span.setStatus('error');
+          this.recordLifecycle(hash, 'timeout', 'confirmation wait window elapsed');
           throw new TransactionTimeoutError(hash);
         }
 
@@ -962,6 +1235,9 @@ export class StellarService {
           result = scValToNative(getResponse.returnValue);
         }
 
+        this.recordLifecycle(hash, 'confirmed', undefined, getResponse.ledger, context);
+        this.recordLifecycle(hash, 'settled', undefined, getResponse.ledger, context);
+
         span.setStatus('ok');
         return {
           hash,
@@ -972,11 +1248,13 @@ export class StellarService {
       }
 
       span.setStatus('error');
+      const resultCodes = getResponse.resultXdr
+        ? [getResponse.resultXdr.result().switch().name]
+        : undefined;
+      this.recordLifecycle(hash, 'failed', resultCodes?.join(','), undefined, context);
       throw new TransactionError('Transaction failed', {
         txHash: hash,
-        resultCodes: getResponse.resultXdr
-          ? [getResponse.resultXdr.result().switch().name]
-          : undefined,
+        resultCodes,
       });
     });
   }
@@ -1086,7 +1364,7 @@ export function createTestnetService(contracts: {
   paymentStream: string;
   distributor: string;
   carbonCertificate?: string;
-}): StellarService {
+}, lifecycleStore?: TransactionLifecycleStore): StellarService {
   return new StellarService({
     network: {
       networkPassphrase: Networks.TESTNET,
@@ -1094,6 +1372,7 @@ export function createTestnetService(contracts: {
       horizonUrl: 'https://horizon-testnet.stellar.org',
     },
     contracts,
+    lifecycleStore,
   });
 }
 
@@ -1104,7 +1383,7 @@ export function createMainnetService(contracts: {
   paymentStream: string;
   distributor: string;
   carbonCertificate?: string;
-}): StellarService {
+}, lifecycleStore?: TransactionLifecycleStore): StellarService {
   return new StellarService({
     network: {
       networkPassphrase: Networks.PUBLIC,
@@ -1112,6 +1391,7 @@ export function createMainnetService(contracts: {
       horizonUrl: 'https://horizon.stellar.org',
     },
     contracts,
+    lifecycleStore,
   });
 }
 

@@ -94,6 +94,150 @@ export const listCampaignsQuerySchema = paginationSchema;
 export const listSubscriptionsQuerySchema = paginationSchema;
 
 /* -------------------------------------------------------------------------- */
+/* Sponsor portfolio (issue #238)                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Reconciliation status of a portfolio line item, comparing committed,
+ * matched, and settled value against authoritative records.
+ *
+ * - `reconciled`: committed, matched, and settled values agree.
+ * - `pending`: authoritative records not yet available; retry later.
+ * - `mismatch`: values disagree with authoritative records; needs review.
+ * - `unavailable`: authoritative source could not be reached.
+ */
+export const reconciliationStatusSchema = z.enum([
+  'reconciled',
+  'pending',
+  'mismatch',
+  'unavailable',
+]);
+
+export type ReconciliationStatus = z.infer<typeof reconciliationStatusSchema>;
+
+/** Source reference pointing at an authoritative record. */
+export const sourceReferenceSchema = z
+  .object({
+    source: nonEmptyString.max(100),
+    reference: nonEmptyString.max(200),
+    url: urlSchema.optional(),
+  })
+  .strict();
+
+export type SourceReference = z.infer<typeof sourceReferenceSchema>;
+
+/**
+ * Query params for `GET /api/sponsors/:sponsorId/portfolio`.
+ *
+ * `campaignIds` filters to specific supported campaigns; `status` filters by
+ * reconciliation status. Both are optional and additive.
+ */
+export const sponsorPortfolioQuerySchema = z
+  .object({
+    cursor: nonEmptyString.optional(),
+    limit: z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_PAGE_LIMIT)
+      .default(DEFAULT_PAGE_LIMIT),
+    campaignIds: z
+      .union([
+        z.array(campaignIdSchema),
+        z
+          .string()
+          .trim()
+          .min(1)
+          .transform((value) =>
+            value
+              .split(',')
+              .map((part) => part.trim())
+              .filter((part) => part.length > 0),
+          )
+          .pipe(z.array(campaignIdSchema).min(1)),
+      ])
+      .optional(),
+    status: reconciliationStatusSchema.optional(),
+  })
+  .strict();
+
+export type SponsorPortfolioQueryInput = z.infer<
+  typeof sponsorPortfolioQuerySchema
+>;
+
+/* -------------------------------------------------------------------------- */
+/* Transaction confirmation timeline (issue #239)                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Lifecycle states of a transaction, ordered from wallet approval through
+ * settlement. Clients render these as a timeline and use them to recover
+ * after a reload.
+ *
+ * - `awaiting_approval`: wallet approval requested, not yet granted.
+ * - `approved`: wallet approved; not yet submitted.
+ * - `submitted`: submitted to the network; awaiting ledger confirmation.
+ * - `confirmed`: included in a ledger.
+ * - `settled`: final settlement recorded.
+ * - `failed`: terminal failure (approval rejected, submission error, etc.).
+ */
+export const transactionLifecycleStateSchema = z.enum([
+  'awaiting_approval',
+  'approved',
+  'submitted',
+  'confirmed',
+  'settled',
+  'failed',
+]);
+
+export type TransactionLifecycleState = z.infer<
+  typeof transactionLifecycleStateSchema
+>;
+
+/** A single timeline entry for a transaction lifecycle transition. */
+export const transactionTimelineEventSchema = z
+  .object({
+    state: transactionLifecycleStateSchema,
+    at: isoDateTimeSchema,
+    ledger: z.coerce.number().int().nonnegative().optional(),
+    txHash: nonEmptyString.max(200).optional(),
+    error: nonEmptyString.max(500).optional(),
+  })
+  .strict();
+
+export type TransactionTimelineEvent = z.infer<
+  typeof transactionTimelineEventSchema
+>;
+
+/** Path params for transaction timeline endpoints. */
+export const transactionIdParamsSchema = z
+  .object({
+    transactionId: nonEmptyString.max(200),
+  })
+  .strict();
+
+export type TransactionIdParams = z.infer<typeof transactionIdParamsSchema>;
+
+/**
+ * Query params for `GET /api/transactions/:transactionId/timeline`.
+ *
+ * `includeEvents` defaults to true; set to `false` to fetch only the current
+ * state (useful for lightweight polling after a reload).
+ */
+export const transactionTimelineQuerySchema = z
+  .object({
+    includeEvents: z
+      .enum(['true', 'false'])
+      .transform((value) => value === 'true')
+      .default('true'),
+  })
+  .strict();
+
+export type TransactionTimelineQueryInput = z.infer<
+  typeof transactionTimelineQuerySchema
+>;
+
+/* -------------------------------------------------------------------------- */
 /* Webhook subscriptions                                                      */
 /* -------------------------------------------------------------------------- */
 

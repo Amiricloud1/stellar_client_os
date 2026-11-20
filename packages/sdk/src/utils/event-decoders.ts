@@ -48,14 +48,16 @@ export type TimelockDecodedEvent =
 export type CampaignFundingDecodedEvent =
   | BaseDecodedEvent<'campaign-funding', 'CampaignCreated', { campaignId: bigint; owner: string; goal?: bigint }>
   | BaseDecodedEvent<'campaign-funding', 'DonationReceived', { campaignId: bigint; donor: string; amount: bigint }>
-  | BaseDecodedEvent<'campaign-funding', 'CampaignFinalized', { campaignId: bigint; success: boolean }>;
+  | BaseDecodedEvent<'campaign-funding', 'CampaignFinalized', { campaignId: bigint; success: boolean }>
+  | BaseDecodedEvent<'campaign-funding', 'CampaignMatched', { campaignId: bigint; sponsor: string; amount: bigint }>;
 
 export type CampaignDiversityDecodedEvent =
   | BaseDecodedEvent<'campaign-diversity', 'DiversityScored', { campaignId: bigint; score: number }>;
 
 export type SponsorCrowdfundingDecodedEvent =
   | BaseDecodedEvent<'sponsor-crowdfunding', 'Pledged', { campaignId: bigint; sponsor: string; amount: bigint }>
-  | BaseDecodedEvent<'sponsor-crowdfunding', 'Settled', { campaignId: bigint; totalRaised: bigint }>;
+  | BaseDecodedEvent<'sponsor-crowdfunding', 'Settled', { campaignId: bigint; totalRaised: bigint }>
+  | BaseDecodedEvent<'sponsor-crowdfunding', 'SponsorshipSettled', { campaignId: bigint; sponsor: string; committed: bigint; matched: bigint; settled: bigint }>;
 
 export type UnknownDecodedEvent = BaseDecodedEvent<'unknown', 'Unknown', { rawValue: unknown; reason: string }>;
 
@@ -305,6 +307,22 @@ export function decodeContractEvent(raw: RawEventInput): DecodedContractEvent {
       }
     }
 
+    if (topicName === 'campaign_matched' || topicName === 'CampaignMatched') {
+      const v = (val as any) || {};
+      const campaignId = toBigInt(v.campaign_id ?? v.campaignId);
+      const sponsor = toString(v.sponsor);
+      const amount = toBigInt(v.amount);
+      if (campaignId !== null && sponsor && amount !== null) {
+        return {
+          family: 'campaign-funding',
+          type: 'CampaignMatched',
+          contractId,
+          rawTopic: topic,
+          payload: { campaignId, sponsor, amount },
+        };
+      }
+    }
+
     // 5. Campaign Diversity Family
     if (topicName === 'diversity_scored' || topicName === 'DiversityScored') {
       const v = (val as any) || {};
@@ -322,6 +340,30 @@ export function decodeContractEvent(raw: RawEventInput): DecodedContractEvent {
     }
 
     // 6. Sponsor Crowdfunding Family
+    if (topicName === 'sponsorship_settled' || topicName === 'SponsorshipSettled') {
+      const v = (val as any) || {};
+      const campaignId = toBigInt(v.campaign_id ?? v.campaignId);
+      const sponsor = toString(v.sponsor);
+      const committed = toBigInt(v.committed);
+      const matched = toBigInt(v.matched);
+      const settled = toBigInt(v.settled);
+      if (
+        campaignId !== null &&
+        sponsor &&
+        committed !== null &&
+        matched !== null &&
+        settled !== null
+      ) {
+        return {
+          family: 'sponsor-crowdfunding',
+          type: 'SponsorshipSettled',
+          contractId,
+          rawTopic: topic,
+          payload: { campaignId, sponsor, committed, matched, settled },
+        };
+      }
+    }
+
     if (topicName === 'pledge' || topicName === 'Pledged') {
       const v = (val as any) || {};
       const campaignId = toBigInt(v.campaign_id ?? v.campaignId);
@@ -334,6 +376,21 @@ export function decodeContractEvent(raw: RawEventInput): DecodedContractEvent {
           contractId,
           rawTopic: topic,
           payload: { campaignId, sponsor, amount },
+        };
+      }
+    }
+
+    if (topicName === 'settled' || topicName === 'Settled') {
+      const v = (val as any) || {};
+      const campaignId = toBigInt(v.campaign_id ?? v.campaignId);
+      const totalRaised = toBigInt(v.total_raised ?? v.totalRaised);
+      if (campaignId !== null && totalRaised !== null) {
+        return {
+          family: 'sponsor-crowdfunding',
+          type: 'Settled',
+          contractId,
+          rawTopic: topic,
+          payload: { campaignId, totalRaised },
         };
       }
     }

@@ -2,11 +2,32 @@
 
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { Sponsor, SponsorTier, INITIAL_MOCK_SPONSORS, calculateSponsorTier } from "@/types/sponsor";
+import {
+  SponsorPortfolio,
+  SponsorPortfolioEntry,
+  PortfolioReconciliationStatus,
+  PortfolioSourceReference,
+  buildSponsorPortfolio,
+  EMPTY_SPONSOR_PORTFOLIO,
+} from "@/types/sponsor-portfolio";
 
 export interface UseSponsorWallOptions {
   campaignId: string;
   enableLiveUpdates?: boolean;
   pollIntervalMs?: number;
+  /**
+   * Authoritative portfolio records fetched from the portfolio API.
+   * When omitted, the hook falls back to the local mock sponsors so the
+   * wall keeps rendering (with an explicit `unavailable` reconciliation
+   * status) instead of silently showing stale numbers.
+   */
+  portfolio?: SponsorPortfolio | null;
+  /** Error surfaced by the portfolio fetch, if any. */
+  portfolioError?: Error | null;
+  /** Whether the portfolio fetch is currently in flight. */
+  isPortfolioLoading?: boolean;
+  /** Retry the authoritative portfolio fetch. */
+  onRetryPortfolio?: () => void;
 }
 
 const SAMPLE_NAMES = [
@@ -18,6 +39,10 @@ export function useSponsorWall({
   campaignId,
   enableLiveUpdates = true,
   pollIntervalMs = 6000,
+  portfolio,
+  portfolioError = null,
+  isPortfolioLoading = false,
+  onRetryPortfolio,
 }: UseSponsorWallOptions) {
   const [sponsors, setSponsors] = useState<Sponsor[]>(INITIAL_MOCK_SPONSORS);
   const [searchQuery, setSearchQuery] = useState("");
@@ -112,6 +137,64 @@ export function useSponsorWall({
     };
   }, [sponsors]);
 
+  /**
+   * Authoritative portfolio. When the caller supplies a portfolio we use it
+   * verbatim (it is the source of truth). Otherwise we derive a portfolio
+   * from the local mock sponsors and mark it as `unavailable` so the UI can
+   * surface that committed/matched/settled values are not reconciled.
+   */
+  const resolvedPortfolio = useMemo<SponsorPortfolio>(() => {
+    if (portfolio) return portfolio;
+    return buildSponsorPortfolio({
+      campaignId,
+      entries: sponsors.map((s) => ({
+        sponsorId: s.id,
+        name: s.name,
+        address: s.address,
+        token: s.token,
+        committedAmount: s.amount,
+        matchedAmount: "0",
+        settledAmount: "0",
+        sponsoredAt: s.sponsoredAt,
+        sources: [],
+      })),
+      reconciliationStatus: "unavailable",
+      reconciliationMessage:
+        "Portfolio records are not available; showing local entries only.",
+    });
+  }, [portfolio, campaignId, sponsors]);
+
+  const portfolioEntries = useMemo<SponsorPortfolioEntry[]>(
+    () => resolvedPortfolio.entries,
+    [resolvedPortfolio]
+  );
+
+  const reconciliationStatus: PortfolioReconciliationStatus = useMemo(() => {
+    if (portfolioError) return "error";
+    if (isPortfolioLoading) return "pending";
+    return resolvedPortfolio.reconciliationStatus;
+  }, [portfolioError, isPortfolioLoading, resolvedPortfolio.reconciliationStatus]);
+
+  const sourceReferences = useMemo<PortfolioSourceReference[]>(
+    () => resolvedPortfolio.sourceReferences,
+    [resolvedPortfolio]
+  );
+
+  const portfolioTotals = useMemo(
+    () => ({
+      committed: resolvedPortfolio.totals.committed,
+      matched: resolvedPortfolio.totals.matched,
+      settled: resolvedPortfolio.totals.settled,
+      currency: resolvedPortfolio.totals.currency,
+      entryCount: resolvedPortfolio.totals.entryCount,
+    }),
+    [resolvedPortfolio]
+  );
+
+  const retryPortfolio = useCallback(() => {
+    onRetryPortfolio?.();
+  }, [onRetryPortfolio]);
+
   return {
     sponsors: filteredSponsors,
     allSponsors: sponsors,
@@ -126,5 +209,16 @@ export function useSponsorWall({
     setIsLiveActive,
     latestNewSponsor,
     addSponsor,
+    // Portfolio (committed / matched / settled) + reconciliation surface
+    portfolio: resolvedPortfolio,
+    portfolioEntries,
+    portfolioTotals,
+    reconciliationStatus,
+    reconciliationMessage: portfolioError
+      ? portfolioError.message
+      : resolvedPortfolio.reconciliationMessage,
+    sourceReferences,
+    isPortfolioLoading,
+    retryPortfolio,
   };
 }

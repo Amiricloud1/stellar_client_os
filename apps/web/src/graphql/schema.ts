@@ -8,6 +8,20 @@
  * Query safety (issue #60): the schema is served with depth-limit and
  * complexity-limit validation rules plus a per-request execution timeout.
  * See `./limits` for the exported rules, budgets, and timeout helper.
+ *
+ * Sponsor portfolio (issue #238): `sponsorPortfolio` reconciles committed,
+ * matched, and settled value for a sponsor across supported campaigns against
+ * authoritative records. Every total carries a `SourceReference` (ledger,
+ * transaction hash, or indexer record) and a `ReconciliationStatus` so callers
+ * can distinguish reconciled, pending, and mismatched figures. All additions
+ * are new types and a new Query field, so existing queries are unaffected.
+ *
+ * Transaction timeline (issue #239): `transactionTimeline` exposes the ordered
+ * lifecycle of a transaction — wallet approval, submission, ledger
+ * confirmation, and settlement — as `TransactionLifecycleEvent`s. The timeline
+ * is keyed by a stable `transactionId` so clients can re-fetch it after a
+ * reload and resume from `lastEventId`. New types and a new Query field only;
+ * no breaking changes to existing fields.
  */
 
 import type { GraphQLSchema } from 'graphql';
@@ -538,6 +552,155 @@ export const typeDefs = /* GraphQL */`
   }
 
   """
+  Reconciliation state of a portfolio total against authoritative records
+  (issue #238). `PENDING` means the figure is not yet confirmed on-ledger;
+  `MISMATCH` means the indexed figure disagrees with the authoritative record
+  and operator review is required.
+  """
+  enum ReconciliationStatus {
+    RECONCILED
+    PENDING
+    MISMATCH
+  }
+
+  """Kind of authoritative record a portfolio figure is derived from."""
+  enum SourceReferenceKind {
+    LEDGER
+    TRANSACTION
+    INDEXER
+    GRANT_PROGRAM
+  }
+
+  """
+  A pointer to the authoritative record backing a portfolio figure
+  (issue #238). Clients can use these to independently verify totals.
+  """
+  type SourceReference {
+    """Kind of authoritative record."""
+    kind: SourceReferenceKind!
+    """Ledger sequence, transaction hash, or indexer record id."""
+    reference: String!
+    """Network the record lives on."""
+    network: Network!
+    """Unix timestamp (seconds) at which the record was observed."""
+    observedAt: Int!
+  }
+
+  """
+  A reconciled monetary total with its authoritative source references
+  (issue #238). Amounts are strings in the asset's stroops.
+  """
+  type ReconciledAmount {
+    """Total amount as a string (stroops)."""
+    amount: String!
+    """Asset (token) the amount is denominated in."""
+    asset: String!
+    """Reconciliation state of this total."""
+    status: ReconciliationStatus!
+    """Authoritative records backing this total."""
+    sources: [SourceReference!]!
+    """Unix timestamp (seconds) of the last reconciliation run."""
+    reconciledAt: Int
+  }
+
+  """Per-campaign contribution within a sponsor portfolio (issue #238)."""
+  type SponsorCampaignPosition {
+    """Campaign the sponsor contributed to."""
+    campaignId: ID!
+    """Campaign name for display."""
+    campaignName: String!
+    """Amount committed by the sponsor (stroops, as string)."""
+    committed: ReconciledAmount!
+    """Amount matched by grant programs (stroops, as string)."""
+    matched: ReconciledAmount!
+    """Amount settled on-ledger (stroops, as string)."""
+    settled: ReconciledAmount!
+  }
+
+  """
+  A sponsor's portfolio across supported campaigns (issue #238): committed,
+  matched, and settled value reconciled against authoritative records.
+  """
+  type SponsorPortfolio {
+    """The sponsor's Stellar address."""
+    address: String!
+    """Network the portfolio was computed for."""
+    network: Network!
+    """Aggregate committed value across all campaigns."""
+    committed: ReconciledAmount!
+    """Aggregate matched value across all campaigns."""
+    matched: ReconciledAmount!
+    """Aggregate settled value across all campaigns."""
+    settled: ReconciledAmount!
+    """Overall reconciliation state of the portfolio."""
+    status: ReconciliationStatus!
+    """Per-campaign positions included in the portfolio."""
+    positions: [SponsorCampaignPosition!]!
+    """Unix timestamp (seconds) when the portfolio was computed."""
+    generatedAt: Int!
+  }
+
+  """
+  Stage of a transaction's lifecycle (issue #239). Stages are reported in the
+  order: WALLET_APPROVAL, SUBMITTED, LEDGER_CONFIRMED, SETTLED.
+  """
+  enum TransactionStage {
+    WALLET_APPROVAL
+    SUBMITTED
+    LEDGER_CONFIRMED
+    SETTLED
+  }
+
+  """Outcome of a single lifecycle stage (issue #239)."""
+  enum TransactionEventStatus {
+    PENDING
+    SUCCEEDED
+    FAILED
+  }
+
+  """
+  A single event in a transaction's confirmation timeline (issue #239).
+  """
+  type TransactionLifecycleEvent {
+    """Stable identifier for this event (used for resume-after-reload)."""
+    id: ID!
+    """Lifecycle stage this event represents."""
+    stage: TransactionStage!
+    """Outcome of the stage."""
+    status: TransactionEventStatus!
+    """Human-readable description of the stage outcome."""
+    message: String
+    """Ledger sequence, when the stage is ledger-bound."""
+    ledger: Int
+    """Transaction hash, when known."""
+    txHash: String
+    """Unix timestamp (seconds) at which the event occurred."""
+    occurredAt: Int!
+  }
+
+  """
+  Ordered confirmation timeline for a transaction (issue #239). Keyed by a
+  stable `transactionId` so clients can re-fetch after a reload and resume
+  from `lastEventId`.
+  """
+  type TransactionTimeline {
+    """Stable identifier for the transaction."""
+    transactionId: ID!
+    """Network the transaction was submitted to."""
+    network: Network!
+    """Current (latest) stage reached by the transaction."""
+    currentStage: TransactionStage!
+    """Overall status of the transaction."""
+    status: TransactionEventStatus!
+    """Ordered lifecycle events (oldest first)."""
+    events: [TransactionLifecycleEvent!]!
+    """Whether the transaction has reached a terminal state."""
+    isFinal: Boolean!
+    """Unix timestamp (seconds) when the timeline was last updated."""
+    updatedAt: Int!
+  }
+
+  """
   A page of campaigns plus shared pagination metadata (issue #59).
   """
   type CampaignPage {
@@ -709,6 +872,31 @@ export const typeDefs = /* GraphQL */`
     The grant allocations awarded to a campaign across all programs.
     """
     campaignGrantAllocations(campaignId: ID!): [GrantAllocation!]!
+
+    """
+    A sponsor's portfolio across supported campaigns (issue #238): committed,
+    matched, and settled value reconciled against authoritative records, with
+    per-campaign positions and source references.
+
+    Auth policy: privileged (a sponsor may only read their own portfolio;
+    requesting another address returns NOT_FOUND).
+    """
+    sponsorPortfolio(address: String!, network: Network): SponsorPortfolio!
+
+    """
+    The ordered confirmation timeline for a transaction (issue #239):
+    wallet approval, submission, ledger confirmation, and settlement.
+
+    Keyed by a stable `transactionId` so clients can re-fetch after a reload
+    and resume from `lastEventId`. Returns null when the transaction is
+    unknown to this network.
+    """
+    transactionTimeline(
+      transactionId: ID!
+      """Resume from the event after this id (optional)."""
+      lastEventId: ID
+      network: Network
+    ): TransactionTimeline
   }
 
   """
