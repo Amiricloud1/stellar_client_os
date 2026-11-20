@@ -239,12 +239,162 @@ CREATE TRIGGER trg_webhook_delivery_attempts_no_delete
     FOR EACH ROW
     EXECUTE FUNCTION webhook_delivery_attempts_append_only();
 
+-- ---------------------------------------------------------------------------
+-- Campaign export jobs: durable asynchronous export state
+-- ---------------------------------------------------------------------------
+--
+-- Large campaign exports run as asynchronous jobs. This table is the durable
+-- source of truth for job status, bounded progress, retry accounting, artifact
+-- location, and expiry. The API exposes only bounded status/progress fields
+-- and access-controlled artifact retrieval; the artifact itself lives in
+-- object storage under `artifact_key`.
+
+CREATE TABLE IF NOT EXISTS campaign_export_jobs (
+    id                TEXT PRIMARY KEY,
+    campaign_id       TEXT NOT NULL,
+    requester_id      TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN (
+            'queued',
+            'running',
+            'succeeded',
+            'failed',
+            'expired',
+            'cancelled'
+        )),
+    -- Bounded progress in [0, 100]; NULL until the job starts reporting.
+    progress          SMALLINT
+        CHECK (progress IS NULL OR (progress >= 0 AND progress <= 100)),
+    attempts          INTEGER NOT NULL DEFAULT 0
+        CHECK (attempts >= 0),
+    max_attempts      INTEGER NOT NULL DEFAULT 3
+        CHECK (max_attempts >= 1),
+    -- Object-storage key for the produced artifact; NULL until succeeded.
+    artifact_key      TEXT,
+    -- Operator/user-visible failure reason; NULL unless status = 'failed'.
+    error             TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    -- Jobs expire so artifacts can be reclaimed; NULL means no expiry set yet.
+    expires_at        TIMESTAMPTZ,
+    CONSTRAINT campaign_export_jobs_attempts_within_max
+        CHECK (attempts <= max_attempts)
+);
+
+-- Read pattern: a requester lists their own jobs, newest first. Also enforces
+-- the authorization boundary at the storage layer (requester_id is required).
+CREATE INDEX IF NOT EXISTS idx_campaign_export_jobs_requester_created
+    ON campaign_export_jobs (requester_id, created_at DESC);
+
+-- Read pattern: operators list jobs by status for monitoring/retry.
+CREATE INDEX IF NOT EXISTS idx_campaign_export_jobs_status_created
+    ON campaign_export_jobs (status, created_at DESC);
+
+-- Read pattern: expiry sweeper scans jobs whose expiry has passed.
+CREATE INDEX IF NOT EXISTS idx_campaign_export_jobs_expires_at
+    ON campaign_export_jobs (expires_at)
+    WHERE expires_at IS NOT NULL;
+
+-- Read pattern: list jobs for a campaign.
+CREATE INDEX IF NOT EXISTS idx_campaign_export_jobs_campaign_id
+    ON campaign_export_jobs (campaign_id, created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Webhook destination circuit breakers: per-destination failure isolation
+-- ---------------------------------------------------------------------------
+--
+-- One failing subscriber must not starve healthy destinations. Each delivery
+-- destination has at most one breaker row. `state` is the authoritative
+-- breaker state; `opened_at`/`next_probe_at` bound the open period and the
+-- half-open probe schedule.
+
+CREATE TABLE IF NOT EXISTS webhook_destination_breakers (
+    destination           TEXT PRIMARY KEY,
+    state                 TEXT NOT NULL DEFAULT 'closed'
+        CHECK (state IN ('closed', 'open', 'half_open')),
+    consecutive_failures  INTEGER NOT NULL DEFAULT 0
+        CHECK (consecutive_failures >= 0),
+    opened_at             TIMESTAMPTZ,
+    next_probe_at         TIMESTAMPTZ,
+    CONSTRAINT webhook_destination_breakers_open_requires_opened_at
+        CHECK (state <> 'open' OR opened_at IS NOT NULL)
+);
+
+-- Read pattern: the dispatcher selects destinations eligible for a probe.
+CREATE INDEX IF NOT EXISTS idx_webhook_destination_breakers_state_next_probe
+    ON webhook_destination_breakers (state, next_probe_at NULLS FIRST);
+
+-- ---------------------------------------------------------------------------
+-- Webhook redelivery audit: append-only operator redelivery log
+-- ---------------------------------------------------------------------------
+--
+-- Manual redelivery preserves the original event and signature inputs while
+-- recording each authorized attempt. Rows are append-only; the original
+-- signature version/timestamp are captured so the redelivered payload is
+-- byte-identical to the original delivery.
+
+CREATE TABLE IF NOT EXISTS webhook_redelivery_audit (
+    id                          BIGSERIAL PRIMARY KEY,
+    subscription_id             TEXT NOT NULL
+        REFERENCES webhook_subscriptions (id) ON DELETE CASCADE,
+    event_id                    TEXT NOT NULL,
+    operator_id                 TEXT NOT NULL,
+    original_signature_version  TEXT NOT NULL,
+    original_signature_timestamp TIMESTAMPTZ NOT NULL,
+    attempt_number              INTEGER NOT NULL CHECK (attempt_number >= 1),
+    outcome                     TEXT NOT NULL
+        CHECK (outcome IN ('success', 'failure', 'timeout')),
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+-- Read pattern: per-subscription redelivery history, newest first.
+CREATE INDEX IF NOT EXISTS idx_webhook_redelivery_audit_subscription_created
+    ON webhook_redelivery_audit (subscription_id, created_at DESC);
+
+-- Read pattern: per-event redelivery history.
+CREATE INDEX IF NOT EXISTS idx_webhook_redelivery_audit_event_id
+    ON webhook_redelivery_audit (event_id, created_at DESC);
+
+-- Enforce append-only semantics: reject UPDATE and DELETE on audit rows.
+CREATE OR REPLACE FUNCTION webhook_redelivery_audit_append_only()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'webhook_redelivery_audit is append-only';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_webhook_redelivery_audit_no_update
+    ON webhook_redelivery_audit;
+CREATE TRIGGER trg_webhook_redelivery_audit_no_update
+    BEFORE UPDATE ON webhook_redelivery_audit
+    FOR EACH ROW
+    EXECUTE FUNCTION webhook_redelivery_audit_append_only();
+
+DROP TRIGGER IF EXISTS trg_webhook_redelivery_audit_no_delete
+    ON webhook_redelivery_audit;
+CREATE TRIGGER trg_webhook_redelivery_audit_no_delete
+    BEFORE DELETE ON webhook_redelivery_audit
+    FOR EACH ROW
+    EXECUTE FUNCTION webhook_redelivery_audit_append_only();
+
 COMMIT;
 
 -- ---------------------------------------------------------------------------
 -- DOWN (rollback) — run manually if this migration must be reverted.
 -- ---------------------------------------------------------------------------
 -- BEGIN;
+-- DROP TRIGGER IF EXISTS trg_webhook_redelivery_audit_no_delete
+--     ON webhook_redelivery_audit;
+-- DROP TRIGGER IF EXISTS trg_webhook_redelivery_audit_no_update
+--     ON webhook_redelivery_audit;
+-- DROP FUNCTION IF EXISTS webhook_redelivery_audit_append_only();
+-- DROP TABLE IF EXISTS webhook_redelivery_audit;
+-- DROP INDEX IF EXISTS idx_webhook_destination_breakers_state_next_probe;
+-- DROP TABLE IF EXISTS webhook_destination_breakers;
+-- DROP INDEX IF EXISTS idx_campaign_export_jobs_campaign_id;
+-- DROP INDEX IF EXISTS idx_campaign_export_jobs_expires_at;
+-- DROP INDEX IF EXISTS idx_campaign_export_jobs_status_created;
+-- DROP INDEX IF EXISTS idx_campaign_export_jobs_requester_created;
+-- DROP TABLE IF EXISTS campaign_export_jobs;
 -- DROP TRIGGER IF EXISTS trg_webhook_delivery_attempts_no_delete
 --     ON webhook_delivery_attempts;
 -- DROP TRIGGER IF EXISTS trg_webhook_delivery_attempts_no_update

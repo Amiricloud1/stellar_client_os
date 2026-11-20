@@ -778,9 +778,127 @@ export const typeDefs = /* GraphQL */`
     secret: String!
   }
 
+  """
+  Lifecycle status of an asynchronous campaign export job (issue #228).
+
+  Terminal states are COMPLETED, FAILED, and EXPIRED. A job that has not yet
+  started is QUEUED; RUNNING jobs report progress. FAILED jobs may be retried
+  while attempts remain and the job has not expired.
+  """
+  enum ExportJobStatus {
+    QUEUED
+    RUNNING
+    COMPLETED
+    FAILED
+    EXPIRED
+  }
+
+  """
+  A bounded, access-controlled asynchronous campaign export job (issue #228).
+
+  Auth policy: privileged (owner only; non-owners receive NOT_FOUND). The
+  artifact URL is only populated once the job reaches COMPLETED and has not
+  expired.
+  """
+  type ExportJob {
+    """Unique job identifier."""
+    id: ID!
+    """The campaign being exported."""
+    campaignId: ID!
+    """Owning account identifier (never another account's id)."""
+    ownerId: ID!
+    """Current lifecycle status."""
+    status: ExportJobStatus!
+    """Progress percentage (0–100)."""
+    progress: Int!
+    """Number of attempts made so far (including the initial run)."""
+    attempts: Int!
+    """Maximum number of attempts permitted before the job is abandoned."""
+    maxAttempts: Int!
+    """Unix timestamp (seconds) when the job was created."""
+    createdAt: Int!
+    """Unix timestamp (seconds) when the job started running, if any."""
+    startedAt: Int
+    """Unix timestamp (seconds) when the job reached a terminal state, if any."""
+    completedAt: Int
+    """Unix timestamp (seconds) after which the artifact is no longer served."""
+    expiresAt: Int!
+    """
+    Access-controlled download URL for the completed artifact. Null until the
+    job is COMPLETED and non-null once available; never served after expiry.
+    """
+    artifactUrl: String
+    """Human-readable failure reason when status is FAILED or EXPIRED."""
+    error: String
+  }
+
+  """
+  A single item in a bounded campaign discovery batch (issue #231). Exactly
+  one of `campaign` or `error` is populated per item.
+  """
+  type CampaignBatchItem {
+    """The requested campaign id."""
+    id: ID!
+    """The campaign when found and authorized; null on error."""
+    campaign: Campaign
+    """Stable machine-readable error code when the item could not be returned."""
+    errorCode: String
+    """Human-readable error message when the item could not be returned."""
+    errorMessage: String
+  }
+
+  """
+  Result of a bounded batch campaign discovery read (issue #231).
+
+  Partial failures are reported per item rather than failing the whole batch.
+  The number of requested ids is capped; over-cap requests are rejected.
+  """
+  type CampaignBatchResult {
+    """Per-id results, in the same order as the requested ids."""
+    items: [CampaignBatchItem!]!
+    """Number of ids that resolved successfully."""
+    successCount: Int!
+    """Number of ids that failed (not found, unauthorized, or invalid)."""
+    errorCount: Int!
+  }
+
+  """
+  An audited manual webhook redelivery attempt (issue #230).
+
+  Preserves the original event payload and signature inputs while recording
+  who triggered the attempt and why.
+  """
+  type WebhookRedelivery {
+    """Unique redelivery attempt identifier."""
+    id: ID!
+    """The subscription the event belongs to."""
+    subscriptionId: ID!
+    """The original event identifier being redelivered."""
+    eventId: ID!
+    """The account that authorized the redelivery."""
+    requestedBy: String!
+    """Operator-supplied reason for the redelivery."""
+    reason: String!
+    """The original event payload, preserved verbatim."""
+    payload: String!
+    """The original signature inputs, preserved verbatim."""
+    signature: String!
+    """Unix timestamp (seconds) of the original delivery attempt."""
+    originalDeliveredAt: Int
+    """Unix timestamp (seconds) when the redelivery was requested."""
+    requestedAt: Int!
+    """Delivery status of this redelivery attempt."""
+    status: String!
+    """Number of delivery attempts made for this redelivery."""
+    attempts: Int!
+    """Human-readable failure reason, if the redelivery failed."""
+    error: String
+  }
+
   type Mutation {
     """
     Clones an indexed stream so a creator can start from an existing campaign.
+=======
 
     Auth policy: authenticated (requires a valid account session).
     """
@@ -814,6 +932,28 @@ export const typeDefs = /* GraphQL */`
     Auth policy: privileged (owner only; non-owners receive NOT_FOUND).
     """
     revokeWebhookSubscription(id: ID!): WebhookSubscription!
+
+    """
+    Enqueues an asynchronous export job for a campaign owned by the
+    authenticated account (issue #228). Returns the bounded job record; poll
+    `campaignExportJob` for status and progress.
+
+    Auth policy: privileged (owner only; non-owners receive NOT_FOUND).
+    """
+    enqueueCampaignExport(campaignId: ID!): ExportJob!
+
+    """
+    Requests an audited manual redelivery of a webhook event (issue #230).
+    The original event payload and signature inputs are preserved; each
+    authorized attempt is recorded.
+
+    Auth policy: privileged (owner only; non-owners receive NOT_FOUND).
+    """
+    redeliverWebhook(
+      subscriptionId: ID!
+      eventId: ID!
+      reason: String!
+    ): WebhookRedelivery!
   }
 
   extend type Query {
@@ -824,6 +964,24 @@ export const typeDefs = /* GraphQL */`
     Auth policy: privileged (returns only the caller's own subscriptions).
     """
     webhookSubscriptions: [WebhookSubscription!]!
+  }
+
+  extend type Query {
+    """
+    Returns the status, progress, expiry, and retry state of an asynchronous
+    campaign export job (issue #228).
+
+    Auth policy: privileged (owner only; non-owners receive NOT_FOUND).
+    """
+    campaignExportJob(id: ID!): ExportJob
+
+    """
+    Bounded batch read of campaigns by id for discovery (issue #231).
+
+    The number of ids is capped; over-cap requests are rejected. Missing or
+    unauthorized ids are reported per item rather than failing the batch.
+    """
+    campaignDiscoveryBatch(ids: [ID!]!): CampaignBatchResult!
   }
 `;
 

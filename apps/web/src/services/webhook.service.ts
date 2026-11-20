@@ -13,6 +13,7 @@ import {
   sanitizeString,
   type TraceContext,
 } from '@/lib/tracing';
+import { ConcurrencyLimiter } from '@/lib/concurrency';
 
 /** Current signature scheme version. Included in the signed canonical string. */
 export const WEBHOOK_SIGNATURE_VERSION = 'v1';
@@ -28,6 +29,50 @@ export const DEFAULT_WEBHOOK_BASE_DELAY_MS = 1000;
 
 /** Maximum backoff delay (ms) so retries stay bounded even with large retry counts. */
 export const MAX_WEBHOOK_BACKOFF_MS = 60 * 1000;
+
+/** Default per-request HTTP timeout (ms) for a single delivery attempt. */
+export const DEFAULT_WEBHOOK_REQUEST_TIMEOUT_MS = 10 * 1000;
+
+/** Default maximum number of concurrent in-flight delivery attempts. */
+export const DEFAULT_WEBHOOK_MAX_CONCURRENCY = 20;
+
+/** Default consecutive failures before a destination's breaker opens. */
+export const DEFAULT_WEBHOOK_BREAKER_FAILURE_THRESHOLD = 5;
+
+/** Default time (ms) an open breaker waits before allowing a probe attempt. */
+export const DEFAULT_WEBHOOK_BREAKER_COOLDOWN_MS = 30 * 1000;
+
+/** Explicit breaker states surfaced to operators via {@link WebhookService.getDestinationHealth}. */
+export type WebhookBreakerState = 'closed' | 'open' | 'half_open';
+
+/** Operator-facing health snapshot for a single destination. */
+export interface WebhookDestinationHealth {
+  subscriptionId: string;
+  url: string;
+  state: WebhookBreakerState;
+  consecutiveFailures: number;
+  /** Epoch ms when the breaker opened, or null when closed. */
+  openedAt: number | null;
+  /** Epoch ms when the next probe is allowed while open, or null. */
+  nextProbeAt: number | null;
+  /** Epoch ms of the last recorded success, or null. */
+  lastSuccessAt: number | null;
+  /** Epoch ms of the last recorded failure, or null. */
+  lastFailureAt: number | null;
+  /** Whether a delivery is currently in flight to this destination. */
+  inFlight: boolean;
+}
+
+interface BreakerRecord {
+  state: WebhookBreakerState;
+  consecutiveFailures: number;
+  openedAt: number | null;
+  nextProbeAt: number | null;
+  lastSuccessAt: number | null;
+  lastFailureAt: number | null;
+  inFlight: number;
+  url?: string;
+}
 
 /**
  * Build the versioned canonical string that is signed.
@@ -235,6 +280,16 @@ export interface WebhookServiceOptions {
   maxBackoff?: number;
   /** Replay window (ms) advertised to subscribers. Defaults to 5 minutes. */
   replayWindowMs?: number;
+  /** Per-request HTTP timeout (ms). Defaults to {@link DEFAULT_WEBHOOK_REQUEST_TIMEOUT_MS}. */
+  requestTimeoutMs?: number;
+  /** Maximum concurrent in-flight delivery attempts. Defaults to {@link DEFAULT_WEBHOOK_MAX_CONCURRENCY}. */
+  maxConcurrency?: number;
+  /** Consecutive failures before a destination breaker opens. Defaults to 5. */
+  breakerFailureThreshold?: number;
+  /** Cooldown (ms) before an open breaker allows a probe. Defaults to 30s. */
+  breakerCooldownMs?: number;
+  /** Injectable clock for deterministic breaker tests. Defaults to `Date.now`. */
+  now?: () => number;
 }
 
 interface DedupeState {
@@ -286,6 +341,12 @@ export class WebhookService {
   private readonly subscriptionsPath: string;
   private readonly deadLetterPath: string;
   private readonly deduplicationPath: string;
+  private readonly requestTimeoutMs: number;
+  private readonly breakerFailureThreshold: number;
+  private readonly breakerCooldownMs: number;
+  private readonly now: () => number;
+  private readonly limiter: ConcurrencyLimiter;
+  private readonly breakers = new Map<string, BreakerRecord>();
   private readonly pendingDeliveries: Set<Promise<unknown>> = new Set();
   private readonly inFlightEventKeys = new Set<string>();
   private readonly deliveredEventKeys = new Set<string>();
@@ -297,6 +358,14 @@ export class WebhookService {
     this.baseDelay = options.baseDelay ?? DEFAULT_WEBHOOK_BASE_DELAY_MS;
     this.maxBackoff = options.maxBackoff ?? MAX_WEBHOOK_BACKOFF_MS;
     this.replayWindowMs = options.replayWindowMs ?? DEFAULT_WEBHOOK_REPLAY_WINDOW_MS;
+    this.requestTimeoutMs = Math.max(1, options.requestTimeoutMs ?? DEFAULT_WEBHOOK_REQUEST_TIMEOUT_MS);
+    this.breakerFailureThreshold = Math.max(
+      1,
+      options.breakerFailureThreshold ?? DEFAULT_WEBHOOK_BREAKER_FAILURE_THRESHOLD,
+    );
+    this.breakerCooldownMs = Math.max(0, options.breakerCooldownMs ?? DEFAULT_WEBHOOK_BREAKER_COOLDOWN_MS);
+    this.now = options.now ?? Date.now;
+    this.limiter = new ConcurrencyLimiter(Math.max(1, options.maxConcurrency ?? DEFAULT_WEBHOOK_MAX_CONCURRENCY));
     this.subscriptionsPath = options.subscriptionsPath ?? path.join(process.cwd(), 'data', 'webhook_subscriptions.json');
     this.deadLetterPath = options.deadLetterPath ?? path.join(process.cwd(), 'data', 'webhook_dead_letter.json');
     this.deduplicationPath = options.deduplicationPath ?? path.join(process.cwd(), 'data', 'webhook_delivered_events.json');
@@ -305,6 +374,94 @@ export class WebhookService {
   /** Replay window (ms) that subscribers should enforce. */
   getReplayWindowMs(): number {
     return this.replayWindowMs;
+  }
+
+  // ============================================
+  // Per-Destination Breaker Methods
+  // ============================================
+
+  private getBreaker(sub: WebhookSubscription): BreakerRecord {
+    let record = this.breakers.get(sub.id);
+    if (!record) {
+      record = {
+        state: 'closed',
+        consecutiveFailures: 0,
+        openedAt: null,
+        nextProbeAt: null,
+        lastSuccessAt: null,
+        lastFailureAt: null,
+        inFlight: 0,
+        url: sub.url,
+      };
+      this.breakers.set(sub.id, record);
+    } else {
+      record.url = sub.url;
+    }
+    return record;
+  }
+
+  /**
+   * Decide whether a delivery attempt may proceed for this destination.
+   *
+   * A closed breaker always allows. An open breaker allows a single probe once
+   * the cooldown has elapsed, transitioning to `half_open`; otherwise it
+   * rejects so the failing destination cannot consume retry budget or
+   * concurrency slots from healthy destinations.
+   */
+  private canAttempt(sub: WebhookSubscription): boolean {
+    const record = this.getBreaker(sub);
+    if (record.state === 'closed') return true;
+
+    if (record.state === 'open') {
+      if (record.nextProbeAt !== null && this.now() >= record.nextProbeAt) {
+        record.state = 'half_open';
+        return true;
+      }
+      return false;
+    }
+
+    // half_open: allow the probe only when nothing else is in flight.
+    return record.inFlight === 0;
+  }
+
+  private recordSuccess(sub: WebhookSubscription): void {
+    const record = this.getBreaker(sub);
+    record.state = 'closed';
+    record.consecutiveFailures = 0;
+    record.openedAt = null;
+    record.nextProbeAt = null;
+    record.lastSuccessAt = this.now();
+  }
+
+  private recordFailure(sub: WebhookSubscription): void {
+    const record = this.getBreaker(sub);
+    record.consecutiveFailures += 1;
+    record.lastFailureAt = this.now();
+
+    if (record.state === 'half_open' || record.consecutiveFailures >= this.breakerFailureThreshold) {
+      record.state = 'open';
+      record.openedAt = this.now();
+      record.nextProbeAt = this.now() + this.breakerCooldownMs;
+    }
+  }
+
+  /**
+   * Operator-facing health snapshot for every destination the service has
+   * observed. States are explicit: `closed` (healthy), `open` (failing, being
+   * skipped) and `half_open` (probing recovery).
+   */
+  getDestinationHealth(): WebhookDestinationHealth[] {
+    return Array.from(this.breakers.entries()).map(([subscriptionId, record]) => ({
+      subscriptionId,
+      url: record.url ?? '',
+      state: record.state,
+      consecutiveFailures: record.consecutiveFailures,
+      openedAt: record.openedAt,
+      nextProbeAt: record.nextProbeAt,
+      lastSuccessAt: record.lastSuccessAt,
+      lastFailureAt: record.lastFailureAt,
+      inFlight: record.inFlight > 0,
+    }));
   }
 
   // ============================================
@@ -691,7 +848,7 @@ export class WebhookService {
       const eventKey = sourceKey ? `${sub.id}:${sourceKey}` : null;
       if (!(await this.reserveEvent(eventKey))) continue;
 
-      const deliveryPromise = this.deliverWithRetry(sub, event, eventData, 1, parentTrace).then(
+      const deliveryPromise = this.deliverWithRetry(sub, event, eventData, 1, undefined, parentTrace).then(
         (delivered) => this.completeEvent(eventKey, delivered),
         async () => {
           await this.completeEvent(eventKey, false);
@@ -725,6 +882,7 @@ export class WebhookService {
     eventData: Record<string, unknown>,
     attemptNum = 1,
     delivery?: WebhookDeliveryMetadata,
+    traceContext?: TraceContext,
   ): Promise<boolean> {
     const metadata: WebhookDeliveryMetadata = delivery ?? {
       deliveryId: 'del_' + randomUUID().replace(/-/g, ''),
@@ -757,44 +915,66 @@ export class WebhookService {
     let success = false;
     let statusCode: number | null = null;
     let errorMessage: string | null = null;
+    let skipped = false;
 
+    const breaker = this.getBreaker(sub);
+    if (!this.canAttempt(sub)) {
+      skipped = true;
+      errorMessage = `Destination circuit breaker is ${breaker.state}; delivery skipped`;
+      span.setAttribute('webhook.breaker_state', breaker.state);
+      span.setAttribute('webhook.skipped', true);
+      span.end('ok');
+      console.warn(sanitizeString(`[Webhook skipped] ${sub.url} breaker ${breaker.state}`));
+      return false;
+    }
+
+    breaker.inFlight += 1;
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s HTTP timeout
+      await this.limiter.run(async () => {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), this.requestTimeoutMs);
 
-      const outgoingHeaders: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'X-Webhook-Timestamp': timestamp.toString(),
-        'X-Webhook-Signature': signature,
-        'X-Webhook-Event': event,
-        'X-Webhook-Delivery-Id': deliveryId,
-      };
-      injectTraceHeaders(traceCtx, outgoingHeaders);
+        try {
+          const outgoingHeaders: Record<string, string> = {
+            'Content-Type': 'application/json',
+            'X-Webhook-Timestamp': timestamp.toString(),
+            'X-Webhook-Signature': signature,
+            'X-Webhook-Signature-Version': signatureVersion,
+            'X-Webhook-Event': event,
+            'X-Webhook-Delivery-Id': deliveryId,
+          };
+          injectTraceHeaders(traceCtx, outgoingHeaders);
 
-      const response = await fetch(sub.url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Webhook-Timestamp': timestamp.toString(),
-          'X-Webhook-Signature': signature,
-          'X-Webhook-Signature-Version': signatureVersion,
-          'X-Webhook-Event': event,
-          'X-Webhook-Delivery-Id': deliveryId,
-        },
-        body: payloadStr,
-        signal: controller.signal,
+          const response = await fetch(sub.url, {
+            method: 'POST',
+            headers: outgoingHeaders,
+            body: payloadStr,
+            signal: controller.signal,
+          });
+
+          statusCode = response.status;
+          success = response.ok;
+
+          if (!success) {
+            errorMessage = `HTTP failure status: ${response.status}`;
+          }
+        } catch (err: unknown) {
+          success = false;
+          errorMessage = err instanceof Error ? err.message : String(err);
+        } finally {
+          clearTimeout(timeoutId);
+        }
       });
+    } finally {
+      breaker.inFlight = Math.max(0, breaker.inFlight - 1);
+    }
 
-      clearTimeout(timeoutId);
-      statusCode = response.status;
-      success = response.ok;
-
-      if (!success) {
-        errorMessage = `HTTP failure status: ${response.status}`;
+    if (!skipped) {
+      if (success) {
+        this.recordSuccess(sub);
+      } else {
+        this.recordFailure(sub);
       }
-    } catch (err: unknown) {
-      success = false;
-      errorMessage = err instanceof Error ? err.message : String(err);
     }
 
     span.setAttribute('http.status_code', statusCode ?? 0);
@@ -834,7 +1014,7 @@ export class WebhookService {
 
       const retryPromise = new Promise<boolean>((resolve) => {
         setTimeout(() => {
-          this.deliverWithRetry(sub, event, eventData, attemptNum + 1, metadata).then(resolve, () => resolve(false));
+          this.deliverWithRetry(sub, event, eventData, attemptNum + 1, metadata, traceCtx).then(resolve, () => resolve(false));
         }, backoffDelay);
       });
 

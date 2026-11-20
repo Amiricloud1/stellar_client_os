@@ -139,6 +139,260 @@ export async function closeRedisClient(): Promise<void> {
     _client = null;
   }
   _attempted = false;
+  resetWebhookBreakers();
+}
+
+/* ------------------------------------------------------------------------- *
+ * Webhook per-destination circuit breakers — issue #229
+ *
+ * One failing subscriber must not starve healthy destinations. Each
+ * destination gets an independent breaker keyed by `wh:breaker:<destination>`.
+ *
+ * State machine:
+ *   closed    -> failures below threshold; deliveries allowed
+ *   open      -> failures >= threshold; deliveries short-circuited until
+ *                `openUntil` (cooldown) elapses
+ *   half-open -> cooldown elapsed; a single probe is allowed. Success closes
+ *                the breaker, failure re-opens it with a fresh cooldown.
+ *
+ * Transitions are performed with atomic Lua scripts so concurrent instances
+ * agree on state. When Redis is unavailable we degrade to a process-local
+ * in-memory map so a single instance still isolates failing destinations.
+ *
+ * Environment variables:
+ * | Variable                          | Default | Description                     |
+ * |-----------------------------------|---------|---------------------------------|
+ * | WEBHOOK_BREAKER_FAILURE_THRESHOLD | 5       | Failures before opening         |
+ * | WEBHOOK_BREAKER_COOLDOWN_MS       | 30000   | Open -> half-open cooldown (ms) |
+ * ------------------------------------------------------------------------- */
+
+export type BreakerState = "closed" | "open" | "half-open";
+
+export interface BreakerSnapshot {
+  state: BreakerState;
+  failures: number;
+  /** Epoch ms when an open breaker becomes half-open; 0 when not open. */
+  openUntil: number;
+  /** True when the state came from the in-memory fallback, not Redis. */
+  degraded: boolean;
+}
+
+export const WEBHOOK_BREAKER_KEY_PREFIX = "wh:breaker:";
+
+/**
+ * Atomic failure recorder.
+ * KEYS[1] = breaker key
+ * ARGV[1] = failure threshold
+ * ARGV[2] = cooldown ms
+ * ARGV[3] = key TTL ms (bounds memory for abandoned destinations)
+ *
+ * Returns { failures, openUntil } where openUntil is 0 while closed.
+ */
+export const BREAKER_FAILURE_LUA_SCRIPT = `
+local failures = redis.call('INCR', KEYS[1])
+local openUntil = 0
+if failures >= tonumber(ARGV[1]) then
+  openUntil = redis.call('TIME')
+  openUntil = (tonumber(openUntil[1]) * 1000) + math.floor(tonumber(openUntil[2]) / 1000) + tonumber(ARGV[2])
+  redis.call('PEXPIRE', KEYS[1], ARGV[3])
+else
+  local ttl = redis.call('PTTL', KEYS[1])
+  if ttl < 0 then
+    redis.call('PEXPIRE', KEYS[1], ARGV[3])
+  end
+end
+return { failures, openUntil }
+`;
+
+/**
+ * Atomic success recorder: clears the failure counter and closes the breaker.
+ * KEYS[1] = breaker key
+ */
+export const BREAKER_SUCCESS_LUA_SCRIPT = `
+redis.call('DEL', KEYS[1])
+return 1
+`;
+
+interface MemoryBreakerEntry {
+  failures: number;
+  openUntil: number;
+}
+
+const _memoryBreakers = new Map<string, MemoryBreakerEntry>();
+
+function breakerThreshold(): number {
+  const raw = Number(process.env.WEBHOOK_BREAKER_FAILURE_THRESHOLD ?? 5);
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 5;
+}
+
+function breakerCooldownMs(): number {
+  const raw = Number(process.env.WEBHOOK_BREAKER_COOLDOWN_MS ?? 30_000);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 30_000;
+}
+
+function breakerKeyTtlMs(): number {
+  // Keep the key alive long enough to cover the cooldown plus a safety margin.
+  return Math.max(breakerCooldownMs() * 2, 60_000);
+}
+
+function breakerKey(destinationKey: string): string {
+  return `${WEBHOOK_BREAKER_KEY_PREFIX}${destinationKey}`;
+}
+
+function deriveState(failures: number, openUntil: number, now: number): BreakerState {
+  if (failures < breakerThreshold()) return "closed";
+  return now < openUntil ? "open" : "half-open";
+}
+
+/** Reset the in-memory fallback — used in tests. */
+export function resetWebhookBreakers(): void {
+  _memoryBreakers.clear();
+}
+
+/**
+ * Read the current breaker state for a destination.
+ * Never throws: Redis errors fall back to the in-memory view.
+ */
+export async function getBreakerState(
+  destinationKey: string
+): Promise<BreakerSnapshot> {
+  const now = Date.now();
+  const client = getReadyRedisClient();
+
+  if (client) {
+    try {
+      const raw = (await client.get(breakerKey(destinationKey))) as
+        | string
+        | null;
+      const failures = raw ? Number(raw) : 0;
+      const safeFailures = Number.isFinite(failures) ? failures : 0;
+      // openUntil is not stored separately; derive it from the key TTL when
+      // the breaker is open. PTTL <= 0 means the cooldown has elapsed.
+      let openUntil = 0;
+      if (safeFailures >= breakerThreshold()) {
+        const pttl = await client.pttl(breakerKey(destinationKey));
+        if (typeof pttl === "number" && pttl > 0) {
+          openUntil = now + pttl;
+        }
+      }
+      return {
+        state: deriveState(safeFailures, openUntil, now),
+        failures: safeFailures,
+        openUntil,
+        degraded: false,
+      };
+    } catch (err) {
+      if (process.env.NODE_ENV !== "test") {
+        console.error(
+          "[redis] getBreakerState failed:",
+          (err as Error).message
+        );
+      }
+    }
+  }
+
+  const entry = _memoryBreakers.get(destinationKey);
+  const failures = entry?.failures ?? 0;
+  const openUntil = entry?.openUntil ?? 0;
+  return {
+    state: deriveState(failures, openUntil, now),
+    failures,
+    openUntil,
+    degraded: true,
+  };
+}
+
+/**
+ * Record a successful delivery: closes the breaker and clears failures.
+ * Returns the resulting snapshot.
+ */
+export async function recordBreakerSuccess(
+  destinationKey: string
+): Promise<BreakerSnapshot> {
+  const client = getReadyRedisClient();
+
+  if (client) {
+    try {
+      await client.eval(BREAKER_SUCCESS_LUA_SCRIPT, 1, breakerKey(destinationKey));
+      _memoryBreakers.delete(destinationKey);
+      return {
+        state: "closed",
+        failures: 0,
+        openUntil: 0,
+        degraded: false,
+      };
+    } catch (err) {
+      if (process.env.NODE_ENV !== "test") {
+        console.error(
+          "[redis] recordBreakerSuccess failed:",
+          (err as Error).message
+        );
+      }
+    }
+  }
+
+  _memoryBreakers.delete(destinationKey);
+  return { state: "closed", failures: 0, openUntil: 0, degraded: true };
+}
+
+/**
+ * Record a failed delivery. Once the threshold is reached the breaker opens
+ * for the configured cooldown. Returns the resulting snapshot.
+ */
+export async function recordBreakerFailure(
+  destinationKey: string
+): Promise<BreakerSnapshot> {
+  const now = Date.now();
+  const threshold = breakerThreshold();
+  const cooldown = breakerCooldownMs();
+  const client = getReadyRedisClient();
+
+  if (client) {
+    try {
+      const raw = (await client.eval(
+        BREAKER_FAILURE_LUA_SCRIPT,
+        1,
+        breakerKey(destinationKey),
+        String(threshold),
+        String(cooldown),
+        String(breakerKeyTtlMs())
+      )) as [number | string, number | string];
+
+      const failures = Number(raw?.[0] ?? 0);
+      const openUntil = Number(raw?.[1] ?? 0);
+      const safeFailures = Number.isFinite(failures) ? failures : 0;
+      const safeOpenUntil = Number.isFinite(openUntil) ? openUntil : 0;
+      return {
+        state: deriveState(safeFailures, safeOpenUntil, now),
+        failures: safeFailures,
+        openUntil: safeOpenUntil,
+        degraded: false,
+      };
+    } catch (err) {
+      if (process.env.NODE_ENV !== "test") {
+        console.error(
+          "[redis] recordBreakerFailure failed:",
+          (err as Error).message
+        );
+      }
+    }
+  }
+
+  const entry = _memoryBreakers.get(destinationKey) ?? {
+    failures: 0,
+    openUntil: 0,
+  };
+  entry.failures += 1;
+  if (entry.failures >= threshold) {
+    entry.openUntil = now + cooldown;
+  }
+  _memoryBreakers.set(destinationKey, entry);
+  return {
+    state: deriveState(entry.failures, entry.openUntil, now),
+    failures: entry.failures,
+    openUntil: entry.openUntil,
+    degraded: true,
+  };
 }
 
 /**
