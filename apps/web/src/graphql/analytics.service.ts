@@ -13,6 +13,36 @@
  * For testability, the data source is injected via a `StreamDataSource`
  * interface so tests can provide deterministic fixtures without hitting
  * the network.
+ *
+ * ── Cache semantics (issue #235) ─────────────────────────────────────────────
+ *
+ * Cold reads are coalesced and bounded so a burst of identical requests
+ * cannot stampede the backing data source:
+ *
+ *  - **Scope keying.** Every cache entry is keyed by
+ *    `(tenant, principal scope, normalized filters)`. Entries are never
+ *    shared across tenants or principals, so a cached aggregate can never
+ *    leak data across permission boundaries. Filters are normalized
+ *    (sorted keys, dropped `undefined`s) so semantically identical queries
+ *    share one entry.
+ *  - **Single-flight.** Concurrent cold reads for the same key are
+ *    coalesced into one in-flight computation. A cross-process Redis-style
+ *    lock (`CacheLock`) is acquired before computing; if the lock is held
+ *    elsewhere we wait briefly for the winner to publish, then fall back to
+ *    computing locally rather than failing the request.
+ *  - **Stale-while-revalidate.** Entries are served fresh until `ttlMs`.
+ *    Between `ttlMs` and `ttlMs + staleMs` they are served with
+ *    `stale: true` while a background revalidation is kicked off. Beyond
+ *    the stale bound an entry is never served.
+ *  - **Failure & recovery.** If the backend fails and a last-known entry is
+ *    still within the stale bound, that entry is returned with
+ *    `stale: true` and `degraded: true` so callers/operators can surface a
+ *    warning. If no entry is within bounds, the error is propagated as an
+ *    explicit `AnalyticsUnavailableError` (never a silent empty result).
+ *
+ * Callers surface the cache state via the `x-analytics-cache` response
+ * header (`hit` | `miss` | `stale` | `coalesced`) and, when degraded, the
+ * `x-analytics-degraded` header carrying the failure reason.
  */
 
 import {
@@ -307,6 +337,313 @@ export interface StreamDataSource {
   getLedgerSnapshot?(network: string): Promise<AuthoritativeLedgerSnapshot | null>;
 }
 
+// ── Cache primitives (issue #235) ────────────────────────────────────────────
+
+/** Default fresh window for a cached analytics aggregate. */
+export const DEFAULT_ANALYTICS_CACHE_TTL_MS = 30_000;
+/** Default window past the TTL during which stale entries may be served. */
+export const DEFAULT_ANALYTICS_STALE_MS = 5 * 60_000;
+/** How long a single-flight waiter blocks for the lock winner to publish. */
+export const DEFAULT_ANALYTICS_LOCK_WAIT_MS = 2_000;
+
+/**
+ * Cross-process lock abstraction. The production implementation is backed by
+ * Redis (`SET key token NX PX ttl`); tests inject an in-memory implementation.
+ */
+export interface CacheLock {
+  /** Attempt to acquire the lock. Resolves `true` when acquired. */
+  acquire(key: string, ttlMs: number): Promise<boolean>;
+  /** Release a lock previously acquired with the same key. */
+  release(key: string): Promise<void>;
+}
+
+/** In-process lock used by default and by tests. */
+export class InMemoryCacheLock implements CacheLock {
+  private readonly held = new Map<string, number>();
+
+  async acquire(key: string, ttlMs: number): Promise<boolean> {
+    const now = Date.now();
+    const expiresAt = this.held.get(key);
+    if (expiresAt !== undefined && expiresAt > now) return false;
+    this.held.set(key, now + ttlMs);
+    return true;
+  }
+
+  async release(key: string): Promise<void> {
+    this.held.delete(key);
+  }
+}
+
+/** Identity of the caller, used to scope cache entries. */
+export interface AnalyticsCacheScope {
+  /** Tenant / organization id. Entries never cross tenants. */
+  tenantId: string;
+  /**
+   * Principal scope — a stable string describing what the caller may see
+   * (e.g. `user:123`, `role:admin`, `anon`). Entries never cross scopes.
+   */
+  principalScope: string;
+}
+
+/** Cache state surfaced to callers via headers / logs. */
+export type AnalyticsCacheState = "hit" | "miss" | "stale" | "coalesced";
+
+/** Result wrapper carrying the cache state alongside the value. */
+export interface CachedAnalyticsResult<T> {
+  value: T;
+  cache: {
+    state: AnalyticsCacheState;
+    /** True when the value is past its fresh TTL (served stale). */
+    stale: boolean;
+    /** True when the value was served because the backend failed. */
+    degraded: boolean;
+    /** Failure reason when `degraded` is true. */
+    degradedReason?: string;
+    /** Age of the served entry in milliseconds. */
+    ageMs: number;
+  };
+}
+
+/**
+ * Raised when the backend failed and no entry within the stale bound exists.
+ * Callers must surface this as an explicit "analytics unavailable" state.
+ */
+export class AnalyticsUnavailableError extends Error {
+  readonly code = "ANALYTICS_UNAVAILABLE";
+  constructor(message: string, readonly cause?: unknown) {
+    super(message);
+    this.name = "AnalyticsUnavailableError";
+  }
+}
+
+interface CacheEntry<T> {
+  value: T;
+  storedAt: number;
+  /** Scope key the entry was stored under — guards against cross-scope reuse. */
+  scopeKey: string;
+}
+
+/**
+ * Build a deterministic cache key from the scope and normalized filters.
+ * Filter keys are sorted and `undefined` values dropped so equivalent
+ * queries map to the same entry.
+ */
+export function buildAnalyticsCacheKey(
+  namespace: string,
+  scope: AnalyticsCacheScope,
+  filters: Record<string, unknown> = {}
+): string {
+  const normalizedFilters = Object.keys(filters)
+    .filter((k) => filters[k] !== undefined && filters[k] !== null)
+    .sort()
+    .map((k) => `${k}=${String(filters[k])}`)
+    .join("&");
+  return [
+    "analytics",
+    namespace,
+    `tenant:${scope.tenantId}`,
+    `scope:${scope.principalScope}`,
+    normalizedFilters || "filters:none",
+  ].join("|");
+}
+
+/**
+ * Single-flight cache with bounded stale-while-revalidate.
+ *
+ * One instance is shared per process; entries are scoped so they can never
+ * be reused across tenants or principals.
+ */
+export class AnalyticsCache {
+  private readonly entries = new Map<string, CacheEntry<unknown>>();
+  private readonly inflight = new Map<string, Promise<unknown>>();
+
+  constructor(
+    private readonly lock: CacheLock = new InMemoryCacheLock(),
+    private readonly options: {
+      ttlMs?: number;
+      staleMs?: number;
+      lockWaitMs?: number;
+      now?: () => number;
+    } = {}
+  ) {}
+
+  private get ttlMs(): number {
+    return this.options.ttlMs ?? DEFAULT_ANALYTICS_CACHE_TTL_MS;
+  }
+
+  private get staleMs(): number {
+    return this.options.staleMs ?? DEFAULT_ANALYTICS_STALE_MS;
+  }
+
+  private get lockWaitMs(): number {
+    return this.options.lockWaitMs ?? DEFAULT_ANALYTICS_LOCK_WAIT_MS;
+  }
+
+  private now(): number {
+    return this.options.now ? this.options.now() : Date.now();
+  }
+
+  /** Read an entry, returning it only if it belongs to `scopeKey`. */
+  private readEntry<T>(key: string, scopeKey: string): CacheEntry<T> | null {
+    const entry = this.entries.get(key) as CacheEntry<T> | undefined;
+    if (!entry) return null;
+    // Defensive: never serve an entry stored under a different scope.
+    if (entry.scopeKey !== scopeKey) return null;
+    return entry;
+  }
+
+  /**
+   * Resolve a cached value, computing it via `compute` on a cold read.
+   *
+   * @param key - Cache key from {@link buildAnalyticsCacheKey}.
+   * @param scopeKey - Scope portion of the key, re-checked on read.
+   * @param compute - Backend loader invoked at most once per cold burst.
+   */
+  async getOrCompute<T>(
+    key: string,
+    scopeKey: string,
+    compute: () => Promise<T>
+  ): Promise<CachedAnalyticsResult<T>> {
+    const now = this.now();
+    const existing = this.readEntry<T>(key, scopeKey);
+
+    if (existing) {
+      const ageMs = now - existing.storedAt;
+      if (ageMs <= this.ttlMs) {
+        return {
+          value: existing.value,
+          cache: { state: "hit", stale: false, degraded: false, ageMs },
+        };
+      }
+      if (ageMs <= this.ttlMs + this.staleMs) {
+        // Stale-while-revalidate: serve immediately, refresh in background.
+        void this.revalidate(key, scopeKey, compute);
+        return {
+          value: existing.value,
+          cache: { state: "stale", stale: true, degraded: false, ageMs },
+        };
+      }
+      // Past the stale bound — drop it so it can never be served again.
+      this.entries.delete(key);
+    }
+
+    // Coalesce concurrent cold reads for the same key.
+    const pending = this.inflight.get(key) as Promise<CachedAnalyticsResult<T>> | undefined;
+    if (pending) {
+      const result = await pending;
+      return { value: result.value, cache: { ...result.cache, state: "coalesced" } };
+    }
+
+    const promise = this.computeWithLock(key, scopeKey, compute);
+    this.inflight.set(key, promise);
+    try {
+      return await promise;
+    } finally {
+      this.inflight.delete(key);
+    }
+  }
+
+  private async computeWithLock<T>(
+    key: string,
+    scopeKey: string,
+    compute: () => Promise<T>
+  ): Promise<CachedAnalyticsResult<T>> {
+    const lockKey = `${key}|lock`;
+    let acquired = false;
+    try {
+      acquired = await this.lock.acquire(lockKey, this.lockWaitMs);
+    } catch {
+      acquired = false;
+    }
+
+    if (!acquired) {
+      // Another process is computing. Wait briefly for it to publish, then
+      // fall back to computing locally rather than failing the request.
+      const deadline = this.now() + this.lockWaitMs;
+      while (this.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 25));
+        const published = this.readEntry<T>(key, scopeKey);
+        if (published) {
+          const ageMs = this.now() - published.storedAt;
+          if (ageMs <= this.ttlMs + this.staleMs) {
+            return {
+              value: published.value,
+              cache: {
+                state: "coalesced",
+                stale: ageMs > this.ttlMs,
+                degraded: false,
+                ageMs,
+              },
+            };
+          }
+        }
+      }
+    }
+
+    try {
+      const value = await compute();
+      this.entries.set(key, { value, storedAt: this.now(), scopeKey });
+      return {
+        value,
+        cache: { state: "miss", stale: false, degraded: false, ageMs: 0 },
+      };
+    } catch (error) {
+      // Failure path: serve the last known entry if still within bounds.
+      const fallback = this.readEntry<T>(key, scopeKey);
+      if (fallback) {
+        const ageMs = this.now() - fallback.storedAt;
+        if (ageMs <= this.ttlMs + this.staleMs) {
+          return {
+            value: fallback.value,
+            cache: {
+              state: "stale",
+              stale: true,
+              degraded: true,
+              degradedReason: error instanceof Error ? error.message : "backend_error",
+              ageMs,
+            },
+          };
+        }
+      }
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new AnalyticsUnavailableError(
+        `Analytics backend unavailable and no entry within the stale bound: ${detail}`,
+        error
+      );
+    } finally {
+      if (acquired) {
+        try {
+          await this.lock.release(lockKey);
+        } catch {
+          // Lock release failures are non-fatal; the TTL will expire it.
+        }
+      }
+    }
+  }
+
+  /** Refresh an entry in the background, swallowing failures. */
+  private async revalidate<T>(
+    key: string,
+    scopeKey: string,
+    compute: () => Promise<T>
+  ): Promise<void> {
+    if (this.inflight.has(key)) return;
+    const promise = this.computeWithLock(key, scopeKey, compute).catch(() => undefined);
+    this.inflight.set(key, promise);
+    try {
+      await promise;
+    } finally {
+      this.inflight.delete(key);
+    }
+  }
+
+  /** Drop all entries (used by tests and on tenant offboarding). */
+  clear(): void {
+    this.entries.clear();
+    this.inflight.clear();
+  }
+}
+
 // ── Default data source (reads from env-configured Stellar RPC) ───────────────
 
 /**
@@ -407,7 +744,30 @@ function filterStreams(
 // ── Analytics Service ─────────────────────────────────────────────────────────
 
 export class AnalyticsService {
-  constructor(private readonly dataSource: StreamDataSource = new DefaultStreamDataSource()) {}
+  private readonly cache: AnalyticsCache;
+
+  constructor(
+    private readonly dataSource: StreamDataSource = new DefaultStreamDataSource(),
+    cache?: AnalyticsCache
+  ) {
+    this.cache = cache ?? new AnalyticsCache();
+  }
+
+  /**
+   * Load streams through the single-flight cache, scoped to the caller.
+   *
+   * The cache key includes the tenant, principal scope, network and any
+   * filters, so entries are never reused across permission boundaries.
+   */
+  private async loadStreams(
+    network: string,
+    scope: AnalyticsCacheScope,
+    filters: Record<string, unknown> = {}
+  ): Promise<CachedAnalyticsResult<StreamRecord[]>> {
+    const key = buildAnalyticsCacheKey("streams", scope, { network, ...filters });
+    const scopeKey = `${scope.tenantId}|${scope.principalScope}`;
+    return this.cache.getOrCompute(key, scopeKey, () => this.dataSource.getStreams(network));
+  }
 
   getMetricDefinitions(): Record<AnalyticsMetricKey, AnalyticsMetricDefinition> {
     return getAnalyticsMetricDefinitions();
@@ -415,8 +775,11 @@ export class AnalyticsService {
 
   // ── globalMetrics ─────────────────────────────────────────────────────────
 
-  async getGlobalMetrics(network = "testnet"): Promise<GlobalMetrics> {
-    const streams = await this.dataSource.getStreams(network);
+  async getGlobalMetrics(
+    network = "testnet",
+    scope: AnalyticsCacheScope = { tenantId: "default", principalScope: "anon" }
+  ): Promise<GlobalMetrics> {
+    const { value: streams } = await this.loadStreams(network, scope);
 
     const activeStreams = streams.filter((s) => s.status === "Active").length;
     const totalVolumeUsd = streams
@@ -501,10 +864,14 @@ export class AnalyticsService {
   async getRegionMetrics(
     filter?: RegionFilter,
     pagination?: PaginationInput,
-    network = "testnet"
+    network = "testnet",
+    scope: AnalyticsCacheScope = { tenantId: "default", principalScope: "anon" }
   ): Promise<PaginatedResult<RegionMetrics>> {
-    let streams = await this.dataSource.getStreams(network);
-    streams = filterStreams(streams, filter ?? {});
+    const { value: allStreams } = await this.loadStreams(network, scope, {
+      kind: "region",
+      ...(filter ?? {}),
+    });
+    const streams = filterStreams(allStreams, filter ?? {});
 
     // Group by region
     const regionMap = new Map<string, StreamRecord[]>();
@@ -546,10 +913,14 @@ export class AnalyticsService {
   async getCategoryMetrics(
     filter?: CategoryFilter,
     pagination?: PaginationInput,
-    network = "testnet"
+    network = "testnet",
+    scope: AnalyticsCacheScope = { tenantId: "default", principalScope: "anon" }
   ): Promise<PaginatedResult<CategoryMetrics>> {
-    let streams = await this.dataSource.getStreams(network);
-    streams = filterStreams(streams, filter ?? {});
+    const { value: allStreams } = await this.loadStreams(network, scope, {
+      kind: "category",
+      ...(filter ?? {}),
+    });
+    const streams = filterStreams(allStreams, filter ?? {});
 
     const total = streams.length;
 
@@ -592,10 +963,14 @@ export class AnalyticsService {
   async getAssetMetrics(
     filter?: AssetFilter,
     pagination?: PaginationInput,
-    network = "testnet"
+    network = "testnet",
+    scope: AnalyticsCacheScope = { tenantId: "default", principalScope: "anon" }
   ): Promise<PaginatedResult<AssetMetrics>> {
-    let streams = await this.dataSource.getStreams(network);
-    streams = filterStreams(streams, filter ?? {});
+    const { value: allStreams } = await this.loadStreams(network, scope, {
+      kind: "asset",
+      ...(filter ?? {}),
+    });
+    const streams = filterStreams(allStreams, filter ?? {});
 
     const results = aggregateByAsset(streams);
     // Stable ordering: totalVolume desc, then asset asc as a tiebreaker.
@@ -620,8 +995,15 @@ export class AnalyticsService {
    * @param address - Stellar address of the sponsor to compare.
    * @param network - Stellar network to aggregate over (default `testnet`).
    */
-  async getSponsorImpact(address: string, network = "testnet"): Promise<SponsorImpact> {
-    const streams = await this.dataSource.getStreams(network);
+  async getSponsorImpact(
+    address: string,
+    network = "testnet",
+    scope: AnalyticsCacheScope = { tenantId: "default", principalScope: "anon" }
+  ): Promise<SponsorImpact> {
+    const { value: streams } = await this.loadStreams(network, scope, {
+      kind: "sponsor",
+      address,
+    });
 
     // Aggregate total funded volume (USDC-equivalent) per sponsor (sender).
     const volumeBySponsor = new Map<string, bigint>();
@@ -683,8 +1065,11 @@ export class AnalyticsService {
 /** Module-level singleton — shared across all requests in the same process. */
 let _defaultService: AnalyticsService | null = null;
 
-export function getAnalyticsService(dataSource?: StreamDataSource): AnalyticsService {
-  if (dataSource) return new AnalyticsService(dataSource);
+export function getAnalyticsService(
+  dataSource?: StreamDataSource,
+  cache?: AnalyticsCache
+): AnalyticsService {
+  if (dataSource || cache) return new AnalyticsService(dataSource, cache);
   if (!_defaultService) _defaultService = new AnalyticsService();
   return _defaultService;
 }

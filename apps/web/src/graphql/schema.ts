@@ -8,6 +8,45 @@
  * Query safety (issue #60): the schema is served with depth-limit and
  * complexity-limit validation rules plus a per-request execution timeout.
  * See `./limits` for the exported rules, budgets, and timeout helper.
+ *
+ * Conditional reads (issue #232): cacheable queries return an `ETag` derived
+ * from the representation *and* the authorization context (principal, tenant,
+ * granted scopes). Responses carry `Cache-Control: private` and
+ * `Vary: Authorization` so shared caches never serve one principal's data to
+ * another. A matching `If-None-Match` yields `304 Not Modified` with no body.
+ *
+ * Request budgets (issue #233): oversized bodies, over-nested lists, and
+ * oversized filters are rejected before application or database work with
+ * `413 Payload Too Large` (body/collection size) or `422 Unprocessable Entity`
+ * (invalid or over-budget filter shape). Error payloads include a `code`
+ * extension (`REQUEST_TOO_LARGE`, `COLLECTION_TOO_LARGE`, `FILTER_TOO_LARGE`)
+ * and a `limit` extension naming the violated budget.
+ *
+ * Operation cost metering (issue #234): each operation has a weighted cost
+ * (see the table below). Tenants have a per-window budget; exceeding it
+ * returns `429 Too Many Requests` with `Retry-After` (seconds) and
+ * `X-RateLimit-Remaining` / `X-RateLimit-Reset` headers. Exports and analytics
+ * cost more than lightweight reads.
+ *
+ *   Operation                         Weight
+ *   --------------------------------  ------
+ *   globalMetrics / regionMetrics        1
+ *   categoryMetrics / assetMetrics       2
+ *   campaignAnalytics                    5
+ *   campaignAnalyticsTrend               5
+ *   export (CSV/JSON bulk)              10
+ *
+ * Analytics stampede control (issue #235): identical cold analytics reads are
+ * coalesced into a single computation. When a fresh value cannot be produced
+ * within the freshness window, a bounded stale value may be served; such
+ * responses set `X-Analytics-Stale: true` and a `stale` extension on the
+ * analytics payload. Cache keys include the principal and the full filter set,
+ * so stale values are never shared across permissions or filters.
+ *
+ * Migration note: clients that previously relied on count-based limits (e.g.
+ * "max 100 items per page") should read the `limit` extension on budget errors
+ * and the `X-RateLimit-*` headers instead of assuming fixed counts. Pagination
+ * caps are unchanged; only the enforcement surface and error codes are new.
  */
 
 import type { GraphQLSchema } from 'graphql';
@@ -484,6 +523,12 @@ export const typeDefs = /* GraphQL */`
   type CampaignAnalyticsDashboard {
     campaignId: ID!
     updatedAt: Int!
+    """
+    Whether this payload was served from a bounded stale cache because a
+    fresh computation could not complete in time (issue #235). Clients should
+    treat stale data as advisory and may retry later.
+    """
+    stale: Boolean!
     trafficSources: [TrafficSourceStat!]!
     funnel: [FunnelStage!]!
     demographics: [BackerDemographic!]!
@@ -497,6 +542,19 @@ export const typeDefs = /* GraphQL */`
     contributions: Int!
     totalFunded: String!
     conversionRate: Float!
+  }
+
+  """
+  Remaining operation-cost budget for the calling tenant (issue #234).
+  Exposed so clients can back off before receiving a 429.
+  """
+  type OperationBudget {
+    """Weighted cost units remaining in the current window."""
+    remaining: Int!
+    """Total weighted cost units granted per window."""
+    limit: Int!
+    """Unix timestamp (seconds) when the window resets."""
+    resetAt: Int!
   }
 
   enum GrantProgramStatus {
@@ -709,6 +767,12 @@ export const typeDefs = /* GraphQL */`
     The grant allocations awarded to a campaign across all programs.
     """
     campaignGrantAllocations(campaignId: ID!): [GrantAllocation!]!
+
+    """
+    Remaining weighted operation-cost budget for the calling tenant
+    (issue #234). Cheap to call and never counted against the budget.
+    """
+    operationBudget: OperationBudget!
   }
 
   """
