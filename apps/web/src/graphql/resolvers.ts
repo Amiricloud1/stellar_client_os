@@ -13,6 +13,16 @@ import { getCampaignSequelService } from "@/services/campaign-sequel.service";
 import { getCampaignAnalyticsDashboard } from "@/services/campaign-analytics-dashboard.service";
 import { getGrantProgramService } from "@/services/grant-program.service";
 import {
+  getCampaignTermsService,
+  TermsSnapshotMismatchError,
+} from "@/services/campaign-terms.service";
+import {
+  getCampaignVerificationAuditService,
+  StaleEvidenceVersionError,
+  ReviewerAuthorizationError,
+} from "@/services/campaign-verification-audit.service";
+import { getCampaignDonationService } from "@/services/campaign-donation.service";
+import {
   buildPageInfo,
   normalizePagination,
   paginateItems,
@@ -137,6 +147,63 @@ function toProgramPayload(program: import("@/services/grant-program.service").Gr
     ...program,
     createdAt: Math.floor(program.createdAt / 1000),
     updatedAt: Math.floor(program.updatedAt / 1000),
+  };
+}
+
+/**
+ * Require an authenticated account id, throwing a stable error otherwise.
+ */
+function requireAccountId(ctx: ResolverContext): string {
+  if (!ctx.accountId) {
+    throw new Error("UNAUTHENTICATED: an authenticated account is required");
+  }
+  return ctx.accountId;
+}
+
+/**
+ * Require the caller to hold a reviewer or admin role. The authoritative check
+ * also lives in the verification-audit service; this is a fast-fail guard that
+ * surfaces a stable error code to clients.
+ */
+function requireReviewer(ctx: ResolverContext): string {
+  const accountId = requireAccountId(ctx);
+  const roles = ctx.roles ?? [];
+  if (!roles.includes("reviewer") && !roles.includes("admin")) {
+    throw new Error("FORBIDDEN: reviewer or admin role required");
+  }
+  return accountId;
+}
+
+/**
+ * Map a terms snapshot to its public GraphQL shape (issue #176).
+ */
+function toTermsSnapshotPayload(snapshot: import("@/services/campaign-terms.service").CampaignTermsSnapshot) {
+  return {
+    id: snapshot.id,
+    campaignId: snapshot.campaignId,
+    version: snapshot.version,
+    contentHash: snapshot.contentHash,
+    terms: snapshot.terms,
+    createdAt: Math.floor(snapshot.createdAt / 1000),
+  };
+}
+
+/**
+ * Map a reviewer comment to its public GraphQL shape (issue #178).
+ */
+function toReviewerCommentPayload(comment: import("@/services/campaign-verification-audit.service").ReviewerComment) {
+  return {
+    id: comment.id,
+    evidenceId: comment.evidenceId,
+    evidenceVersion: comment.evidenceVersion,
+    authorId: comment.authorId,
+    body: comment.body,
+    references: comment.references,
+    resolved: comment.resolved,
+    resolvedAt: comment.resolvedAt ? Math.floor(comment.resolvedAt / 1000) : null,
+    resolvedBy: comment.resolvedBy ?? null,
+    createdAt: Math.floor(comment.createdAt / 1000),
+    updatedAt: Math.floor(comment.updatedAt / 1000),
   };
 }
 
@@ -477,6 +544,41 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         const subscriptions = await getWebhookSubscriptionService().listSubscriptions(accountId);
         return paginate(subscriptions.map(toWebhookPayload), args.pagination);
       },
+
+      /**
+       * Return the current donor-facing terms snapshot for a campaign
+       * (issue #176). Clients must display this snapshot and pass its
+       * `contentHash` back on the donation mutation so the contribution is
+       * bound to the exact terms the donor saw.
+       */
+      campaignTermsSnapshot: async (
+        _: unknown,
+        rawArgs: { campaignId: string },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Query.campaignTermsSnapshot", ctx, rawArgs, "campaignId");
+        const snapshot = await getCampaignTermsService().getCurrentSnapshot(args.campaignId);
+        if (!snapshot) return null;
+        return toTermsSnapshotPayload(snapshot);
+      },
+
+      /**
+       * List reviewer comments for a specific evidence version (issue #178).
+       * Requires reviewer or admin role.
+       */
+      reviewerComments: async (
+        _: unknown,
+        rawArgs: { evidenceId: string; evidenceVersion: number; pagination?: PaginationInput },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Query.reviewerComments", ctx, rawArgs, "evidenceId");
+        requireReviewer(ctx);
+        const comments = await getCampaignVerificationAuditService().listComments(
+          args.evidenceId,
+          args.evidenceVersion,
+        );
+        return paginate(comments.map(toReviewerCommentPayload), args.pagination);
+      },
     },
     Mutation: {
       cloneCampaign: async (
@@ -566,6 +668,111 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         const accountId = requireAccountId(ctx);
         const subscription = await getWebhookSubscriptionService().revokeSubscription(accountId, args.id);
         return toWebhookPayload(subscription);
+      },
+
+      /**
+       * Record a contribution bound to the terms snapshot the donor saw
+       * (issue #176). The `termsSnapshotHash` must match the campaign's current
+       * snapshot; a mismatch surfaces a TERMS_SNAPSHOT_MISMATCH error so the
+       * client can re-fetch terms and ask the donor to re-confirm.
+       */
+      donateToCampaign: async (
+        _: unknown,
+        rawArgs: {
+          campaignId: string;
+          amount: string;
+          termsSnapshotHash: string;
+          network?: Network;
+        },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Mutation.donateToCampaign", ctx, rawArgs, "campaignId");
+        const accountId = requireAccountId(ctx);
+        try {
+          const contribution = await getCampaignDonationService().recordContribution({
+            campaignId: args.campaignId,
+            amount: args.amount,
+            termsSnapshotHash: args.termsSnapshotHash,
+            donorId: accountId,
+            network: args.network ?? "testnet",
+          });
+          return {
+            id: contribution.id,
+            campaignId: contribution.campaignId,
+            amount: contribution.amount,
+            termsSnapshotHash: contribution.termsSnapshotHash,
+            termsSnapshotVersion: contribution.termsSnapshotVersion,
+            createdAt: Math.floor(contribution.createdAt / 1000),
+          };
+        } catch (error) {
+          if (error instanceof TermsSnapshotMismatchError) {
+            throw new Error(
+              `TERMS_SNAPSHOT_MISMATCH: terms changed since they were displayed; re-fetch campaignTermsSnapshot and re-confirm`,
+            );
+          }
+          throw error;
+        }
+      },
+
+      /**
+       * Add a reviewer comment against a specific evidence version (issue #178).
+       * Requires reviewer or admin role. A stale `evidenceVersion` surfaces a
+       * STALE_EVIDENCE_VERSION error so the reviewer can reload the evidence.
+       */
+      addReviewerComment: async (
+        _: unknown,
+        rawArgs: {
+          evidenceId: string;
+          evidenceVersion: number;
+          body: string;
+          references?: string[];
+        },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Mutation.addReviewerComment", ctx, rawArgs, "evidenceId");
+        const authorId = requireReviewer(ctx);
+        try {
+          const comment = await getCampaignVerificationAuditService().addComment({
+            evidenceId: args.evidenceId,
+            evidenceVersion: args.evidenceVersion,
+            authorId,
+            body: args.body,
+            references: args.references ?? [],
+          });
+          return toReviewerCommentPayload(comment);
+        } catch (error) {
+          if (error instanceof StaleEvidenceVersionError) {
+            throw new Error(
+              `STALE_EVIDENCE_VERSION: evidence has advanced to version ${error.currentVersion}; reload before commenting`,
+            );
+          }
+          if (error instanceof ReviewerAuthorizationError) {
+            throw new Error("FORBIDDEN: reviewer or admin role required");
+          }
+          throw error;
+        }
+      },
+
+      /**
+       * Mark a reviewer comment resolved (issue #178). Requires reviewer or
+       * admin role; attribution and timestamp are recorded by the service.
+       */
+      resolveReviewerComment: async (
+        _: unknown,
+        rawArgs: { commentId: string },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Mutation.resolveReviewerComment", ctx, rawArgs, "commentId");
+        const resolvedBy = requireReviewer(ctx);
+        try {
+          const comment = await getCampaignVerificationAuditService().resolveComment(args.commentId, resolvedBy);
+          return toReviewerCommentPayload(comment);
+        } catch (error) {
+          if (error instanceof ReviewerAuthorizationError) {
+            throw new Error("FORBIDDEN: reviewer or admin role required");
+          }
+          throw error;
+        }
       },
     },
   };

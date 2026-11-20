@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   CampaignDataSource,
   CampaignRecord,
@@ -47,7 +48,9 @@ export type DonationErrorCode =
   | "INVALID_TOKEN"
   | "INVALID_DONOR"
   | "MESSAGE_TOO_LONG"
-  | "IDEMPOTENCY_CONFLICT";
+  | "IDEMPOTENCY_CONFLICT"
+  | "MISSING_TERMS_SNAPSHOT"
+  | "TERMS_SNAPSHOT_MISMATCH";
 
 export interface CreateDonationInput {
   campaignId: string;
@@ -59,6 +62,61 @@ export interface CreateDonationInput {
   txHash?: string;
   /** Caller-supplied key that makes retries safe: a repeat call returns the original donation. */
   idempotencyKey?: string;
+  /**
+   * Content hash of the donor-facing terms the donor reviewed before signing
+   * (issue #176). Required: the donation is bound to the exact terms shown.
+   */
+  termsSnapshotHash: string;
+  /** Optional human-readable terms version the snapshot hash was derived from. */
+  termsVersion?: string;
+}
+
+/**
+ * Canonical, deterministic representation of the donor-facing terms for a
+ * campaign. Only fields the donor actually sees before signing are included so
+ * the hash stays stable across unrelated campaign edits.
+ */
+export interface DonorTermsSnapshot {
+  campaignId: string;
+  campaignName: string;
+  campaignStatus: CampaignStatus;
+  allocation: typeof DONATION_ALLOCATION;
+  allocationLabel: string;
+  allocationDescription: string;
+  supportedTokens: readonly DonationToken[];
+  maxMessageLength: number;
+}
+
+export function buildDonorTermsSnapshot(campaign: CampaignRecord): DonorTermsSnapshot {
+  return {
+    campaignId: campaign.id,
+    campaignName: campaign.name,
+    campaignStatus: campaign.status,
+    allocation: DONATION_ALLOCATION,
+    allocationLabel: DONATION_ALLOCATION_LABEL,
+    allocationDescription: DONATION_ALLOCATION_DESCRIPTION,
+    supportedTokens: DONATION_TOKENS,
+    maxMessageLength: MAX_DONATION_MESSAGE_LENGTH,
+  };
+}
+
+/** Stable JSON serialisation: object keys sorted, no whitespace. */
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
+  }
+  const entries = Object.keys(value as Record<string, unknown>)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`);
+  return `{${entries.join(",")}}`;
+}
+
+/** SHA-256 content hash of the donor-facing terms for a campaign. */
+export function computeDonorTermsHash(campaign: CampaignRecord): string {
+  return createHash("sha256").update(canonicalJson(buildDonorTermsSnapshot(campaign))).digest("hex");
 }
 
 export type DonationResult =
@@ -126,6 +184,16 @@ export class CampaignDonationService {
     }
     const token: DonationToken = isDonationToken(input.token) ? input.token : "XLM";
 
+    const termsSnapshotHash = String(input.termsSnapshotHash ?? "").trim();
+    if (!termsSnapshotHash) {
+      return {
+        ok: false,
+        error: "The donor-facing terms must be reviewed before donating.",
+        code: "MISSING_TERMS_SNAPSHOT",
+      };
+    }
+    const termsVersion = input.termsVersion?.trim() || undefined;
+
     const amountError = validateDonationAmount(input.amount);
     if (amountError) {
       return { ok: false, error: amountError, code: "INVALID_AMOUNT" };
@@ -144,6 +212,18 @@ export class CampaignDonationService {
       };
     }
 
+    // Bind the donation to the exact terms the donor reviewed. If the terms
+    // changed since the donor loaded them, refuse the write so the donor can
+    // re-review rather than donating under stale terms.
+    const expectedTermsHash = computeDonorTermsHash(campaign);
+    if (expectedTermsHash !== termsSnapshotHash) {
+      return {
+        ok: false,
+        error: "The campaign terms changed since you reviewed them. Please review and try again.",
+        code: "TERMS_SNAPSHOT_MISMATCH",
+      };
+    }
+
     // Retries (double-clicks, network replays) resolve to the original record.
     // The idempotency key is scoped per campaign and the request payload is
     // fingerprinted so reusing a key with a different payload is rejected.
@@ -157,6 +237,8 @@ export class CampaignDonationService {
           token,
           message: input.message?.trim() || null,
           anonymous: Boolean(input.anonymous),
+          termsSnapshotHash,
+          termsVersion: termsVersion ?? null,
         })
       : undefined;
 
@@ -214,6 +296,8 @@ export class CampaignDonationService {
       status: "CONFIRMED",
       txHash: input.txHash?.trim() || undefined,
       idempotencyKey: idempotencyKey || undefined,
+      termsSnapshotHash,
+      termsVersion,
       createdAt: now,
       confirmedAt: now,
     };
@@ -230,6 +314,8 @@ export class CampaignDonationService {
       allocation: DONATION_ALLOCATION,
       allocationLabel: DONATION_ALLOCATION_LABEL,
       allocationDescription: DONATION_ALLOCATION_DESCRIPTION,
+      termsSnapshotHash,
+      termsVersion,
       status: donation.status,
       issuedAt: now,
     };
