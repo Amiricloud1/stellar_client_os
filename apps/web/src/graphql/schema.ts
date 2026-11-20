@@ -297,6 +297,111 @@ export const typeDefs = /* GraphQL */`
     sponsoredAt: Int!
   }
 
+  """
+  Immutable snapshot of the donor-facing terms shown before a contribution was
+  signed (issue #176).
+
+  The snapshot is captured at contribution time and bound to the contribution
+  by `contentHash`. Clients should display `terms` and recompute the hash to
+  verify it matches `contentHash` before signing.
+  """
+  type TermsSnapshot {
+    """Monotonic version of the terms document that was shown."""
+    version: Int!
+    """The exact donor-facing terms text shown before signing."""
+    terms: String!
+    """
+    SHA-256 (hex) content hash of `terms`. Bound to the contribution so the
+    displayed terms can be verified after the fact.
+    """
+    contentHash: String!
+    """Unix timestamp (seconds) when the snapshot was captured."""
+    capturedAt: Int!
+  }
+
+  """
+  A contribution (donation) bound to the terms snapshot shown before signing
+  (issue #176).
+  """
+  type CampaignDonation {
+    id: ID!
+    campaignId: ID!
+    donor: String!
+    amount: String!
+    token: String!
+    createdAt: Int!
+    """The terms snapshot captured when this contribution was signed."""
+    termsSnapshot: TermsSnapshot!
+    """Convenience accessor for `termsSnapshot.contentHash`."""
+    termsSnapshotHash: String!
+    """Convenience accessor for `termsSnapshot.version`."""
+    termsVersion: Int!
+  }
+
+  """
+  Receipt for a contribution, including the terms snapshot it was bound to
+  (issue #176). Receipts remain verifiable even if the current terms change.
+  """
+  type DonationReceipt {
+    id: ID!
+    donationId: ID!
+    campaignId: ID!
+    donor: String!
+    amount: String!
+    token: String!
+    issuedAt: Int!
+    """The terms snapshot bound to the underlying contribution."""
+    termsSnapshot: TermsSnapshot!
+    """Convenience accessor for `termsSnapshot.contentHash`."""
+    termsSnapshotHash: String!
+    """Convenience accessor for `termsSnapshot.version`."""
+    termsVersion: Int!
+  }
+
+  """
+  Resolution status of a reviewer comment (issue #178).
+  """
+  enum ReviewerCommentStatus {
+    """Comment is open and awaiting resolution."""
+    OPEN
+    """Comment has been resolved by a reviewer."""
+    RESOLVED
+  }
+
+  """
+  A reviewer comment attached to a specific evidence version (issue #178).
+
+  Attribution (`author`), `createdAt`, and `status` are preserved. Comments are
+  immutable except for their resolution status.
+  """
+  type ReviewerComment {
+    id: ID!
+    """The evidence item the comment refers to."""
+    evidenceId: ID!
+    """The specific evidence version the comment refers to."""
+    evidenceVersion: Int!
+    """Author (reviewer) address or account identifier."""
+    author: String!
+    """Comment body."""
+    body: String!
+    """Current resolution status."""
+    status: ReviewerCommentStatus!
+    """Unix timestamp (seconds) when the comment was created."""
+    createdAt: Int!
+    """Unix timestamp (seconds) when the comment was resolved, if ever."""
+    resolvedAt: Int
+    """Author who resolved the comment, if ever."""
+    resolvedBy: String
+  }
+
+  """
+  A page of reviewer comments plus shared pagination metadata (issue #178).
+  """
+  type ReviewerCommentPage {
+    items: [ReviewerComment!]!
+    pageInfo: PageInfo!
+  }
+
   type CampaignStatusHistory {
     id: ID!
     campaignId: ID!
@@ -709,6 +814,42 @@ export const typeDefs = /* GraphQL */`
     The grant allocations awarded to a campaign across all programs.
     """
     campaignGrantAllocations(campaignId: ID!): [GrantAllocation!]!
+
+    """
+    The current donor-facing terms snapshot for a campaign (issue #176).
+
+    Clients must display this snapshot and verify its `contentHash` before
+    signing a contribution. The snapshot returned here is the one that will be
+    bound to the next contribution.
+    """
+    campaignTermsSnapshot(campaignId: ID!): TermsSnapshot!
+
+    """
+    A contribution with its bound terms snapshot (issue #176).
+    """
+    campaignDonation(donationId: ID!): CampaignDonation
+
+    """
+    The receipt for a contribution, including its bound terms snapshot
+    (issue #176).
+    """
+    donationReceipt(donationId: ID!): DonationReceipt
+
+    """
+    Reviewer comments for a specific evidence version (issue #178).
+
+    Default sort: createdAt DESC, tiebroken by id ASC. Limit defaults to 20 and
+    is capped at 100.
+
+    Auth policy: privileged (requires an authenticated reviewer account).
+    """
+    reviewerComments(
+      evidenceId: ID!
+      evidenceVersion: Int!
+      status: ReviewerCommentStatus
+      sort: SortInput
+      pagination: PaginationInput
+    ): ReviewerCommentPage!
   }
 
   """
@@ -814,6 +955,30 @@ export const typeDefs = /* GraphQL */`
     Auth policy: privileged (owner only; non-owners receive NOT_FOUND).
     """
     revokeWebhookSubscription(id: ID!): WebhookSubscription!
+
+    """
+    Creates a reviewer comment on a specific evidence version (issue #178).
+
+    The author is always the authenticated reviewer; attribution is taken from
+    the session and cannot be spoofed by the client.
+
+    Auth policy: privileged (authenticated reviewer; unauthenticated callers
+    receive UNAUTHENTICATED).
+    """
+    createReviewerComment(
+      evidenceId: ID!
+      evidenceVersion: Int!
+      body: String!
+    ): ReviewerComment!
+
+    """
+    Resolves a reviewer comment (issue #178). Idempotent: resolving an already
+    resolved comment returns it unchanged.
+
+    Auth policy: privileged (authenticated reviewer; non-reviewers receive
+    FORBIDDEN).
+    """
+    resolveReviewerComment(id: ID!): ReviewerComment!
   }
 
   extend type Query {

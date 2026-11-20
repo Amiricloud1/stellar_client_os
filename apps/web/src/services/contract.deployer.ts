@@ -61,6 +61,7 @@ export type CompilationErrorCode =
   | 'COMPILATION_TIMEOUT'
   | 'COMPILATION_OUTPUT_TOO_LARGE';
 
+
 export class CompilationLimitError extends Error {
   readonly code: CompilationErrorCode;
 
@@ -69,6 +70,269 @@ export class CompilationLimitError extends Error {
     this.name = 'CompilationLimitError';
     this.code = code;
   }
+}
+
+/**
+ * Categories of pre-launch readiness checks. Each category is validated
+ * independently so operators can see exactly what must be fixed before a
+ * campaign can be deployed.
+ */
+export type ReadinessCategory =
+  | 'metadata'
+  | 'network'
+  | 'assetSupport'
+  | 'milestones'
+  | 'payoutTerms';
+
+export const READINESS_CATEGORIES: readonly ReadinessCategory[] = Object.freeze([
+  'metadata',
+  'network',
+  'assetSupport',
+  'milestones',
+  'payoutTerms',
+]);
+
+/**
+ * A single item in the pre-launch readiness checklist.
+ *
+ * - `category`  — Which readiness area the item belongs to.
+ * - `id`        — Stable identifier for the check (safe to branch on).
+ * - `passed`    — Whether the check succeeded.
+ * - `message`   — Human-readable, operator-facing explanation.
+ */
+export interface ReadinessCheckItem {
+  category: ReadinessCategory;
+  id: string;
+  passed: boolean;
+  message: string;
+}
+
+/**
+ * Structured result of a readiness validation run.
+ *
+ * - `ready`  — True only when every check passed.
+ * - `items`  — The full checklist (both passing and failing items).
+ * - `failed` — Convenience list of only the failing items.
+ */
+export interface ReadinessReport {
+  ready: boolean;
+  items: ReadinessCheckItem[];
+  failed: ReadinessCheckItem[];
+}
+
+/**
+ * Campaign metadata required before deployment.
+ */
+export interface CampaignMetadata {
+  name?: string;
+  description?: string;
+  owner?: string;
+}
+
+/**
+ * Milestone definition used for readiness validation.
+ */
+export interface CampaignMilestone {
+  title?: string;
+  amount?: string | number;
+  dueDate?: string | Date;
+}
+
+/**
+ * Payout terms used for readiness validation.
+ */
+export interface PayoutTerms {
+  assetCode?: string;
+  assetIssuer?: string;
+  totalAmount?: string | number;
+  /** Whether the payout asset is a native (XLM) asset. */
+  native?: boolean;
+}
+
+/**
+ * Inputs to the pre-launch readiness validator.
+ */
+export interface CampaignReadinessInput {
+  /** Campaign metadata (name, description, owner). */
+  metadata?: CampaignMetadata;
+  /** Network the campaign will be deployed to. */
+  network?: {
+    networkPassphrase?: string;
+    rpcUrl?: string;
+  };
+  /** Assets the campaign will accept / pay out. */
+  assets?: {
+    supported?: string[];
+    required?: string[];
+  };
+  /** Milestones the campaign defines. */
+  milestones?: CampaignMilestone[];
+  /** Payout terms for the campaign. */
+  payoutTerms?: PayoutTerms;
+  /** Address of the account attempting the deployment (authorization). */
+  deployerAddress?: string;
+  /** Addresses authorized to deploy the campaign. */
+  authorizedDeployers?: string[];
+}
+
+/**
+ * Raised when a deployment is attempted while the readiness checklist has
+ * failing items. Carries the full {@link ReadinessReport} so operators can
+ * surface every problem at once and retry after fixes.
+ */
+export class ReadinessError extends Error {
+  readonly code = 'DEPLOYMENT_NOT_READY' as const;
+  readonly report: ReadinessReport;
+
+  constructor(report: ReadinessReport) {
+    const summary = report.failed
+      .map((item) => `[${item.category}] ${item.message}`)
+      .join('; ');
+    super(`Deployment blocked: campaign is not ready. ${summary}`);
+    this.name = 'ReadinessError';
+    this.report = report;
+  }
+}
+
+/**
+ * Validates campaign readiness before deployment. Returns a structured
+ * checklist covering metadata, network, asset support, milestones, and payout
+ * terms. This is a pure function so it can be reused by the API layer and by
+ * the deployer's authoritative pre-deployment gate.
+ */
+export function validateCampaignReadiness(input: CampaignReadinessInput): ReadinessReport {
+  const items: ReadinessCheckItem[] = [];
+
+  const push = (
+    category: ReadinessCategory,
+    id: string,
+    passed: boolean,
+    message: string
+  ): void => {
+    items.push({ category, id, passed, message });
+  };
+
+  // --- Metadata -----------------------------------------------------------
+  const name = input.metadata?.name?.trim();
+  push(
+    'metadata',
+    'metadata.name',
+    Boolean(name),
+    name ? 'Campaign name is set.' : 'Campaign name is required.'
+  );
+
+  const description = input.metadata?.description?.trim();
+  push(
+    'metadata',
+    'metadata.description',
+    Boolean(description),
+    description ? 'Campaign description is set.' : 'Campaign description is required.'
+  );
+
+  const owner = input.metadata?.owner?.trim();
+  push(
+    'metadata',
+    'metadata.owner',
+    Boolean(owner),
+    owner ? 'Campaign owner is set.' : 'Campaign owner address is required.'
+  );
+
+  // --- Network ------------------------------------------------------------
+  const passphrase = input.network?.networkPassphrase?.trim();
+  push(
+    'network',
+    'network.passphrase',
+    Boolean(passphrase),
+    passphrase
+      ? 'Network passphrase is configured.'
+      : 'Network passphrase is required.'
+  );
+
+  const rpcUrl = input.network?.rpcUrl?.trim();
+  const rpcValid = Boolean(rpcUrl) && /^https?:\/\//i.test(rpcUrl as string);
+  push(
+    'network',
+    'network.rpcUrl',
+    rpcValid,
+    rpcValid
+      ? 'RPC URL is configured.'
+      : 'A valid http(s) RPC URL is required.'
+  );
+
+  // --- Asset support ------------------------------------------------------
+  const supported = input.assets?.supported ?? [];
+  const required = input.assets?.required ?? [];
+  const supportedSet = new Set(supported);
+  const missingAssets = required.filter((asset) => !supportedSet.has(asset));
+  push(
+    'assetSupport',
+    'assets.requiredSupported',
+    required.length > 0 && missingAssets.length === 0,
+    required.length === 0
+      ? 'At least one required asset must be declared.'
+      : missingAssets.length === 0
+        ? 'All required assets are supported.'
+        : `Unsupported required asset(s): ${missingAssets.join(', ')}.`
+  );
+
+  // --- Milestones ---------------------------------------------------------
+  const milestones = input.milestones ?? [];
+  const milestonesValid =
+    milestones.length > 0 &&
+    milestones.every((m) => {
+      const title = m.title?.trim();
+      const amount = Number(m.amount);
+      const hasAmount = Number.isFinite(amount) && amount > 0;
+      const hasDue = Boolean(m.dueDate);
+      return Boolean(title) && hasAmount && hasDue;
+    });
+  push(
+    'milestones',
+    'milestones.valid',
+    milestonesValid,
+    milestones.length === 0
+      ? 'At least one milestone is required.'
+      : milestonesValid
+        ? 'All milestones have a title, positive amount, and due date.'
+        : 'Every milestone must have a title, a positive amount, and a due date.'
+  );
+
+  // --- Payout terms -------------------------------------------------------
+  const terms = input.payoutTerms;
+  const native = terms?.native === true;
+  const assetCode = terms?.assetCode?.trim();
+  const assetIssuer = terms?.assetIssuer?.trim();
+  const totalAmount = Number(terms?.totalAmount);
+  const hasTotal = Number.isFinite(totalAmount) && totalAmount > 0;
+  const assetOk = native ? true : Boolean(assetCode) && Boolean(assetIssuer);
+  const payoutValid = hasTotal && assetOk;
+  push(
+    'payoutTerms',
+    'payoutTerms.valid',
+    payoutValid,
+    !hasTotal
+      ? 'Payout total amount must be a positive number.'
+      : !assetOk
+        ? 'Payout asset code and issuer are required (or mark the asset as native).'
+        : 'Payout terms are complete.'
+  );
+
+  // --- Authorization ------------------------------------------------------
+  const deployer = input.deployerAddress?.trim();
+  const authorized = input.authorizedDeployers ?? [];
+  const authorizedOk =
+    Boolean(deployer) && authorized.length > 0 && authorized.includes(deployer as string);
+  push(
+    'metadata',
+    'authorization.deployer',
+    authorizedOk,
+    authorizedOk
+      ? 'Deployer is authorized.'
+      : 'Deployer address is not authorized to deploy this campaign.'
+  );
+
+  const failed = items.filter((item) => !item.passed);
+  return { ready: failed.length === 0, items, failed };
 }
 =======
 
@@ -401,6 +665,41 @@ export class ContractDeployer {
     }
     
     return contractAddress;
+  }
+
+  /**
+   * Authoritative pre-deployment readiness gate.
+   *
+   * Runs the full pre-launch checklist (metadata, network, asset support,
+   * milestones, payout terms, and deployer authorization) and throws a
+   * {@link ReadinessError} carrying the structured report if any item fails.
+   * This must be called before any deployment transaction is built or
+   * submitted so that invalid campaigns are blocked at the boundary.
+   *
+   * @returns The passing {@link ReadinessReport} when the campaign is ready.
+   */
+  assertReadyForDeployment(input: CampaignReadinessInput): ReadinessReport {
+    const report = validateCampaignReadiness(input);
+    if (!report.ready) {
+      throw new ReadinessError(report);
+    }
+    return report;
+  }
+
+  /**
+   * Builds the create-contract transaction only after the campaign passes the
+   * pre-launch readiness checklist. Fails fast with a {@link ReadinessError}
+   * (and never contacts the network) when the campaign is not ready.
+   */
+  async buildCreateContractTxIfReady(
+    readiness: CampaignReadinessInput,
+    address: string,
+    wasmHash: Buffer,
+    salt?: Buffer,
+    fee: string = '1000',
+  ): Promise<{ transaction: Transaction; simulation: Api.SimulateTransactionSuccessResponse; salt: Buffer }> {
+    this.assertReadyForDeployment(readiness);
+    return this.buildCreateContractTx(address, wasmHash, salt, fee);
   }
 
   private async getAccount(address: string): Promise<Account> {
