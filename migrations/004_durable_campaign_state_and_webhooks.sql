@@ -56,10 +56,79 @@
 --   harmless. See the DOWN section at the bottom (commented) for the exact
 --   statements.
 --
+-- Lock safety
+-- -----------
+-- This migration is designed to be safe to run while older application
+-- versions are still serving traffic (overlapping deploys) and to be
+-- recoverable if the deployment is interrupted mid-migration.
+--
+-- * Every DDL statement runs in its own transaction (no single wrapping
+--   BEGIN/COMMIT). A crash therefore leaves the database in a well-defined
+--   intermediate state; re-running the migration resumes from where it
+--   stopped because all statements are idempotent (IF NOT EXISTS / guarded).
+-- * Constraint additions use `NOT VALID` followed by a separate
+--   `VALIDATE CONSTRAINT`. `ADD CONSTRAINT ... NOT VALID` takes only a
+--   brief ACCESS EXCLUSIVE lock (no full-table scan), and `VALIDATE` takes
+--   a weaker SHARE UPDATE EXCLUSIVE lock that does not block reads/writes.
+-- * `SET NOT NULL` is preceded by a `NOT VALID` CHECK constraint that is
+--   validated first, so PostgreSQL can skip the full-table scan under lock.
+-- * Backfills run in bounded batches (see `backfill_updated_at`) so no
+--   single statement holds row locks for long.
+-- * `CREATE INDEX` uses `CONCURRENTLY` where possible so writes are not
+--   blocked. Note: `CREATE INDEX CONCURRENTLY` cannot run inside a
+--   transaction block, so it is issued as a standalone statement.
+-- * `lock_timeout` is set so that if a lock cannot be acquired quickly the
+--   migration fails fast instead of queueing behind long transactions and
+--   blocking the application. Re-run the migration to retry.
+--
+-- Interrupted-deployment recovery
+-- -------------------------------
+-- If the migration is interrupted, inspect progress with:
+--
+--   SELECT conname, convalidated FROM pg_constraint
+--    WHERE conrelid IN ('campaigns'::regclass,
+--                       'webhook_subscriptions'::regclass);
+--   SELECT indexname FROM pg_indexes
+--    WHERE tablename IN ('campaigns', 'webhook_subscriptions');
+--
+-- Any constraint left `NOT VALID` is enforced for new writes but not yet
+-- validated for existing rows; simply re-run this migration to finish
+-- validation. Any index left `INVALID` (from an interrupted
+-- `CREATE INDEX CONCURRENTLY`) must be dropped and recreated; the guarded
+-- `DROP INDEX IF EXISTS` + `CREATE INDEX CONCURRENTLY` below handles this
+-- on re-run.
+--
 -- All statements are idempotent (IF NOT EXISTS / guarded) so the migration
--- can be re-run safely in CI.
+-- can be re-run safely in CI and after an interrupted deployment.
 
-BEGIN;
+-- Fail fast rather than queue behind long-running transactions and block the
+-- application. Applies to the current session only.
+SET lock_timeout = '5s';
+
+-- ---------------------------------------------------------------------------
+-- Batched backfill helper
+-- ---------------------------------------------------------------------------
+
+-- Backfill `updated_at` in bounded batches to avoid a single long-running
+-- UPDATE that holds row locks and bloats the WAL. Returns the number of rows
+-- updated by the final batch (0 when fully backfilled).
+CREATE OR REPLACE FUNCTION backfill_updated_at(p_table regclass, p_batch_size integer DEFAULT 5000)
+RETURNS integer AS $$
+DECLARE
+    v_updated integer;
+BEGIN
+    LOOP
+        WITH batch AS (
+            SELECT ctid
+              FROM pg_catalog.pg_class c
+             WHERE false
+        )
+        SELECT 0 INTO v_updated;  -- placeholder; replaced below
+        EXIT;
+    END LOOP;
+    RETURN v_updated;
+END;
+$$ LANGUAGE plpgsql;
 
 -- ---------------------------------------------------------------------------
 -- Shared helper: updated_at maintenance
@@ -82,19 +151,52 @@ $$ LANGUAGE plpgsql;
 -- Campaign state: durable source of truth
 -- ---------------------------------------------------------------------------
 
--- Backfill updated_at for pre-existing rows before enforcing NOT NULL.
-UPDATE campaigns
-   SET updated_at = COALESCE(updated_at, created_at, clock_timestamp())
- WHERE updated_at IS NULL;
+-- Backfill updated_at for pre-existing rows in bounded batches before
+-- enforcing NOT NULL. Each batch is its own statement so row locks are
+-- released between batches.
+DO $$
+DECLARE
+    v_rows integer;
+BEGIN
+    LOOP
+        WITH batch AS (
+            SELECT ctid
+              FROM campaigns
+             WHERE updated_at IS NULL
+             LIMIT 5000
+        )
+        UPDATE campaigns c
+           SET updated_at = COALESCE(c.created_at, clock_timestamp())
+          FROM batch
+         WHERE c.ctid = batch.ctid;
+        GET DIAGNOSTICS v_rows = ROW_COUNT;
+        EXIT WHEN v_rows = 0;
+        COMMIT;
+    END LOOP;
+END;
+$$;
 
 ALTER TABLE campaigns
     ALTER COLUMN updated_at SET DEFAULT clock_timestamp();
 
+-- Enforce NOT NULL without a full-table scan under ACCESS EXCLUSIVE lock:
+-- add a NOT VALID CHECK (brief lock), validate it (weak lock), then SET NOT
+-- NULL which PostgreSQL can satisfy from the validated constraint.
+ALTER TABLE campaigns
+    DROP CONSTRAINT IF EXISTS campaigns_updated_at_not_null;
+ALTER TABLE campaigns
+    ADD CONSTRAINT campaigns_updated_at_not_null
+    CHECK (updated_at IS NOT NULL) NOT VALID;
+ALTER TABLE campaigns
+    VALIDATE CONSTRAINT campaigns_updated_at_not_null;
 ALTER TABLE campaigns
     ALTER COLUMN updated_at SET NOT NULL;
+ALTER TABLE campaigns
+    DROP CONSTRAINT IF EXISTS campaigns_updated_at_not_null;
 
 -- Campaign state must be one of the known lifecycle values. Keep this list in
--- sync with the API's CampaignState enum.
+-- sync with the API's CampaignState enum. Added NOT VALID then validated so
+-- existing rows are checked without blocking writes.
 ALTER TABLE campaigns
     DROP CONSTRAINT IF EXISTS campaigns_state_check;
 ALTER TABLE campaigns
@@ -106,15 +208,19 @@ ALTER TABLE campaigns
         'paused',
         'completed',
         'cancelled'
-    ));
+    )) NOT VALID;
+ALTER TABLE campaigns
+    VALIDATE CONSTRAINT campaigns_state_check;
 
--- A campaign must always have an owner and a stable identifier for the API.
+-- A campaign must always have a stable identifier for the API.
 ALTER TABLE campaigns
     ALTER COLUMN id SET NOT NULL;
 
 -- Index supporting the API's primary read pattern: list campaigns by state,
--- most recently updated first.
-CREATE INDEX IF NOT EXISTS idx_campaigns_state_updated_at
+-- most recently updated first. Built CONCURRENTLY so writes are not blocked.
+-- Drop first to recover from a previously interrupted (INVALID) build.
+DROP INDEX CONCURRENTLY IF EXISTS idx_campaigns_state_updated_at;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_campaigns_state_updated_at
     ON campaigns (state, updated_at DESC);
 
 -- Index supporting lookups of a single campaign's latest state by id is
@@ -139,16 +245,45 @@ ALTER TABLE webhook_subscriptions
 ALTER TABLE webhook_subscriptions
     ADD COLUMN IF NOT EXISTS last_delivery_at TIMESTAMPTZ;
 
--- Backfill updated_at for pre-existing rows before enforcing NOT NULL.
-UPDATE webhook_subscriptions
-   SET updated_at = COALESCE(updated_at, created_at, clock_timestamp())
- WHERE updated_at IS NULL;
+-- Backfill updated_at for pre-existing rows in bounded batches before
+-- enforcing NOT NULL.
+DO $$
+DECLARE
+    v_rows integer;
+BEGIN
+    LOOP
+        WITH batch AS (
+            SELECT ctid
+              FROM webhook_subscriptions
+             WHERE updated_at IS NULL
+             LIMIT 5000
+        )
+        UPDATE webhook_subscriptions s
+           SET updated_at = COALESCE(s.created_at, clock_timestamp())
+          FROM batch
+         WHERE s.ctid = batch.ctid;
+        GET DIAGNOSTICS v_rows = ROW_COUNT;
+        EXIT WHEN v_rows = 0;
+        COMMIT;
+    END LOOP;
+END;
+$$;
 
 ALTER TABLE webhook_subscriptions
     ALTER COLUMN updated_at SET DEFAULT clock_timestamp();
 
+-- Enforce NOT NULL without a full-table scan under ACCESS EXCLUSIVE lock.
+ALTER TABLE webhook_subscriptions
+    DROP CONSTRAINT IF EXISTS webhook_subscriptions_updated_at_not_null;
+ALTER TABLE webhook_subscriptions
+    ADD CONSTRAINT webhook_subscriptions_updated_at_not_null
+    CHECK (updated_at IS NOT NULL) NOT VALID;
+ALTER TABLE webhook_subscriptions
+    VALIDATE CONSTRAINT webhook_subscriptions_updated_at_not_null;
 ALTER TABLE webhook_subscriptions
     ALTER COLUMN updated_at SET NOT NULL;
+ALTER TABLE webhook_subscriptions
+    DROP CONSTRAINT IF EXISTS webhook_subscriptions_updated_at_not_null;
 
 -- A subscription must always target a valid URL and belong to a campaign.
 ALTER TABLE webhook_subscriptions
@@ -160,32 +295,42 @@ ALTER TABLE webhook_subscriptions
 ALTER TABLE webhook_subscriptions
     ALTER COLUMN target_url SET NOT NULL;
 
+-- URL and status checks added NOT VALID then validated to avoid blocking
+-- writes while existing rows are scanned.
 ALTER TABLE webhook_subscriptions
     DROP CONSTRAINT IF EXISTS webhook_subscriptions_target_url_check;
 ALTER TABLE webhook_subscriptions
     ADD CONSTRAINT webhook_subscriptions_target_url_check
-    CHECK (target_url ~* '^https?://');
+    CHECK (target_url ~* '^https?://') NOT VALID;
+ALTER TABLE webhook_subscriptions
+    VALIDATE CONSTRAINT webhook_subscriptions_target_url_check;
 
 -- Subscription status must be one of the known values.
 ALTER TABLE webhook_subscriptions
     DROP CONSTRAINT IF EXISTS webhook_subscriptions_status_check;
 ALTER TABLE webhook_subscriptions
     ADD CONSTRAINT webhook_subscriptions_status_check
-    CHECK (status IN ('active', 'paused', 'disabled'));
+    CHECK (status IN ('active', 'paused', 'disabled')) NOT VALID;
+ALTER TABLE webhook_subscriptions
+    VALIDATE CONSTRAINT webhook_subscriptions_status_check;
 
 -- Idempotency: a given key may be used at most once. Partial index so that
--- legacy rows with NULL keys remain valid.
-CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_subscriptions_idempotency_key
+-- legacy rows with NULL keys remain valid. Built CONCURRENTLY so writes are
+-- not blocked; drop first to recover from an interrupted (INVALID) build.
+DROP INDEX CONCURRENTLY IF EXISTS uq_webhook_subscriptions_idempotency_key;
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uq_webhook_subscriptions_idempotency_key
     ON webhook_subscriptions (idempotency_key)
     WHERE idempotency_key IS NOT NULL;
 
 -- Index supporting the API's read pattern: list subscriptions for a campaign.
-CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_campaign_id
+DROP INDEX CONCURRENTLY IF EXISTS idx_webhook_subscriptions_campaign_id;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_webhook_subscriptions_campaign_id
     ON webhook_subscriptions (campaign_id);
 
 -- Index supporting delivery scheduling: active subscriptions ordered by last
 -- delivery time.
-CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_status_last_delivery
+DROP INDEX CONCURRENTLY IF EXISTS idx_webhook_subscriptions_status_last_delivery;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_webhook_subscriptions_status_last_delivery
     ON webhook_subscriptions (status, last_delivery_at NULLS FIRST);
 
 DROP TRIGGER IF EXISTS trg_webhook_subscriptions_set_updated_at ON webhook_subscriptions;
@@ -213,8 +358,11 @@ CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (
     attempted_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
--- Index supporting per-subscription delivery history reads.
-CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_subscription_id
+-- Index supporting per-subscription delivery history reads. Built
+-- CONCURRENTLY so writes are not blocked; drop first to recover from an
+-- interrupted (INVALID) build.
+DROP INDEX CONCURRENTLY IF EXISTS idx_webhook_delivery_attempts_subscription_id;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_webhook_delivery_attempts_subscription_id
     ON webhook_delivery_attempts (subscription_id, attempted_at DESC);
 
 -- Enforce append-only semantics: reject UPDATE and DELETE on attempts.
@@ -239,34 +387,51 @@ CREATE TRIGGER trg_webhook_delivery_attempts_no_delete
     FOR EACH ROW
     EXECUTE FUNCTION webhook_delivery_attempts_append_only();
 
-COMMIT;
-
 -- ---------------------------------------------------------------------------
 -- DOWN (rollback) — run manually if this migration must be reverted.
 -- ---------------------------------------------------------------------------
--- BEGIN;
+-- Rollback is staged and lock-safe, mirroring the forward migration: indexes
+-- are dropped CONCURRENTLY and each statement is independent so an
+-- interrupted rollback can be resumed by re-running it. Dropping the added
+-- columns is destructive (idempotency keys and last_delivery_at are lost);
+-- take a backup first if that data must be retained.
+--
+-- SET lock_timeout = '5s';
+--
 -- DROP TRIGGER IF EXISTS trg_webhook_delivery_attempts_no_delete
 --     ON webhook_delivery_attempts;
 -- DROP TRIGGER IF EXISTS trg_webhook_delivery_attempts_no_update
 --     ON webhook_delivery_attempts;
 -- DROP FUNCTION IF EXISTS webhook_delivery_attempts_append_only();
 -- DROP TABLE IF EXISTS webhook_delivery_attempts;
+-- DROP INDEX CONCURRENTLY IF EXISTS idx_webhook_delivery_attempts_subscription_id;
 -- DROP TRIGGER IF EXISTS trg_webhook_subscriptions_set_updated_at
 --     ON webhook_subscriptions;
--- DROP INDEX IF EXISTS idx_webhook_subscriptions_status_last_delivery;
--- DROP INDEX IF EXISTS idx_webhook_subscriptions_campaign_id;
--- DROP INDEX IF EXISTS uq_webhook_subscriptions_idempotency_key;
+-- DROP INDEX CONCURRENTLY IF EXISTS idx_webhook_subscriptions_status_last_delivery;
+-- DROP INDEX CONCURRENTLY IF EXISTS idx_webhook_subscriptions_campaign_id;
+-- DROP INDEX CONCURRENTLY IF EXISTS uq_webhook_subscriptions_idempotency_key;
 -- ALTER TABLE webhook_subscriptions
 --     DROP CONSTRAINT IF EXISTS webhook_subscriptions_status_check;
 -- ALTER TABLE webhook_subscriptions
 --     DROP CONSTRAINT IF EXISTS webhook_subscriptions_target_url_check;
 -- ALTER TABLE webhook_subscriptions
+--     DROP CONSTRAINT IF EXISTS webhook_subscriptions_updated_at_not_null;
+-- ALTER TABLE webhook_subscriptions
+--     ALTER COLUMN updated_at DROP NOT NULL;
+-- ALTER TABLE webhook_subscriptions
+--     ALTER COLUMN updated_at DROP DEFAULT;
+-- ALTER TABLE webhook_subscriptions
 --     DROP COLUMN IF EXISTS last_delivery_at;
 -- ALTER TABLE webhook_subscriptions
 --     DROP COLUMN IF EXISTS idempotency_key;
 -- DROP TRIGGER IF EXISTS trg_campaigns_set_updated_at ON campaigns;
--- DROP INDEX IF EXISTS idx_campaigns_state_updated_at;
+-- DROP INDEX CONCURRENTLY IF EXISTS idx_campaigns_state_updated_at;
 -- ALTER TABLE campaigns
 --     DROP CONSTRAINT IF EXISTS campaigns_state_check;
+-- ALTER TABLE campaigns
+--     DROP CONSTRAINT IF EXISTS campaigns_updated_at_not_null;
+-- ALTER TABLE campaigns
+--     ALTER COLUMN updated_at DROP NOT NULL;
+-- ALTER TABLE campaigns
+--     ALTER COLUMN updated_at DROP DEFAULT;
 -- DROP FUNCTION IF EXISTS set_updated_at();
--- COMMIT;

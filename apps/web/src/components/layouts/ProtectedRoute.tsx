@@ -7,6 +7,11 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useWallet } from "@/providers/StellarWalletProvider";
 import { ClientOnly } from "@/components/ui/client-only";
+import {
+  evaluateResourceAccess,
+  type ResourceAccessDecision,
+  type ResourceAccessPolicy,
+} from "@/lib/authorization/nestedResourcePolicy";
 
 interface ConnectWalletPromptProps {
   title?: string;
@@ -58,6 +63,17 @@ export function ConnectWalletPrompt({
 
 interface ProtectedRouteProps extends ConnectWalletPromptProps {
   children: ReactNode;
+  /**
+   * Optional nested-resource authorization policy. When provided, the route is
+   * gated using the centralized policy (see `nestedResourcePolicy`) instead of
+   * a plain "wallet connected" check. Existing usages that omit this prop keep
+   * the previous behavior.
+   */
+  policy?: ResourceAccessPolicy;
+  /** Rendered when the policy denies access (authenticated but unauthorized). */
+  unauthorizedFallback?: ReactNode;
+  /** Rendered when the policy reports the resource does not exist. */
+  notFoundFallback?: ReactNode;
 }
 
 /**
@@ -78,6 +94,9 @@ export default function ProtectedRoute({
   actionLabel,
   containerClassName,
   cardClassName,
+  policy,
+  unauthorizedFallback,
+  notFoundFallback,
 }: ProtectedRouteProps) {
   return (
     <ClientOnly
@@ -97,10 +116,80 @@ export default function ProtectedRoute({
         actionLabel={actionLabel}
         containerClassName={containerClassName}
         cardClassName={cardClassName}
+        policy={policy}
+        unauthorizedFallback={unauthorizedFallback}
+        notFoundFallback={notFoundFallback}
       >
         {children}
       </ProtectedRouteInner>
     </ClientOnly>
+  );
+}
+
+/** Explicit state shown when the viewer is authenticated but not permitted. */
+function UnauthorizedState({
+  containerClassName,
+  cardClassName,
+}: Pick<ConnectWalletPromptProps, "containerClassName" | "cardClassName">) {
+  return (
+    <div
+      className={cn(
+        "flex min-h-[60vh] items-center justify-center px-4 py-10",
+        containerClassName,
+      )}
+      role="alert"
+    >
+      <div
+        className={cn(
+          "relative w-full max-w-xl overflow-hidden rounded-3xl border border-white/10 bg-fundable-mid-dark p-10 text-center shadow-[0_0_40px_rgba(130,86,255,0.12)]",
+          cardClassName,
+        )}
+      >
+        <div className="relative z-10 space-y-2">
+          <h2 className="text-2xl font-semibold text-white">
+            You don&apos;t have access to this resource
+          </h2>
+          <p className="text-fundable-light-grey">
+            Your wallet is connected, but it isn&apos;t the owner, a
+            collaborator, or an authorized donor for this resource. If you
+            believe this is a mistake, contact the project owner.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Explicit state shown when the resource referenced by the route is missing. */
+function NotFoundState({
+  containerClassName,
+  cardClassName,
+}: Pick<ConnectWalletPromptProps, "containerClassName" | "cardClassName">) {
+  return (
+    <div
+      className={cn(
+        "flex min-h-[60vh] items-center justify-center px-4 py-10",
+        containerClassName,
+      )}
+      role="alert"
+    >
+      <div
+        className={cn(
+          "relative w-full max-w-xl overflow-hidden rounded-3xl border border-white/10 bg-fundable-mid-dark p-10 text-center shadow-[0_0_40px_rgba(130,86,255,0.12)]",
+          cardClassName,
+        )}
+      >
+        <div className="relative z-10 space-y-2">
+          <h2 className="text-2xl font-semibold text-white">
+            Resource not found
+          </h2>
+          <p className="text-fundable-light-grey">
+            The resource you&apos;re looking for doesn&apos;t exist or is no
+            longer available.
+          </p>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -112,6 +201,9 @@ function ProtectedRouteInner({
   actionLabel,
   containerClassName,
   cardClassName,
+  policy,
+  unauthorizedFallback,
+  notFoundFallback,
 }: ProtectedRouteProps) {
   const { address } = useWallet();
 
@@ -125,6 +217,39 @@ function ProtectedRouteInner({
         cardClassName={cardClassName}
       />
     );
+  }
+
+  if (policy) {
+    const decision: ResourceAccessDecision = evaluateResourceAccess(
+      policy,
+      address,
+    );
+
+    if (decision.status === "not_found") {
+      return (
+        <>
+          {notFoundFallback ?? (
+            <NotFoundState
+              containerClassName={containerClassName}
+              cardClassName={cardClassName}
+            />
+          )}
+        </>
+      );
+    }
+
+    if (decision.status === "unauthorized") {
+      return (
+        <>
+          {unauthorizedFallback ?? (
+            <UnauthorizedState
+              containerClassName={containerClassName}
+              cardClassName={cardClassName}
+            />
+          )}
+        </>
+      );
+    }
   }
 
   return <>{children}</>;

@@ -10,6 +10,12 @@ import {
   streamIdSchema,
   paginationQuerySchema,
   streamStatusSchema,
+  sponsorPortfolioQuerySchema,
+  transactionTimelineQuerySchema,
+  transactionTimelineStageSchema,
+  transactionTimelineStatusSchema,
+  transactionTimelineEventSchema,
+  transactionTimelineSchema,
 } from './api-schemas'
 
 // Re-export the shared API schemas so form and API validation share a single
@@ -22,10 +28,22 @@ export {
   streamIdSchema,
   paginationQuerySchema,
   streamStatusSchema,
+  sponsorPortfolioQuerySchema,
+  transactionTimelineQuerySchema,
+  transactionTimelineStageSchema,
+  transactionTimelineStatusSchema,
+  transactionTimelineEventSchema,
+  transactionTimelineSchema,
 }
 export type {
   PaginationQuery,
   StreamStatus,
+  SponsorPortfolioQuery,
+  TransactionTimelineQuery,
+  TransactionTimelineStage,
+  TransactionTimelineStatus,
+  TransactionTimelineEvent,
+  TransactionTimeline,
 } from './api-schemas'
 
 // Stream record type for display
@@ -286,4 +304,27 @@ export function buildUploadObjectKey(
   parts.push(input.fileName)
   return parts.join("/")
 }
+
+/**
+ * Sponsor portfolio filters (issue #238).
+ *
+ * The sponsor portfolio reconciles committed, matched, and settled value across
+ * supported campaigns. Filters are shared by the portfolio form and the API
+ * route so both reject the same malformed input. `sponsorAddress` is the
+ * authenticated caller and is never trusted from the request body.
+ */
+export const sponsorPortfolioFiltersSchema = sponsorPortfolioQuerySchema
+
+export type SponsorPortfolioFilters = z.infer<typeof sponsorPortfolioFiltersSchema>
+
+/**
+ * Transaction confirmation timeline lookup (issue #239).
+ *
+ * A timeline is keyed by the transaction hash and optionally scoped to the
+ * owning campaign. The same schema backs the client poller and the API route so
+ * reload recovery resolves the same authoritative record.
+ */
+export const transactionTimelineLookupSchema = transactionTimelineQuerySchema
+
+export type TransactionTimelineLookup = z.infer<typeof transactionTimelineLookupSchema>
 

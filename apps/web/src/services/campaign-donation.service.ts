@@ -47,7 +47,70 @@ export type DonationErrorCode =
   | "INVALID_TOKEN"
   | "INVALID_DONOR"
   | "MESSAGE_TOO_LONG"
-  | "IDEMPOTENCY_CONFLICT";
+  | "IDEMPOTENCY_CONFLICT"
+  | "UNAUTHENTICATED"
+  | "FORBIDDEN";
+
+/**
+ * The authenticated principal making a donation-service request.
+ *
+ * `address` is the connected wallet; it is absent for anonymous callers.
+ * Authorization for nested resources (a campaign's donations and receipts) is
+ * decided here so every entry point enforces the same policy.
+ */
+export interface DonationPrincipal {
+  address?: string | null;
+  /** Explicit anonymous flag; anonymous principals are denied on read paths. */
+  anonymous?: boolean;
+}
+
+/** Relationship between a principal and a campaign, used by the policy. */
+export type CampaignRelationship = "owner" | "collaborator" | "donor" | "anonymous";
+
+export type DonationAuthorizationResult =
+  | { ok: true; relationship: CampaignRelationship; address: string }
+  | { ok: false; error: string; code: "UNAUTHENTICATED" | "FORBIDDEN" };
+
+const UNAUTHENTICATED_ERROR = "Connect a wallet to continue.";
+const FORBIDDEN_ERROR = "You do not have access to this campaign's donations.";
+
+/**
+ * Resolve the relationship between a principal and a campaign.
+ *
+ * Owner and collaborator checks are delegated to the campaign record so the
+ * policy stays in one place as campaign roles evolve. A principal that is not
+ * an owner/collaborator but has donated to the campaign is a donor.
+ */
+export function resolveCampaignRelationship(
+  principal: DonationPrincipal | null | undefined,
+  campaign: CampaignRecord,
+  donations: readonly CampaignDonation[] = [],
+): DonationAuthorizationResult {
+  const address = String(principal?.address ?? "").trim();
+  if (!address || principal?.anonymous) {
+    return { ok: false, error: UNAUTHENTICATED_ERROR, code: "UNAUTHENTICATED" };
+  }
+
+  const normalized = address.toLowerCase();
+  const owner = String(campaign.creator ?? "").trim().toLowerCase();
+  if (owner && owner === normalized) {
+    return { ok: true, relationship: "owner", address };
+  }
+
+  const collaborators = (campaign.collaborators ?? []).map((entry) => String(entry).trim().toLowerCase());
+  if (collaborators.includes(normalized)) {
+    return { ok: true, relationship: "collaborator", address };
+  }
+
+  const isDonor = donations.some(
+    (donation) => String(donation.donorAddress ?? "").trim().toLowerCase() === normalized,
+  );
+  if (isDonor) {
+    return { ok: true, relationship: "donor", address };
+  }
+
+  return { ok: false, error: FORBIDDEN_ERROR, code: "FORBIDDEN" };
+}
 
 export interface CreateDonationInput {
   campaignId: string;
@@ -259,16 +322,86 @@ export class CampaignDonationService {
     return { ok: true, ...result };
   }
 
-  /** Every donation recorded for a campaign, oldest first. */
-  getDonations(campaignId: string): CampaignDonation[] {
-    return [...this.campaignDonations(campaignId)];
+  /**
+   * Every donation recorded for a campaign, oldest first.
+   *
+   * Authorization: owners and collaborators may read the full campaign ledger;
+   * donors may read only their own donations; anonymous callers are denied.
+   */
+  async getDonations(
+    campaignId: string,
+    principal: DonationPrincipal | null | undefined,
+    dataSource: CampaignDataSource = getCampaignDataSource(),
+  ): Promise<DonationAccessResult<CampaignDonation[]>> {
+    const campaign = await getCampaign(campaignId?.trim() ?? "", dataSource);
+    if (!campaign) {
+      return { ok: false, error: "Campaign not found.", code: "INVALID_CAMPAIGN" };
+    }
+
+    const donations = this.campaignDonations(campaignId);
+    const authorization = resolveCampaignRelationship(principal, campaign, donations);
+    if (!authorization.ok) {
+      return authorization;
+    }
+
+    if (authorization.relationship === "donor") {
+      const normalized = authorization.address.toLowerCase();
+      return {
+        ok: true,
+        relationship: authorization.relationship,
+        value: donations.filter(
+          (donation) => String(donation.donorAddress ?? "").trim().toLowerCase() === normalized,
+        ),
+      };
+    }
+
+    return { ok: true, relationship: authorization.relationship, value: [...donations] };
   }
 
-  getReceipt(donationId: string): DonationReceipt | undefined {
-    return this.receipts.get(donationId);
+  /**
+   * Fetch a receipt by donation id.
+   *
+   * Authorization: the receipt is a nested resource of the donation, so only
+   * the donating wallet, the campaign owner, or a collaborator may read it.
+   */
+  async getReceipt(
+    donationId: string,
+    principal: DonationPrincipal | null | undefined,
+    dataSource: CampaignDataSource = getCampaignDataSource(),
+  ): Promise<DonationAccessResult<DonationReceipt>> {
+    const receipt = this.receipts.get(donationId);
+    if (!receipt) {
+      return { ok: false, error: "Receipt not found.", code: "INVALID_CAMPAIGN" };
+    }
+
+    const campaign = await getCampaign(receipt.campaignId, dataSource);
+    if (!campaign) {
+      return { ok: false, error: "Campaign not found.", code: "INVALID_CAMPAIGN" };
+    }
+
+    const donations = this.campaignDonations(receipt.campaignId);
+    const authorization = resolveCampaignRelationship(principal, campaign, donations);
+    if (!authorization.ok) {
+      return authorization;
+    }
+
+    if (authorization.relationship === "donor") {
+      const normalized = authorization.address.toLowerCase();
+      const ownsReceipt = String(receipt.donorAddress ?? "").trim().toLowerCase() === normalized;
+      if (!ownsReceipt) {
+        return { ok: false, error: FORBIDDEN_ERROR, code: "FORBIDDEN" };
+      }
+    }
+
+    return { ok: true, relationship: authorization.relationship, value: receipt };
   }
 
-  /** Exact per-token totals for a campaign so mixed tokens are never summed. */
+  /**
+   * Exact per-token totals for a campaign so mixed tokens are never summed.
+   *
+   * Authorization: aggregate totals are public campaign data, so anonymous
+   * callers may read the summary; individual donations stay protected.
+   */
   getSummary(campaignId: string): DonationSummary {
     const donations = this.campaignDonations(campaignId);
     const totalsByToken: Record<DonationToken, string> = { XLM: "0", USDC: "0" };
@@ -300,5 +433,10 @@ export class CampaignDonationService {
     await this.idempotencyStore.clearScope(DONATION_IDEMPOTENCY_SCOPE);
   }
 }
+
+/** Discriminated result for authorized read paths. */
+export type DonationAccessResult<T> =
+  | { ok: true; relationship: CampaignRelationship; value: T }
+  | { ok: false; error: string; code: DonationErrorCode };
 
 export const donationService = new CampaignDonationService();

@@ -7,6 +7,13 @@
 
 import { DefaultStreamDataSource, getAnalyticsService } from "./analytics.service";
 import { withExecutionTimeout } from "./query-guard";
+import {
+  AuthorizationError,
+  authorizeNestedResource,
+  resolvePrincipal,
+  type NestedResourceKind,
+  type NestedResourceAction,
+} from "./authorization-policy";
 import { getCampaignHealthAssessment, getCampaignRiskAssessment, getCampaignVerificationSummary, queryCampaigns } from "@/services/campaign.service";
 import type { CampaignDataSource, CampaignQueryInput } from "@/services/campaign.service";
 import { getCampaignSequelService } from "@/services/campaign-sequel.service";
@@ -62,6 +69,33 @@ function toBigInt(value: string): bigint {
     return BigInt(value);
   } catch {
     return 0n;
+  }
+}
+
+/**
+ * Enforce the centralized nested-resource authorization policy (issue #236)
+ * before a resolver delegates to a service.
+ *
+ * The principal is resolved from the request context (anonymous when no
+ * account is present) and the policy helper decides whether the principal may
+ * perform `action` on the nested resource. Denials surface as
+ * `AuthorizationError`s carrying stable codes (`UNAUTHENTICATED` → 401,
+ * `FORBIDDEN` → 403, `NOT_FOUND` → 404) so clients can branch on them.
+ */
+async function authorizeResource(
+  ctx: ResolverContext,
+  kind: NestedResourceKind,
+  action: NestedResourceAction,
+  resource: { campaignId?: string; ownerId?: string; collaboratorIds?: string[]; donorIds?: string[]; resourceId?: string },
+): Promise<void> {
+  const principal = resolvePrincipal({ accountId: ctx.accountId, roles: ctx.roles });
+  const decision = await authorizeNestedResource(principal, kind, action, resource);
+  if (!decision.allowed) {
+    throw new AuthorizationError(decision.code, decision.message, {
+      kind,
+      action,
+      resourceId: resource.resourceId,
+    });
   }
 }
 
@@ -391,6 +425,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext,
       ) => {
         const args = guard<typeof rawArgs>("Query.campaignSequels", ctx, rawArgs, "campaignSequels");
+        await authorizeResource(ctx, "campaign", "read", { campaignId: args.campaignId, resourceId: args.campaignId });
         const sequels = await getCampaignSequelService(ctx.campaignDataSource).getSequels(args.campaignId, {
           relation: args.relation,
         });
@@ -409,6 +444,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext,
       ) => {
         const args = guard<typeof rawArgs>("Query.nextInSeries", ctx, rawArgs, "campaignId");
+        await authorizeResource(ctx, "campaign", "read", { campaignId: args.campaignId, resourceId: args.campaignId });
         const result = await getCampaignSequelService(ctx.campaignDataSource).getNextInSeries(args.campaignId);
         if (!result) return null;
         return {
@@ -425,6 +461,8 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         rawArgs: { campaignId: string; network?: Network },
         ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.campaignAnalytics", ctx, rawArgs, "campaignId");
+        await authorizeResource(ctx, "campaign", "read", { campaignId: args.campaignId, resourceId: args.campaignId });
         return runAnalytics(() => getCampaignAnalyticsDashboard(args.campaignId));
       },
 
@@ -443,6 +481,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext,
       ) => {
         const args = guard<typeof rawArgs>("Query.grantProgramSummary", ctx, rawArgs, "grantProgramSummary");
+        await authorizeResource(ctx, "campaign", "read", { campaignId: args.campaignId, resourceId: args.campaignId });
         const summary = await getGrantProgramService().getProgramSummary(args.programId, args.campaignId);
         if (!summary) return null;
         return {
@@ -454,8 +493,10 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
       campaignGrantAllocations: async (
         _: unknown,
         args: { campaignId: string; pagination?: PaginationInput; sort?: SortInput },
+        ctx: ResolverContext,
       ) => {
         validateListArgs(args.pagination, args.sort);
+        await authorizeResource(ctx, "campaign", "read", { campaignId: args.campaignId, resourceId: args.campaignId });
         const allocations = await getGrantProgramService().getCampaignAllocations(args.campaignId);
         return paginate(allocations.map((allocation) => ({
           ...allocation,
@@ -485,6 +526,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext
       ) => {
         const args = guard<typeof rawArgs>("Mutation.cloneCampaign", ctx, rawArgs, "cloneCampaign");
+        await authorizeResource(ctx, "campaign", "read", { campaignId: args.id, resourceId: args.id });
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const campaign = streams.find((stream) => stream.id === args.id);
         if (!campaign) throw new Error(`Campaign ${args.id} not found`);
@@ -508,6 +550,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext
       ) => {
         const args = guard<typeof rawArgs>("Mutation.updateCampaign", ctx, rawArgs, "updateCampaign");
+        await authorizeResource(ctx, "campaign", "update", { campaignId: args.id, resourceId: args.id });
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const campaign = streams.find((stream) => stream.id === args.id);
         if (!campaign) throw new Error(`Campaign ${args.id} not found`);

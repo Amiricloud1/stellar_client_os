@@ -7,6 +7,12 @@ import {
   type ApiPolicy,
 } from "./api-policy";
 
+export {
+  checkNestedResourcePolicy,
+  type NestedResourcePolicy,
+  type ResourceRelationship,
+} from "./api-policy";
+
 /**
  * Admin API authorization.
  *
@@ -17,6 +23,12 @@ import {
  * Privileged routes MUST go through `requirePolicy(request, 'privileged')`
  * (or `checkPolicy(request, 'privileged')` when a `NextResponse | null` is
  * preferred); do not hand-roll bearer-token comparisons in route handlers.
+ *
+ * Nested-resource routes (owner / collaborator / donor / anonymous access to a
+ * resource reached through another resource) MUST go through
+ * `checkNestedResourcePolicy` from `./api-policy` (re-exported here for
+ * compatibility). Do not hand-roll ownership or relationship checks in route
+ * handlers; the centralized policy is the authoritative boundary.
  *
  * The admin key is read from the `Authorization` header only, never from the
  * query string, so it cannot end up in access logs or browser history. The

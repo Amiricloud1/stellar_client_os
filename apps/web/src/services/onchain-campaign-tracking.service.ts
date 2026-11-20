@@ -13,9 +13,80 @@ import {
   RecordMilestoneInput,
 } from '@/types/onchain-tracking';
 
+/**
+ * Lifecycle states for an on-chain transaction. These are the authoritative
+ * states a sponsor portfolio / transaction timeline reconciles against.
+ *
+ * - `submitted`: the transaction was broadcast to the network (wallet approval
+ *   already happened before this point).
+ * - `ledger_confirmed`: the transaction was included in a ledger.
+ * - `settled`: the transaction reached finality and its effects are applied.
+ * - `failed`: the transaction was rejected or dropped; `retryable` indicates
+ *   whether the caller may safely resubmit.
+ */
+export type OnChainTransactionStatus =
+  | 'submitted'
+  | 'ledger_confirmed'
+  | 'settled'
+  | 'failed';
+
+export interface OnChainTransactionEvent {
+  /** Stable id for the event, used for idempotent retries. */
+  eventId: string;
+  /** The on-chain transaction hash this event refers to. */
+  txHash: string;
+  /** Campaign the transaction belongs to. */
+  campaignId: string;
+  /** What the transaction represents (e.g. milestone, certificate). */
+  kind: 'milestone' | 'certificate';
+  /** Authoritative lifecycle status. */
+  status: OnChainTransactionStatus;
+  /** Ledger sequence once confirmed; null before confirmation. */
+  ledger: number | null;
+  /** ISO timestamp of when this status was observed. */
+  observedAt: string;
+  /** Whether a failed transaction may be retried. */
+  retryable: boolean;
+  /** Human-readable failure reason, when status is `failed`. */
+  failureReason?: string;
+  /** Source reference so consumers can reconcile against authoritative records. */
+  source: {
+    /** Identifier of the authoritative record (milestone id or certificate id). */
+    referenceId: string;
+    /** Network the transaction lives on. */
+    network: string;
+    /** Contract / account the transaction was submitted against. */
+    contractId: string;
+  };
+}
+
+export interface RecordTransactionEventInput {
+  txHash: string;
+  campaignId: string;
+  kind: 'milestone' | 'certificate';
+  status: OnChainTransactionStatus;
+  ledger?: number | null;
+  retryable?: boolean;
+  failureReason?: string;
+  source: {
+    referenceId: string;
+    network?: string;
+    contractId?: string;
+  };
+}
+
 export class OnChainCampaignTrackingService {
   private milestones: Map<string, OnChainMilestone[]> = new Map();
   private certificates: Map<string, NFTCertificate> = new Map();
+  private transactionEvents: Map<string, OnChainTransactionEvent[]> = new Map();
+  private transactionEventsByTxHash: Map<string, OnChainTransactionEvent[]> = new Map();
+  private readonly defaultNetwork: string;
+  private readonly defaultContractId: string;
+
+  constructor(options?: { network?: string; contractId?: string }) {
+    this.defaultNetwork = options?.network ?? 'testnet';
+    this.defaultContractId = options?.contractId ?? 'campaign-tracking-contract';
+  }
 
   /**
    * Record a milestone on the Stellar blockchain.
@@ -46,7 +117,119 @@ export class OnChainCampaignTrackingService {
     existing.push(milestone);
     this.milestones.set(input.campaignId, existing);
 
+    // Emit the authoritative lifecycle events for the milestone transaction.
+    // Submission is recorded first, then ledger confirmation and settlement.
+    this.recordTransactionEvent({
+      txHash: milestone.txHash,
+      campaignId: milestone.campaignId,
+      kind: 'milestone',
+      status: 'submitted',
+      source: { referenceId: milestone.id },
+    });
+    this.recordTransactionEvent({
+      txHash: milestone.txHash,
+      campaignId: milestone.campaignId,
+      kind: 'milestone',
+      status: 'ledger_confirmed',
+      ledger: milestone.blockTimestamp,
+      source: { referenceId: milestone.id },
+    });
+    this.recordTransactionEvent({
+      txHash: milestone.txHash,
+      campaignId: milestone.campaignId,
+      kind: 'milestone',
+      status: 'settled',
+      ledger: milestone.blockTimestamp,
+      source: { referenceId: milestone.id },
+    });
+
     return milestone;
+  }
+
+  /**
+   * Persist a lifecycle event for an on-chain transaction.
+   *
+   * Events are idempotent per (txHash, status): re-recording the same status
+   * for the same transaction returns the existing event instead of appending a
+   * duplicate. This makes retries safe for callers that may re-submit after a
+   * reload or a transient failure.
+   */
+  public recordTransactionEvent(input: RecordTransactionEventInput): OnChainTransactionEvent {
+    const existingForTx = this.transactionEventsByTxHash.get(input.txHash) ?? [];
+    const duplicate = existingForTx.find((e) => e.status === input.status);
+    if (duplicate) {
+      return duplicate;
+    }
+
+    const event: OnChainTransactionEvent = {
+      eventId: `evt-${input.txHash}-${input.status}`,
+      txHash: input.txHash,
+      campaignId: input.campaignId,
+      kind: input.kind,
+      status: input.status,
+      ledger: input.ledger ?? null,
+      observedAt: new Date().toISOString(),
+      retryable: input.status === 'failed' ? Boolean(input.retryable) : false,
+      failureReason: input.status === 'failed' ? input.failureReason : undefined,
+      source: {
+        referenceId: input.source.referenceId,
+        network: input.source.network ?? this.defaultNetwork,
+        contractId: input.source.contractId ?? this.defaultContractId,
+      },
+    };
+
+    existingForTx.push(event);
+    this.transactionEventsByTxHash.set(input.txHash, existingForTx);
+
+    const existingForCampaign = this.transactionEvents.get(input.campaignId) ?? [];
+    existingForCampaign.push(event);
+    this.transactionEvents.set(input.campaignId, existingForCampaign);
+
+    return event;
+  }
+
+  /**
+   * Record a failure for an on-chain transaction so operators and the timeline
+   * can surface an explicit recovery state.
+   */
+  public recordTransactionFailure(
+    input: Omit<RecordTransactionEventInput, 'status'> & {
+      retryable?: boolean;
+      failureReason: string;
+    },
+  ): OnChainTransactionEvent {
+    return this.recordTransactionEvent({
+      ...input,
+      status: 'failed',
+      retryable: input.retryable ?? true,
+    });
+  }
+
+  /**
+   * Get the ordered lifecycle events for a single transaction. Used by the
+   * transaction confirmation timeline to recover state after a reload.
+   */
+  public getTransactionEvents(txHash: string): OnChainTransactionEvent[] {
+    return [...(this.transactionEventsByTxHash.get(txHash) ?? [])];
+  }
+
+  /**
+   * Get all lifecycle events for a campaign, ordered by observation time.
+   */
+  public getCampaignTransactionEvents(campaignId: string): OnChainTransactionEvent[] {
+    return [...(this.transactionEvents.get(campaignId) ?? [])];
+  }
+
+  /**
+   * Resolve the latest authoritative status for a transaction, or `null` when
+   * the transaction is unknown.
+   */
+  public getTransactionStatus(txHash: string): OnChainTransactionStatus | null {
+    const events = this.transactionEventsByTxHash.get(txHash);
+    if (!events || events.length === 0) {
+      return null;
+    }
+    return events[events.length - 1].status;
   }
 
   /**
@@ -82,6 +265,28 @@ export class OnChainCampaignTrackingService {
     };
 
     this.certificates.set(certId, certificate);
+
+    this.recordTransactionEvent({
+      txHash: certificate.txHash,
+      campaignId: certificate.campaignId,
+      kind: 'certificate',
+      status: 'submitted',
+      source: { referenceId: certificate.certificateId },
+    });
+    this.recordTransactionEvent({
+      txHash: certificate.txHash,
+      campaignId: certificate.campaignId,
+      kind: 'certificate',
+      status: 'ledger_confirmed',
+      source: { referenceId: certificate.certificateId },
+    });
+    this.recordTransactionEvent({
+      txHash: certificate.txHash,
+      campaignId: certificate.campaignId,
+      kind: 'certificate',
+      status: 'settled',
+      source: { referenceId: certificate.certificateId },
+    });
 
     // Auto-record 100% milestone on-chain as well
     await this.recordOnChainMilestone({

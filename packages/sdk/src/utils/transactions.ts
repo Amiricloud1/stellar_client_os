@@ -41,6 +41,105 @@ export const TransactionWaitStatusEnum = {
 };
 
 /**
+ * User-facing lifecycle phases of a transaction, from wallet approval through
+ * on-chain settlement. These are distinct from the lower-level
+ * {@link TransactionWaitStatus} polling statuses: a single phase may span
+ * several polling statuses (e.g. `SUBMITTED` covers `PENDING` and
+ * `NOT_FOUND`).
+ *
+ * - `AWAITING_APPROVAL` — assembled and handed to the wallet; not yet signed.
+ * - `SUBMITTED` — signed and broadcast to the network; not yet confirmed.
+ * - `LEDGER_CONFIRMED` — included in a ledger, but the contract result has not
+ *   yet been reconciled (e.g. settlement effects still being verified).
+ * - `SETTLED` — confirmed on-chain and the contract result is available.
+ * - `FAILED` — rejected by the wallet, failed on-chain, or expired.
+ * - `TIMED_OUT` — confirmation was not observed within the timeout window.
+ *   The transaction may still settle later; reconcile with
+ *   {@link rehydrateTransaction}.
+ */
+export type TransactionLifecyclePhase =
+  | "AWAITING_APPROVAL"
+  | "SUBMITTED"
+  | "LEDGER_CONFIRMED"
+  | "SETTLED"
+  | "FAILED"
+  | "TIMED_OUT";
+
+/**
+ * Enum representation of TransactionLifecyclePhase
+ */
+export const TransactionLifecyclePhaseEnum = {
+  AWAITING_APPROVAL: "AWAITING_APPROVAL" as const,
+  SUBMITTED: "SUBMITTED" as const,
+  LEDGER_CONFIRMED: "LEDGER_CONFIRMED" as const,
+  SETTLED: "SETTLED" as const,
+  FAILED: "FAILED" as const,
+  TIMED_OUT: "TIMED_OUT" as const,
+};
+
+/**
+ * A single recorded lifecycle transition, suitable for persisting (e.g. to
+ * localStorage) and rendering as a confirmation timeline.
+ */
+export interface TransactionLifecycleTransition {
+  /** Lifecycle phase entered by this transition. */
+  phase: TransactionLifecyclePhase;
+  /** Wall-clock timestamp (ms since epoch) when the transition was observed. */
+  timestamp: number;
+  /** Transaction hash, when known. */
+  hash?: string;
+  /** Ledger sequence, when the transaction has been included in one. */
+  ledger?: number;
+  /** Human-readable detail (e.g. failure reason). */
+  detail?: string;
+}
+
+/**
+ * Serializable snapshot of a transaction's lifecycle, safe to persist and
+ * restore across page reloads.
+ */
+export interface TransactionLifecycleSnapshot {
+  /** Transaction hash, when known. */
+  hash?: string;
+  /** Current lifecycle phase. */
+  phase: TransactionLifecyclePhase;
+  /** Ordered list of transitions observed so far. */
+  transitions: TransactionLifecycleTransition[];
+  /** Ledger sequence, when confirmed. */
+  ledger?: number;
+  /** Error message when the phase is `FAILED` or `TIMED_OUT`. */
+  error?: string;
+}
+
+/**
+ * Options for {@link trackTransactionLifecycle}.
+ */
+export interface TrackTransactionLifecycleOptions<T = unknown>
+  extends WaitForTransactionOptions {
+  /**
+   * Callback invoked on every lifecycle transition. Use this to persist the
+   * snapshot so the timeline can be restored after a reload.
+   */
+  onTransition?: (
+    transition: TransactionLifecycleTransition,
+    snapshot: TransactionLifecycleSnapshot,
+  ) => void;
+  /**
+   * Optional pre-existing snapshot (e.g. restored from storage). Its
+   * transitions are preserved and the current phase is used as the starting
+   * point.
+   */
+  initialSnapshot?: TransactionLifecycleSnapshot;
+  /**
+   * Optional callback invoked once the transaction is included in a ledger,
+   * before settlement is reconciled. Return `false` to keep the phase at
+   * `LEDGER_CONFIRMED` (e.g. while awaiting an external settlement check).
+   */
+  isSettled?: (result: T | undefined) => boolean | Promise<boolean>;
+}
+=======
+
+/**
  * A single contract effect (event or state change) observed while simulating
  * a transaction. Effects are derived from the simulation's diagnostic events
  * and are intended for display in a pre-signing review UI.
@@ -518,7 +617,317 @@ export async function waitForTransaction<T = unknown>(
 }
 
 /**
+ * Builds a lifecycle snapshot from a list of transitions.
+ */
+function buildSnapshot(
+  transitions: TransactionLifecycleTransition[],
+): TransactionLifecycleSnapshot {
+  const last = transitions[transitions.length - 1];
+  const snapshot: TransactionLifecycleSnapshot = {
+    phase: last ? last.phase : "AWAITING_APPROVAL",
+    transitions: [...transitions],
+  };
+  if (last?.hash) snapshot.hash = last.hash;
+  if (last?.ledger !== undefined) snapshot.ledger = last.ledger;
+  if (last?.detail && (last.phase === "FAILED" || last.phase === "TIMED_OUT")) {
+    snapshot.error = last.detail;
+  }
+  return snapshot;
+}
+
+/**
+ * Records a lifecycle transition, invoking the caller's `onTransition`
+ * callback with the updated snapshot. Callback errors are surfaced as
+ * {@link FundableStellarError}s so persistence failures are not silently
+ * swallowed.
+ */
+function recordTransition<T>(
+  transitions: TransactionLifecycleTransition[],
+  transition: TransactionLifecycleTransition,
+  onTransition?: TrackTransactionLifecycleOptions<T>["onTransition"],
+): TransactionLifecycleSnapshot {
+  transitions.push(transition);
+  const snapshot = buildSnapshot(transitions);
+  if (onTransition) {
+    try {
+      onTransition(transition, snapshot);
+    } catch (cbErr) {
+      const parsedError = parseContractError(
+        `Error in onTransition callback: ${
+          cbErr instanceof Error ? cbErr.message : String(cbErr)
+        }`,
+        "Transaction lifecycle callback",
+      );
+      throw new FundableStellarError(parsedError);
+    }
+  }
+  return snapshot;
+}
+
+/**
+ * Signs, sends, and tracks a transaction through its full lifecycle:
+ * wallet approval, submission, ledger confirmation, and settlement.
+ *
+ * Every transition is reported through `onTransition` with a serializable
+ * {@link TransactionLifecycleSnapshot}, so callers can persist the timeline
+ * and restore it after a reload via {@link rehydrateTransaction}.
+ *
+ * Failure and timeout states are explicit: wallet rejection and on-chain
+ * failure surface as `FAILED`, and an unconfirmed transaction surfaces as
+ * `TIMED_OUT` (the transaction may still settle later).
+ *
+ * @typeParam T - The result type of the contract invocation
+ * @param tx - The AssembledTransaction to sign and send
+ * @param rpcUrl - The Soroban RPC URL
+ * @param signTransaction - Callback function to sign the transaction
+ * @param options - Lifecycle tracking options
+ * @returns Promise resolving to the final lifecycle snapshot
+ * @throws {FundableStellarError | Error} If signing, sending, or confirmation fails
+ */
+export async function trackTransactionLifecycle<T = unknown>(
+  tx: AssembledTransaction<T>,
+  rpcUrl: string,
+  signTransaction: (xdr: string) => Promise<string>,
+  options: TrackTransactionLifecycleOptions<T> = {},
+): Promise<TransactionLifecycleSnapshot> {
+  const { onTransition, initialSnapshot, isSettled, ...waitOptions } = options;
+  const transitions: TransactionLifecycleTransition[] = initialSnapshot
+    ? [...initialSnapshot.transitions]
+    : [];
+
+  const emit = (transition: TransactionLifecycleTransition) =>
+    recordTransition(transitions, transition, onTransition);
+
+  // 1. Wallet approval.
+  emit({ phase: "AWAITING_APPROVAL", timestamp: Date.now() });
+
+  try {
+    await tx.signAndSend({
+      signTransaction: async (xdr: string) => ({
+        signedTxXdr: await signTransaction(xdr),
+      }),
+    });
+  } catch (error) {
+    const classified = classifyTransactionError(error);
+    emit({
+      phase: "FAILED",
+      timestamp: Date.now(),
+      detail: classified.message,
+    });
+    throw classified;
+  }
+
+  // 2. Submitted to the network.
+  const hash = tx?.signed?.hash ? tx.signed.hash().toString("hex") : undefined;
+  emit({ phase: "SUBMITTED", timestamp: Date.now(), hash });
+
+  // 3. Ledger confirmation and 4. settlement.
+  let waitResult: TransactionWaitResult<T>;
+  try {
+    waitResult = await waitForTransaction(tx, rpcUrl, {
+      ...waitOptions,
+      throwOnFailure: false,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    emit({ phase: "FAILED", timestamp: Date.now(), hash, detail: message });
+    throw error;
+  }
+
+  if (waitResult.status === "SUCCESS") {
+    emit({
+      phase: "LEDGER_CONFIRMED",
+      timestamp: Date.now(),
+      hash: waitResult.hash,
+      ledger: waitResult.ledger,
+    });
+
+    let settled = true;
+    if (isSettled) {
+      try {
+        settled = await isSettled(waitResult.result);
+      } catch (settleErr) {
+        const message =
+          settleErr instanceof Error ? settleErr.message : String(settleErr);
+        emit({
+          phase: "FAILED",
+          timestamp: Date.now(),
+          hash: waitResult.hash,
+          ledger: waitResult.ledger,
+          detail: `Settlement check failed: ${message}`,
+        });
+        throw settleErr;
+      }
+    }
+
+    if (settled) {
+      return emit({
+        phase: "SETTLED",
+        timestamp: Date.now(),
+        hash: waitResult.hash,
+        ledger: waitResult.ledger,
+      });
+    }
+
+    return buildSnapshot(transitions);
+  }
+
+  if (waitResult.status === "TIMEOUT") {
+    return emit({
+      phase: "TIMED_OUT",
+      timestamp: Date.now(),
+      hash: waitResult.hash,
+      detail: waitResult.error,
+    });
+  }
+
+  // FAILED, EXPIRED, ABORTED, or any other terminal non-success status.
+  return emit({
+    phase: "FAILED",
+    timestamp: Date.now(),
+    hash: waitResult.hash,
+    ledger: waitResult.ledger,
+    detail: waitResult.error ?? `Transaction ${waitResult.status}`,
+  });
+}
+
+/**
+ * Options for {@link rehydrateTransaction}.
+ */
+export interface RehydrateTransactionOptions<T = unknown> {
+  /**
+   * Callback invoked with the reconciled snapshot. Use this to update
+   * persisted state after a reload.
+   */
+  onTransition?: TrackTransactionLifecycleOptions<T>["onTransition"];
+  /**
+   * Optional settlement check, as in {@link trackTransactionLifecycle}.
+   */
+  isSettled?: (result: T | undefined) => boolean | Promise<boolean>;
+}
+
+/**
+ * Reconciles a persisted lifecycle snapshot against the network after a
+ * reload.
+ *
+ * Given a transaction hash (from the snapshot or supplied explicitly), this
+ * queries Soroban RPC and advances the snapshot to the authoritative phase:
+ * `SETTLED` if the transaction succeeded, `FAILED` if it failed or expired,
+ * and otherwise leaves it in its current in-flight phase (`SUBMITTED` or
+ * `LEDGER_CONFIRMED`). This makes recovery after a reload explicit rather
+ * than relying on stale local state.
+ *
+ * @typeParam T - The result type of the contract invocation
+ * @param snapshot - The persisted snapshot to reconcile
+ * @param rpcUrl - The Soroban RPC URL
+ * @param options - Reconciliation options
+ * @returns Promise resolving to the reconciled snapshot
+ */
+export async function rehydrateTransaction<T = unknown>(
+  snapshot: TransactionLifecycleSnapshot,
+  rpcUrl: string,
+  options: RehydrateTransactionOptions<T> = {},
+): Promise<TransactionLifecycleSnapshot> {
+  const { onTransition, isSettled } = options;
+  const transitions: TransactionLifecycleTransition[] = [
+    ...snapshot.transitions,
+  ];
+  const emit = (transition: TransactionLifecycleTransition) =>
+    recordTransition(transitions, transition, onTransition);
+
+  const hash = snapshot.hash;
+  if (!hash) {
+    // Nothing to reconcile against the network yet.
+    return buildSnapshot(transitions);
+  }
+
+  const server = new rpc.Server(rpcUrl);
+  let response: rpc.Api.GetTransactionResponse;
+  try {
+    response = await server.getTransaction(hash);
+  } catch (error) {
+    // Transient RPC failure: keep the current phase so the caller can retry.
+    return buildSnapshot(transitions);
+  }
+
+  const respStatus = response?.status as string | undefined;
+
+  if (respStatus === rpc.Api.GetTransactionStatus.SUCCESS) {
+    const ledger = response.ledger;
+    const alreadyConfirmed = transitions.some(
+      (t) => t.phase === "LEDGER_CONFIRMED" || t.phase === "SETTLED",
+    );
+    if (!alreadyConfirmed) {
+      emit({ phase: "LEDGER_CONFIRMED", timestamp: Date.now(), hash, ledger });
+    }
+
+    let settled = true;
+    if (isSettled) {
+      try {
+        settled = await isSettled(undefined);
+      } catch (settleErr) {
+        const message =
+          settleErr instanceof Error ? settleErr.message : String(settleErr);
+        return emit({
+          phase: "FAILED",
+          timestamp: Date.now(),
+          hash,
+          ledger,
+          detail: `Settlement check failed: ${message}`,
+        });
+      }
+    }
+
+    if (!settled) {
+      return buildSnapshot(transitions);
+    }
+
+    return emit({ phase: "SETTLED", timestamp: Date.now(), hash, ledger });
+  }
+
+  if (respStatus === rpc.Api.GetTransactionStatus.FAILED) {
+    const parsedError = parseContractError(
+      {
+        resultXdr: response.resultXdr,
+        message: `Transaction failed on ledger ${response.ledger}`,
+      },
+      "Transaction confirmation",
+    );
+    return emit({
+      phase: "FAILED",
+      timestamp: Date.now(),
+      hash,
+      ledger: response.ledger,
+      detail: parsedError.message,
+    });
+  }
+
+  if (respStatus === "EXPIRED") {
+    return emit({
+      phase: "FAILED",
+      timestamp: Date.now(),
+      hash,
+      detail: `Transaction expired: ${hash}`,
+    });
+  }
+
+  // NOT_FOUND / PENDING: still in flight. If we previously timed out, keep the
+  // explicit TIMED_OUT phase so the UI can show that recovery is pending.
+  if (snapshot.phase === "TIMED_OUT") {
+    return buildSnapshot(transitions);
+  }
+
+  const inFlight = transitions.some((t) => t.phase === "SUBMITTED");
+  if (!inFlight) {
+    return emit({ phase: "SUBMITTED", timestamp: Date.now(), hash });
+  }
+
+  return buildSnapshot(transitions);
+}
+
+/**
  * Convenience method combining signAndSend with waitForTransaction.
+=======
  *
  * Sign, send, and automatically wait for confirmation in one call.
  *
@@ -568,5 +977,64 @@ export async function signAndWait<T = unknown>(
 
   // Wait for confirmation
   return waitForTransaction(tx, rpcUrl, options);
+}
+
+/**
+ * Classifies a signing / submission error into a typed
+ * {@link FundableStellarError} so callers can map it to a recovery action.
+ */
+function classifyTransactionError(error: unknown): Error {
+  if (error instanceof FundableStellarError) {
+    return error;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  const lower = message.toLowerCase();
+
+  if (lower.includes("reject") || lower.includes("denied") || lower.includes("cancel")) {
+    return new TransactionError("wallet", message, {
+      retryable: true,
+      cause: error,
+    });
+  }
+  if (lower.includes("simulation")) {
+    return new TransactionError("simulation", message, {
+      retryable: false,
+      cause: error,
+    });
+  }
+  if (lower.includes("timeout") || lower.includes("network")) {
+    return new TransactionError("rpc", message, {
+      retryable: true,
+      cause: error,
+    });
+  }
+  return new TransactionError("rpc", message, {
+    retryable: true,
+    cause: error,
+  });
+}
+
+/**
+ * Error type carrying a classified transaction failure category.
+ */
+export class TransactionError extends FundableStellarError {
+  /** Failure category: wallet, simulation, or rpc. */
+  readonly category: "wallet" | "simulation" | "rpc";
+  /** Transaction hash, when known. */
+  readonly hash?: string;
+  /** Whether the operation may be safely retried. */
+  readonly retryable: boolean;
+
+  constructor(
+    category: "wallet" | "simulation" | "rpc",
+    message: string,
+    options: { hash?: string; retryable?: boolean; cause?: unknown } = {},
+  ) {
+    super(message, { cause: options.cause });
+    this.name = "TransactionError";
+    this.category = category;
+    this.hash = options.hash;
+    this.retryable = options.retryable ?? false;
+  }
 }
 

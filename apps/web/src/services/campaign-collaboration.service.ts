@@ -1,4 +1,16 @@
 import { CoCreator, CoCreatorInvite, CoCreatorRole } from "@/types/collaboration";
+import {
+  NestedResourcePolicy,
+  ResourceAction,
+  ResourcePrincipal,
+  PolicyDecision,
+} from "@/lib/auth/nested-resource-policy";
+
+export type CollaborationResult<T> =
+  | { ok: true; data: T }
+  | { ok: false; error: string; code: "NOT_FOUND" | "FORBIDDEN" | "INVALID" };
+
+const policy = new NestedResourcePolicy();
 
 const initialCollaborators: CoCreator[] = [
   {
@@ -50,8 +62,29 @@ class CampaignCollaborationService {
     initialInvites.forEach((inv) => this.invites.set(inv.token, inv));
   }
 
-  getCollaborators(campaignId: string): CoCreator[] {
-    return this.collaborators.get(campaignId) || [];
+  private authorize(
+    campaignId: string,
+    principal: ResourcePrincipal | null | undefined,
+    action: ResourceAction,
+  ): PolicyDecision {
+    return policy.evaluate({
+      resource: "collaborator",
+      action,
+      parentId: campaignId,
+      principal,
+      collaborators: this.collaborators.get(campaignId) || [],
+    });
+  }
+
+  getCollaborators(
+    campaignId: string,
+    principal: ResourcePrincipal | null | undefined,
+  ): CollaborationResult<CoCreator[]> {
+    const decision = this.authorize(campaignId, principal, "read");
+    if (!decision.allowed) {
+      return { ok: false, error: decision.reason, code: decision.code };
+    }
+    return { ok: true, data: this.collaborators.get(campaignId) || [] };
   }
 
   createInviteToken(params: {
@@ -61,7 +94,13 @@ class CampaignCollaborationService {
     invitedBy: string;
     invitedByName: string;
     expiresInDays?: number;
-  }): CoCreatorInvite {
+    principal: ResourcePrincipal | null | undefined;
+  }): CollaborationResult<CoCreatorInvite> {
+    const decision = this.authorize(params.campaignId, params.principal, "invite");
+    if (!decision.allowed) {
+      return { ok: false, error: decision.reason, code: decision.code };
+    }
+
     const token = `inv_${Math.random().toString(36).substring(2, 10)}_${Date.now()}`;
     const days = params.expiresInDays || 7;
     const invite: CoCreatorInvite = {
@@ -79,7 +118,7 @@ class CampaignCollaborationService {
     };
 
     this.invites.set(token, invite);
-    return invite;
+    return { ok: true, data: invite };
   }
 
   getInviteByToken(token: string): CoCreatorInvite | null {
@@ -123,21 +162,54 @@ class CampaignCollaborationService {
     return { success: true, collaborator: newCollaborator };
   }
 
-  removeCollaborator(campaignId: string, collaboratorId: string): boolean {
+  removeCollaborator(
+    campaignId: string,
+    collaboratorId: string,
+    principal: ResourcePrincipal | null | undefined,
+  ): CollaborationResult<{ removedId: string }> {
+    const decision = this.authorize(campaignId, principal, "manage");
+    if (!decision.allowed) {
+      return { ok: false, error: decision.reason, code: decision.code };
+    }
+
     const list = this.collaborators.get(campaignId) || [];
-    const updated = list.filter((c) => c.id !== collaboratorId && c.role !== "OWNER");
-    this.collaborators.set(campaignId, updated);
-    return true;
+    const target = list.find((c) => c.id === collaboratorId);
+    if (!target) {
+      return { ok: false, error: "Collaborator not found.", code: "NOT_FOUND" };
+    }
+    if (target.role === "OWNER") {
+      return { ok: false, error: "The campaign owner cannot be removed.", code: "FORBIDDEN" };
+    }
+
+    this.collaborators.set(
+      campaignId,
+      list.filter((c) => c.id !== collaboratorId),
+    );
+    return { ok: true, data: { removedId: collaboratorId } };
   }
 
-  updateRole(campaignId: string, collaboratorId: string, newRole: CoCreatorRole): boolean {
+  updateRole(
+    campaignId: string,
+    collaboratorId: string,
+    newRole: CoCreatorRole,
+    principal: ResourcePrincipal | null | undefined,
+  ): CollaborationResult<CoCreator> {
+    const decision = this.authorize(campaignId, principal, "manage");
+    if (!decision.allowed) {
+      return { ok: false, error: decision.reason, code: decision.code };
+    }
+
     const list = this.collaborators.get(campaignId) || [];
     const item = list.find((c) => c.id === collaboratorId);
-    if (item && item.role !== "OWNER") {
-      item.role = newRole;
-      return true;
+    if (!item) {
+      return { ok: false, error: "Collaborator not found.", code: "NOT_FOUND" };
     }
-    return false;
+    if (item.role === "OWNER") {
+      return { ok: false, error: "The campaign owner role cannot be changed.", code: "FORBIDDEN" };
+    }
+
+    item.role = newRole;
+    return { ok: true, data: item };
   }
 }
 
