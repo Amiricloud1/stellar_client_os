@@ -144,6 +144,172 @@ export type RevokeWebhookSubscriptionInput = z.infer<
 >;
 
 /* -------------------------------------------------------------------------- */
+/* Contract deployment registry (issue #218)                                  */
+/* -------------------------------------------------------------------------- */
+
+/** Supported networks for contract deployments. */
+export const deploymentNetworkSchema = z.enum([
+  'mainnet',
+  'testnet',
+  'futurenet',
+  'local',
+]);
+
+export type DeploymentNetwork = z.infer<typeof deploymentNetworkSchema>;
+
+/** Lifecycle state of a deployment record. */
+export const deploymentStatusSchema = z.enum([
+  'pending',
+  'active',
+  'paused',
+  'deprecated',
+  'failed',
+]);
+
+export type DeploymentStatus = z.infer<typeof deploymentStatusSchema>;
+
+/** Stellar contract address (C... strkey, 56 chars). */
+export const contractAddressSchema = z
+  .string()
+  .trim()
+  .regex(/^C[A-Z2-7]{55}$/, 'must be a valid Stellar contract address');
+
+/** Ledger sequence number (non-negative integer). */
+export const ledgerSequenceSchema = z.coerce.number().int().min(0);
+
+/** Semantic spec version, e.g. "1.2.0". */
+export const specVersionSchema = z
+  .string()
+  .trim()
+  .regex(/^\d+\.\d+\.\d+$/, 'must be a semantic version (MAJOR.MINOR.PATCH)');
+
+export const deploymentRecordSchema = z
+  .object({
+    network: deploymentNetworkSchema,
+    address: contractAddressSchema,
+    ledger: ledgerSequenceSchema,
+    specVersion: specVersionSchema,
+    status: deploymentStatusSchema,
+    failureReason: nonEmptyString.max(500).optional(),
+  })
+  .strict();
+
+export type DeploymentRecordInput = z.infer<typeof deploymentRecordSchema>;
+
+export const deploymentRecordParamsSchema = z
+  .object({
+    network: deploymentNetworkSchema,
+    address: contractAddressSchema,
+  })
+  .strict();
+
+export const listDeploymentsQuerySchema = z
+  .object({
+    network: deploymentNetworkSchema.optional(),
+    status: deploymentStatusSchema.optional(),
+  })
+  .strict();
+
+export type ListDeploymentsQuery = z.infer<typeof listDeploymentsQuerySchema>;
+
+/* -------------------------------------------------------------------------- */
+/* Canonical contract-event mappings (issue #219)                             */
+/* -------------------------------------------------------------------------- */
+
+/** Event schema version, e.g. "v1" or "v2". */
+export const eventVersionSchema = z
+  .string()
+  .trim()
+  .regex(/^v\d+$/, 'must be a version like "v1"');
+
+export const eventMappingSchema = z
+  .object({
+    eventName: nonEmptyString.max(200),
+    version: eventVersionSchema,
+    projection: nonEmptyString.max(200),
+    /** Unknown versions retain their raw payload instead of dropping it. */
+    retainUnknownPayload: z.boolean().optional(),
+  })
+  .strict();
+
+export type EventMappingInput = z.infer<typeof eventMappingSchema>;
+
+export const eventMappingParamsSchema = z
+  .object({
+    eventName: nonEmptyString.max(200),
+    version: eventVersionSchema,
+  })
+  .strict();
+
+/* -------------------------------------------------------------------------- */
+/* Projection replay (issue #220)                                             */
+/* -------------------------------------------------------------------------- */
+
+export const replayStatusSchema = z.enum([
+  'queued',
+  'running',
+  'completed',
+  'failed',
+  'cancelled',
+]);
+
+export type ReplayStatus = z.infer<typeof replayStatusSchema>;
+
+export const startReplayBodySchema = z
+  .object({
+    fromVersion: eventVersionSchema,
+    toVersion: eventVersionSchema,
+    fromLedger: ledgerSequenceSchema.optional(),
+    toLedger: ledgerSequenceSchema.optional(),
+    /** When true, compare replayed output against live state before cutover. */
+    compareBeforeCutover: z.boolean().optional(),
+  })
+  .strict()
+  .refine(
+    (value) =>
+      value.fromLedger === undefined ||
+      value.toLedger === undefined ||
+      value.fromLedger <= value.toLedger,
+    { message: 'fromLedger must be <= toLedger', path: ['fromLedger'] },
+  );
+
+export type StartReplayInput = z.infer<typeof startReplayBodySchema>;
+
+export const replayIdParamsSchema = z
+  .object({
+    replayId: idSchema,
+  })
+  .strict();
+
+/* -------------------------------------------------------------------------- */
+/* Bounded event-consumer queues (issue #222)                                 */
+/* -------------------------------------------------------------------------- */
+
+export const MAX_QUEUE_CAPACITY = 100_000;
+export const MAX_QUEUE_CONCURRENCY = 64;
+
+export const queueConfigSchema = z
+  .object({
+    capacity: z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_QUEUE_CAPACITY)
+      .default(1_000),
+    concurrency: z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_QUEUE_CONCURRENCY)
+      .default(8),
+    /** Milliseconds to wait before retrying after an outage. */
+    retryBackoffMs: z.coerce.number().int().min(0).max(300_000).default(1_000),
+  })
+  .strict();
+
+export type QueueConfigInput = z.infer<typeof queueConfigSchema>;
+
+/* -------------------------------------------------------------------------- */
 /* Parse helper                                                               */
 /* -------------------------------------------------------------------------- */
 

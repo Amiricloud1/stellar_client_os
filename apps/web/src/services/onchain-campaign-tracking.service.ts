@@ -13,9 +13,68 @@ import {
   RecordMilestoneInput,
 } from '@/types/onchain-tracking';
 
+/**
+ * Raw event retained for replay. Events are the authoritative source of truth;
+ * projections (milestones/certificates) are derived from them.
+ */
+export interface RetainedTrackingEvent {
+  eventId: string;
+  sequence: number;
+  type: 'milestone.recorded' | 'certificate.issued';
+  payload: RecordMilestoneInput | MintCertificateInput;
+  recordedAt: string;
+}
+
+export type ReplayStatus = 'idle' | 'running' | 'succeeded' | 'failed' | 'blocked';
+
+export interface ReplayMismatch {
+  kind: 'milestone' | 'certificate';
+  key: string;
+  field: string;
+  projected: unknown;
+  replayed: unknown;
+}
+
+export interface ReplayReport {
+  status: ReplayStatus;
+  startedAt: string;
+  finishedAt: string | null;
+  eventsReplayed: number;
+  mismatches: ReplayMismatch[];
+  error: string | null;
+  cutoverAllowed: boolean;
+}
+
 export class OnChainCampaignTrackingService {
   private milestones: Map<string, OnChainMilestone[]> = new Map();
   private certificates: Map<string, NFTCertificate> = new Map();
+  private events: RetainedTrackingEvent[] = [];
+  private eventSequence = 0;
+  private lastReplayReport: ReplayReport | null = null;
+
+  /** Append a raw event to the retained log (authoritative boundary). */
+  private retainEvent(
+    type: RetainedTrackingEvent['type'],
+    payload: RecordMilestoneInput | MintCertificateInput,
+  ): void {
+    this.events.push({
+      eventId: `evt-${++this.eventSequence}`,
+      sequence: this.eventSequence,
+      type,
+      payload: JSON.parse(JSON.stringify(payload)),
+      recordedAt: new Date().toISOString(),
+    });
+  }
+
+  /** Get the retained raw event log (for replay/audit). */
+  public getRetainedEvents(): RetainedTrackingEvent[] {
+    return this.events.map((e) => ({ ...e, payload: { ...e.payload } }));
+  }
+
+  /** Get the most recent replay report, if any. */
+  public getReplayReport(): ReplayReport | null {
+    return this.lastReplayReport;
+  }
 
   /**
    * Record a milestone on the Stellar blockchain.
@@ -45,6 +104,7 @@ export class OnChainCampaignTrackingService {
 
     existing.push(milestone);
     this.milestones.set(input.campaignId, existing);
+    this.retainEvent('milestone.recorded', input);
 
     return milestone;
   }
@@ -82,6 +142,7 @@ export class OnChainCampaignTrackingService {
     };
 
     this.certificates.set(certId, certificate);
+    this.retainEvent('certificate.issued', input);
 
     // Auto-record 100% milestone on-chain as well
     await this.recordOnChainMilestone({
@@ -121,6 +182,161 @@ export class OnChainCampaignTrackingService {
    */
   public async getCertificatesForCampaign(campaignId: string): Promise<NFTCertificate[]> {
     return Array.from(this.certificates.values()).filter((c) => c.campaignId === campaignId);
+  }
+
+  /**
+   * Replay retained raw events into fresh projections and compare them against
+   * the current projections. Cutover is only allowed when the replay is
+   * deterministic and produces no mismatches.
+   */
+  public async replayProjections(): Promise<ReplayReport> {
+    const startedAt = new Date().toISOString();
+    const report: ReplayReport = {
+      status: 'running',
+      startedAt,
+      finishedAt: null,
+      eventsReplayed: 0,
+      mismatches: [],
+      error: null,
+      cutoverAllowed: false,
+    };
+    this.lastReplayReport = report;
+
+    try {
+      const replayedMilestones = new Map<string, OnChainMilestone[]>();
+      const replayedCertificates = new Map<string, NFTCertificate>();
+
+      for (const event of [...this.events].sort((a, b) => a.sequence - b.sequence)) {
+        if (event.type === 'milestone.recorded') {
+          const input = event.payload as RecordMilestoneInput;
+          const list = replayedMilestones.get(input.campaignId) || [];
+          if (!list.find((m) => m.milestonePercentage === input.milestonePercentage)) {
+            list.push(this.buildMilestone(input));
+            replayedMilestones.set(input.campaignId, list);
+          }
+        } else {
+          const input = event.payload as MintCertificateInput;
+          const cert = this.buildCertificate(input);
+          replayedCertificates.set(cert.certificateId, cert);
+        }
+        report.eventsReplayed++;
+      }
+
+      report.mismatches = [
+        ...this.compareMilestones(replayedMilestones),
+        ...this.compareCertificates(replayedCertificates),
+      ];
+
+      report.status = report.mismatches.length === 0 ? 'succeeded' : 'blocked';
+      report.cutoverAllowed = report.mismatches.length === 0;
+    } catch (err) {
+      report.status = 'failed';
+      report.error = err instanceof Error ? err.message : String(err);
+      report.cutoverAllowed = false;
+    } finally {
+      report.finishedAt = new Date().toISOString();
+    }
+
+    return report;
+  }
+
+  private buildMilestone(input: RecordMilestoneInput): OnChainMilestone {
+    return {
+      id: `ms-${input.campaignId}-${input.milestonePercentage}`,
+      campaignId: input.campaignId,
+      milestonePercentage: input.milestonePercentage,
+      title: input.title,
+      description: input.description,
+      targetAmount: input.targetAmount,
+      achievedAmount: input.achievedAmount,
+      txHash: '',
+      blockTimestamp: 0,
+      verifiedOnChain: true,
+    };
+  }
+
+  private buildCertificate(input: MintCertificateInput): NFTCertificate {
+    const certId = `NFT-CERT-${input.campaignId}-${Date.now()}`;
+    return {
+      certificateId: certId,
+      campaignId: input.campaignId,
+      campaignTitle: input.campaignTitle,
+      creatorAddress: input.creatorAddress,
+      recipientAddress: input.recipientAddress || input.creatorAddress,
+      fundingGoal: input.fundingGoal,
+      totalRaised: input.totalRaised,
+      issuedAt: new Date().toISOString(),
+      txHash: '',
+      metadataUri: `https://ipfs.io/ipfs/QmFNDL${certId.toLowerCase()}`,
+      assetCode: `FUND${input.campaignId.substring(0, 4).toUpperCase()}`,
+      verified: true,
+      impact: input.impact,
+    };
+  }
+
+  private compareMilestones(replayed: Map<string, OnChainMilestone[]>): ReplayMismatch[] {
+    const mismatches: ReplayMismatch[] = [];
+    const campaignIds = new Set([...this.milestones.keys(), ...replayed.keys()]);
+    for (const campaignId of campaignIds) {
+      const projected = this.milestones.get(campaignId) || [];
+      const rebuilt = replayed.get(campaignId) || [];
+      if (projected.length !== rebuilt.length) {
+        mismatches.push({
+          kind: 'milestone',
+          key: campaignId,
+          field: 'count',
+          projected: projected.length,
+          replayed: rebuilt.length,
+        });
+        continue;
+      }
+      for (let i = 0; i < projected.length; i++) {
+        for (const field of ['milestonePercentage', 'title', 'targetAmount', 'achievedAmount'] as const) {
+          if (projected[i][field] !== rebuilt[i][field]) {
+            mismatches.push({
+              kind: 'milestone',
+              key: projected[i].id,
+              field,
+              projected: projected[i][field],
+              replayed: rebuilt[i][field],
+            });
+          }
+        }
+      }
+    }
+    return mismatches;
+  }
+
+  private compareCertificates(replayed: Map<string, NFTCertificate>): ReplayMismatch[] {
+    const mismatches: ReplayMismatch[] = [];
+    if (this.certificates.size !== replayed.size) {
+      mismatches.push({
+        kind: 'certificate',
+        key: '*',
+        field: 'count',
+        projected: this.certificates.size,
+        replayed: replayed.size,
+      });
+    }
+    for (const [id, projected] of this.certificates) {
+      const rebuilt = replayed.get(id);
+      if (!rebuilt) {
+        mismatches.push({ kind: 'certificate', key: id, field: 'missing', projected: true, replayed: false });
+        continue;
+      }
+      for (const field of ['campaignId', 'recipientAddress', 'totalRaised'] as const) {
+        if (projected[field] !== rebuilt[field]) {
+          mismatches.push({
+            kind: 'certificate',
+            key: id,
+            field,
+            projected: projected[field],
+            replayed: rebuilt[field],
+          });
+        }
+      }
+    }
+    return mismatches;
   }
 
   /**

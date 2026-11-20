@@ -10,10 +10,40 @@ import {
 } from '@stellar/stellar-sdk';
 import { Server as RpcServer, Api, assembleTransaction } from '@stellar/stellar-sdk/rpc';
 import { getStellarServerOptions } from '@/utils/rpc-connection-options';
+import {
+  DeploymentRecord,
+  DeploymentRegistry,
+  DeploymentRegistryError,
+  DeploymentRegistryErrorCode,
+  DeploymentStatus,
+} from './deployment.registry';
 
 interface DeployConfig {
   rpcUrl: string;
   networkPassphrase: string;
+  /**
+   * Optional deployment registry. When provided, every successful deployment is
+   * recorded and the resulting {@link DeploymentRecord} is returned to callers.
+   */
+  registry?: DeploymentRegistry;
+  /** Maximum attempts made when writing to the registry (default: 3). */
+  registryMaxAttempts?: number;
+  /** Base backoff between registry write attempts, in ms (default: 250). */
+  registryRetryDelayMs?: number;
+}
+
+/**
+ * Outcome of a deployment that was also written to the registry.
+ *
+ * - `recorded` — the deployment succeeded and the registry write succeeded.
+ * - `registry_failed` — the deployment succeeded on-chain but the registry
+ *   write failed after all retries. Callers should surface this to operators
+ *   and retry via {@link ContractDeployer.recordDeployment}.
+ */
+export interface DeploymentOutcome {
+  state: 'recorded' | 'registry_failed';
+  record: DeploymentRecord;
+  registryError?: DeploymentRegistryError;
 }
 
 /**
@@ -77,11 +107,80 @@ export class ContractDeployer {
   private networkPassphrase: string;
   private limits: CompilationLimits;
   private inFlight = 0;
+  private registry?: DeploymentRegistry;
+  private registryMaxAttempts: number;
+  private registryRetryDelayMs: number;
 
   constructor(config: DeployConfig & { limits?: Partial<CompilationLimits> }) {
     this.rpcServer = new RpcServer(config.rpcUrl, getStellarServerOptions(config.rpcUrl));
     this.networkPassphrase = config.networkPassphrase;
     this.limits = { ...DEFAULT_COMPILATION_LIMITS, ...(config.limits ?? {}) };
+    this.registry = config.registry;
+    this.registryMaxAttempts = config.registryMaxAttempts ?? 3;
+    this.registryRetryDelayMs = config.registryRetryDelayMs ?? 250;
+  }
+
+  /**
+   * Records a deployment in the registry, retrying transient failures.
+   *
+   * Throws a {@link DeploymentRegistryError} when the registry is not
+   * configured, the record is invalid, the caller is unauthorized, or all
+   * retry attempts are exhausted. Non-retryable errors (validation,
+   * authorization) fail immediately.
+   */
+  async recordDeployment(record: DeploymentRecord): Promise<DeploymentRecord> {
+    if (!this.registry) {
+      throw new DeploymentRegistryError(
+        'REGISTRY_NOT_CONFIGURED',
+        'No deployment registry is configured for this deployer.'
+      );
+    }
+
+    let lastError: DeploymentRegistryError | undefined;
+    for (let attempt = 1; attempt <= this.registryMaxAttempts; attempt++) {
+      try {
+        return await this.registry.record(record);
+      } catch (err) {
+        const registryError =
+          err instanceof DeploymentRegistryError
+            ? err
+            : new DeploymentRegistryError(
+                'REGISTRY_WRITE_FAILED',
+                err instanceof Error ? err.message : String(err)
+              );
+        lastError = registryError;
+        if (!isRetryableRegistryError(registryError.code) || attempt === this.registryMaxAttempts) {
+          throw registryError;
+        }
+        await new Promise((resolve) =>
+          setTimeout(resolve, this.registryRetryDelayMs * attempt)
+        );
+      }
+    }
+
+    // Unreachable: the loop either returns or throws.
+    throw lastError ?? new DeploymentRegistryError('REGISTRY_WRITE_FAILED', 'Registry write failed.');
+  }
+
+  /**
+   * Records a deployment and converts registry failures into an explicit
+   * {@link DeploymentOutcome} state instead of throwing, so callers can surface
+   * the failure to operators while preserving the on-chain result.
+   */
+  async recordDeploymentOutcome(record: DeploymentRecord): Promise<DeploymentOutcome> {
+    try {
+      const stored = await this.recordDeployment(record);
+      return { state: 'recorded', record: stored };
+    } catch (err) {
+      const registryError =
+        err instanceof DeploymentRegistryError
+          ? err
+          : new DeploymentRegistryError(
+              'REGISTRY_WRITE_FAILED',
+              err instanceof Error ? err.message : String(err)
+            );
+      return { state: 'registry_failed', record, registryError };
+    }
   }
 
   /** Returns the effective compilation limits (read-only copy). */
@@ -411,4 +510,43 @@ export class ContractDeployer {
        throw new Error("Wait! Account not found on the network. Is it funded with XLM?");
     }
   }
+}
+
+/**
+ * Registry error codes that are safe to retry. Validation and authorization
+ * failures are terminal and must not be retried.
+ */
+function isRetryableRegistryError(code: DeploymentRegistryErrorCode): boolean {
+  return code === 'REGISTRY_WRITE_FAILED' || code === 'REGISTRY_UNAVAILABLE';
+}
+
+/**
+ * Builds a {@link DeploymentRecord} for a completed deployment.
+ *
+ * The record captures network, address, deployment ledger, spec version, and
+ * lifecycle state as required by the registry contract. `ledger` and
+ * `specVersion` must be supplied by the caller from the confirmed transaction.
+ */
+export function buildDeploymentRecord(params: {
+  networkPassphrase: string;
+  contractId: string;
+  deployerAddress: string;
+  ledger: number;
+  specVersion: string;
+  status?: DeploymentStatus;
+  wasmHash?: string;
+  salt?: string;
+  metadata?: Record<string, string>;
+}): DeploymentRecord {
+  return {
+    network: params.networkPassphrase,
+    contractId: params.contractId,
+    deployer: params.deployerAddress,
+    ledger: params.ledger,
+    specVersion: params.specVersion,
+    status: params.status ?? 'deployed',
+    wasmHash: params.wasmHash,
+    salt: params.salt,
+    metadata: params.metadata,
+  };
 }
