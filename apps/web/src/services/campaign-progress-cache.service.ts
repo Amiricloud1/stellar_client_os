@@ -1,5 +1,15 @@
 import { getCampaign } from "@/services/campaign.service";
 
+/**
+ * Current version of the incremental campaign aggregate reducer.
+ *
+ * Bump this whenever the reducer's math or event handling changes so that
+ * cached snapshots produced by an older reducer are never served. Cached
+ * entries carry the version they were computed with; a mismatch is treated as
+ * a miss and the entry is evicted.
+ */
+export const CAMPAIGN_AGGREGATE_REDUCER_VERSION = 1;
+
 export interface CampaignProgressMetrics {
   campaignId: string;
   treeCount: number;
@@ -8,6 +18,8 @@ export interface CampaignProgressMetrics {
   co2SequestrationTonnes: string;
   raisedAmount: string;
   goalAmount: string;
+  /** Reducer version that produced these totals. */
+  aggregateVersion: number;
   cachedAt: number;
   expiresAt: number;
   ttlSeconds: number;
@@ -21,11 +33,19 @@ export interface CampaignProgressMetrics {
  * - `chain-correction`: an on-chain reorg/correction changed previously
  *   confirmed totals, so any cached snapshot is untrustworthy.
  * - `manual`: an operator or admin explicitly requested a refresh.
+ * - `reconciliation`: a periodic reconciliation pass detected drift between
+ *   incremental aggregates and a full recomputation.
+ * - `drift-repair`: a drift repair rewrote aggregate totals.
+ * - `version-mismatch`: a cached entry was produced by an older reducer
+ *   version and must not be served.
  */
 export type CampaignProgressInvalidationReason =
   | "mutation"
   | "chain-correction"
-  | "manual";
+  | "manual"
+  | "reconciliation"
+  | "drift-repair"
+  | "version-mismatch";
 
 export interface CampaignProgressInvalidationResult {
   campaignId: string;
@@ -48,6 +68,11 @@ export interface CampaignProgressCacheOptions {
   ttlSeconds?: number;
   /** Injectable clock (ms since epoch). Defaults to `Date.now`. */
   now?: () => number;
+  /**
+   * Reducer version this cache instance considers current. Defaults to
+   * `CAMPAIGN_AGGREGATE_REDUCER_VERSION`.
+   */
+  aggregateVersion?: number;
 }
 
 /**
@@ -78,9 +103,17 @@ export const CAMPAIGN_PROGRESS_CACHE_KEY_PREFIX = "campaign:progress";
  */
 export const CAMPAIGN_PROGRESS_FRESHNESS_BUDGET_SECONDS = DEFAULT_CAMPAIGN_PROGRESS_TTL_SECONDS;
 
-/** Build the isolated cache key for a campaign's progress metrics. */
-export function buildCampaignProgressCacheKey(campaignId: string): string {
-  return `${CAMPAIGN_PROGRESS_CACHE_KEY_PREFIX}:${campaignId}`;
+/**
+ * Build the isolated cache key for a campaign's progress metrics.
+ *
+ * The key includes the aggregate reducer version so entries produced by an
+ * older reducer can never collide with (or be served to) the current one.
+ */
+export function buildCampaignProgressCacheKey(
+  campaignId: string,
+  aggregateVersion: number = CAMPAIGN_AGGREGATE_REDUCER_VERSION
+): string {
+  return `${CAMPAIGN_PROGRESS_CACHE_KEY_PREFIX}:v${aggregateVersion}:${campaignId}`;
 }
 
 /**
@@ -114,23 +147,33 @@ export class CampaignProgressCacheService {
   private cache = new Map<string, CacheEntry>();
   private defaultTtlSeconds: number;
   private now: () => number;
+  private aggregateVersion: number;
   private stats = {
     hits: 0,
     misses: 0,
+    versionMismatches: 0,
   };
 
   constructor(options: number | CampaignProgressCacheOptions = {}) {
     if (typeof options === "number") {
       this.defaultTtlSeconds = resolveDefaultTtl(options);
       this.now = () => Date.now();
+      this.aggregateVersion = CAMPAIGN_AGGREGATE_REDUCER_VERSION;
     } else {
       this.defaultTtlSeconds = resolveDefaultTtl(options.ttlSeconds);
       this.now = options.now ?? (() => Date.now());
+      this.aggregateVersion =
+        options.aggregateVersion ?? CAMPAIGN_AGGREGATE_REDUCER_VERSION;
     }
   }
 
+  /** Reducer version this cache instance serves. */
+  getAggregateVersion(): number {
+    return this.aggregateVersion;
+  }
+
   get(campaignId: string): CampaignProgressMetrics | null {
-    const key = buildCampaignProgressCacheKey(campaignId);
+    const key = buildCampaignProgressCacheKey(campaignId, this.aggregateVersion);
     const entry = this.cache.get(key);
     if (!entry) {
       this.stats.misses++;
@@ -143,21 +186,33 @@ export class CampaignProgressCacheService {
       return null;
     }
 
+    // Never serve totals produced by a different reducer version.
+    if (entry.data.aggregateVersion !== this.aggregateVersion) {
+      this.cache.delete(key);
+      this.stats.versionMismatches++;
+      this.stats.misses++;
+      return null;
+    }
+
     this.stats.hits++;
     return entry.data;
   }
 
   set(
     campaignId: string,
-    metrics: Omit<CampaignProgressMetrics, "cachedAt" | "expiresAt" | "ttlSeconds">,
+    metrics: Omit<
+      CampaignProgressMetrics,
+      "cachedAt" | "expiresAt" | "ttlSeconds" | "aggregateVersion"
+    > & { aggregateVersion?: number },
     ttlSeconds = this.defaultTtlSeconds
   ): CampaignProgressMetrics {
-    const key = buildCampaignProgressCacheKey(campaignId);
+    const key = buildCampaignProgressCacheKey(campaignId, this.aggregateVersion);
     const now = this.now();
     const effectiveTtl = clampToFreshnessBudget(ttlSeconds);
     const expiresAt = now + effectiveTtl * 1000;
     const entryData: CampaignProgressMetrics = {
       ...metrics,
+      aggregateVersion: this.aggregateVersion,
       cachedAt: now,
       expiresAt,
       ttlSeconds: effectiveTtl,
@@ -214,7 +269,9 @@ export class CampaignProgressCacheService {
   }
 
   invalidate(campaignId: string): boolean {
-    return this.cache.delete(buildCampaignProgressCacheKey(campaignId));
+    return this.cache.delete(
+      buildCampaignProgressCacheKey(campaignId, this.aggregateVersion)
+    );
   }
 
   /**
@@ -230,7 +287,7 @@ export class CampaignProgressCacheService {
     campaignId: string,
     reason: CampaignProgressInvalidationReason
   ): CampaignProgressInvalidationResult {
-    const key = buildCampaignProgressCacheKey(campaignId);
+    const key = buildCampaignProgressCacheKey(campaignId, this.aggregateVersion);
     const invalidated = this.cache.delete(key);
     return {
       campaignId,
@@ -239,6 +296,23 @@ export class CampaignProgressCacheService {
       key,
       invalidatedAt: this.now(),
     };
+  }
+
+  /**
+   * Invalidate a campaign's cached totals after a reconciliation pass or a
+   * drift repair rewrote the incremental aggregates.
+   *
+   * This is a thin, explicit wrapper over `invalidateForReason` so callers
+   * cannot accidentally use the wrong reason for aggregate rewrites.
+   */
+  invalidateForReconciliation(
+    campaignId: string,
+    reason: Extract<
+      CampaignProgressInvalidationReason,
+      "reconciliation" | "drift-repair" | "version-mismatch"
+    > = "reconciliation"
+  ): CampaignProgressInvalidationResult {
+    return this.invalidateForReason(campaignId, reason);
   }
 
   /**
@@ -256,6 +330,7 @@ export class CampaignProgressCacheService {
     this.cache.clear();
     this.stats.hits = 0;
     this.stats.misses = 0;
+    this.stats.versionMismatches = 0;
   }
 
   getStats() {
@@ -263,6 +338,8 @@ export class CampaignProgressCacheService {
       size: this.cache.size,
       hits: this.stats.hits,
       misses: this.stats.misses,
+      versionMismatches: this.stats.versionMismatches,
+      aggregateVersion: this.aggregateVersion,
     };
   }
 }

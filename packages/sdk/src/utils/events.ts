@@ -13,6 +13,12 @@ import type {
   StreamPausedEvent,
   StreamResumedEvent,
 } from "../generated/payment-stream/src/index.js";
+import {
+  buildRawEventEnvelope,
+  reconstructRawEvent,
+  type RawEventEnvelope,
+  type RawEventEnvelopeOptions,
+} from "../audit.js";
 
 export type ContractEventRaw = {
   contract_id: string;
@@ -234,4 +240,31 @@ export function parsePaymentStreamContractEvents(
     if (parsed) acc.push(parsed);
     return acc;
   }, []);
+}
+
+/**
+ * Wrap a raw contract event into the minimal, integrity-checkable audit
+ * envelope. The envelope stores only the fields required to reconstruct the
+ * event for audit queries plus a payload hash, retention class and privacy
+ * flags. Throws when the raw event is malformed or required options are
+ * missing so callers can surface an explicit failure state.
+ */
+export function toRawEventEnvelope(
+  raw: ContractEventRaw,
+  options: RawEventEnvelopeOptions,
+): RawEventEnvelope {
+  return buildRawEventEnvelope(raw, options);
+}
+
+/**
+ * Rebuild the raw contract event shape from a stored audit envelope.
+ *
+ * Returns `null` when the envelope is malformed or its payload hash does not
+ * match the stored payload, so audit queries can distinguish a corrupt or
+ * tampered record from a valid one instead of silently returning bad data.
+ */
+export function reconstructEventFromEnvelope(
+  envelope: RawEventEnvelope,
+): ContractEventRaw | null {
+  return reconstructRawEvent(envelope);
 }
