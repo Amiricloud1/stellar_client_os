@@ -30,6 +30,37 @@ interface CampaignAnalyticsState {
   views: Set<string>;
   contributions: Array<{ amount: bigint; sponsor: string }>;
   refunds: number;
+  /** Monotonic version of the aggregate; bumped by every applied event. */
+  version: number;
+  /** Event ids already folded into the aggregate, for idempotent replay. */
+  appliedEventIds: Set<string>;
+}
+
+/**
+ * Version of the incremental aggregation algorithm.
+ *
+ * Bumped whenever the reducer semantics change so that cached aggregates
+ * produced by an older algorithm are never compared against or served to
+ * callers expecting the current one. Reconciliation compares the incremental
+ * totals against a full recomputation and reports a mismatch when either the
+ * algorithm version or the resulting totals diverge.
+ */
+export const CAMPAIGN_ANALYTICS_AGGREGATE_VERSION = 1;
+
+export type CampaignAnalyticsEvent =
+  | { type: "view"; eventId: string; viewerId?: string }
+  | { type: "contribution"; eventId: string; amount: string; sponsor: string }
+  | { type: "refund"; eventId: string };
+
+export interface CampaignAnalyticsReconciliation {
+  campaignId: string;
+  aggregateVersion: number;
+  incrementalVersion: number;
+  consistent: boolean;
+  /** Human-readable reasons the incremental totals diverged, if any. */
+  mismatches: string[];
+  incremental: CampaignAnalytics;
+  recomputed: CampaignAnalytics;
 }
 
 /**
@@ -61,6 +92,7 @@ export const CAMPAIGN_ANALYTICS_MAX_STALE_MS = 5 * 60_000;
 interface CampaignAnalyticsCacheEntry {
   value: CampaignAnalytics;
   cachedAt: number;
+  aggregateVersion: number;
 }
 
 const states = new Map<string, CampaignAnalyticsState>();
@@ -70,10 +102,71 @@ const invalidatedAt = new Map<string, number>();
 function stateFor(campaignId: string): CampaignAnalyticsState {
   let state = states.get(campaignId);
   if (!state) {
-    state = { totalViews: 0, views: new Set(), contributions: [], refunds: 0 };
+    state = {
+      totalViews: 0,
+      views: new Set(),
+      contributions: [],
+      refunds: 0,
+      version: 0,
+      appliedEventIds: new Set(),
+    };
     states.set(campaignId, state);
   }
   return state;
+}
+
+/**
+ * Fold a single analytics event into the aggregate exactly once.
+ *
+ * Returns `true` when the event was applied and `false` when it was a
+ * duplicate (already seen event id) or otherwise ignored. Deduplication is by
+ * `eventId`, so late replays and at-least-once delivery cannot double count.
+ */
+function applyEvent(state: CampaignAnalyticsState, event: CampaignAnalyticsEvent): boolean {
+  if (!event.eventId?.trim()) throw new Error("eventId is required");
+  if (state.appliedEventIds.has(event.eventId)) return false;
+  switch (event.type) {
+    case "view":
+      state.totalViews += 1;
+      state.views.add(event.viewerId?.trim() || `anonymous:${event.eventId}`);
+      break;
+    case "contribution":
+      if (!event.sponsor?.trim()) throw new Error("sponsor is required");
+      state.contributions.push({ amount: parseAmount(event.amount), sponsor: event.sponsor.trim() });
+      break;
+    case "refund":
+      state.refunds += 1;
+      break;
+    default:
+      throw new Error(`Unsupported analytics event type: ${(event as { type: string }).type}`);
+  }
+  state.appliedEventIds.add(event.eventId);
+  state.version += 1;
+  return true;
+}
+
+/**
+ * Apply an analytics event to a campaign's aggregate.
+ *
+ * All view/contribution/refund mutations funnel through this reducer so the
+ * incremental aggregate is deterministic and idempotent. Duplicate events are
+ * dropped without bumping the version or invalidating the cache.
+ */
+export async function applyCampaignAnalyticsEvent(
+  campaignId: string,
+  event: CampaignAnalyticsEvent,
+  dataSource = getCampaignDataSource(),
+): Promise<{ applied: boolean; version: number }> {
+  if (!(await getCampaign(campaignId, dataSource))) throw new Error("Campaign not found");
+  const state = stateFor(campaignId);
+  const applied = applyEvent(state, event);
+  if (applied) invalidateCampaignAnalyticsCache(campaignId);
+  return { applied, version: state.version };
+}
+
+/** Returns the current aggregate version for a campaign (0 if never updated). */
+export function getCampaignAnalyticsVersion(campaignId: string): number {
+  return states.get(campaignId)?.version ?? 0;
 }
 
 function parseAmount(amount: string): bigint {
@@ -112,12 +205,9 @@ export async function recordCampaignView(
   campaignId: string,
   viewerId?: string,
   dataSource = getCampaignDataSource(),
+  eventId = crypto.randomUUID(),
 ): Promise<void> {
-  if (!(await getCampaign(campaignId, dataSource))) throw new Error("Campaign not found");
-  const state = stateFor(campaignId);
-  state.totalViews += 1;
-  state.views.add(viewerId?.trim() || `anonymous:${crypto.randomUUID()}`);
-  invalidateCampaignAnalyticsCache(campaignId);
+  await applyCampaignAnalyticsEvent(campaignId, { type: "view", eventId, viewerId }, dataSource);
 }
 
 export async function recordCampaignContribution(
@@ -125,20 +215,21 @@ export async function recordCampaignContribution(
   amount: string,
   sponsor: string,
   dataSource = getCampaignDataSource(),
+  eventId = crypto.randomUUID(),
 ): Promise<void> {
-  if (!(await getCampaign(campaignId, dataSource))) throw new Error("Campaign not found");
-  if (!sponsor?.trim()) throw new Error("sponsor is required");
-  stateFor(campaignId).contributions.push({ amount: parseAmount(amount), sponsor: sponsor.trim() });
-  invalidateCampaignAnalyticsCache(campaignId);
+  await applyCampaignAnalyticsEvent(
+    campaignId,
+    { type: "contribution", eventId, amount, sponsor },
+    dataSource,
+  );
 }
 
 export async function recordCampaignRefund(
   campaignId: string,
   dataSource = getCampaignDataSource(),
+  eventId = crypto.randomUUID(),
 ): Promise<void> {
-  if (!(await getCampaign(campaignId, dataSource))) throw new Error("Campaign not found");
-  stateFor(campaignId).refunds += 1;
-  invalidateCampaignAnalyticsCache(campaignId);
+  await applyCampaignAnalyticsEvent(campaignId, { type: "refund", eventId }, dataSource);
 }
 
 /**
@@ -156,6 +247,7 @@ export function applyCampaignChainCorrection(
   const state = stateFor(campaignId);
   if (correction.contributions) state.contributions = [...correction.contributions];
   if (typeof correction.refunds === "number") state.refunds = correction.refunds;
+  state.version += 1;
   invalidateCampaignAnalyticsCache(campaignId, now);
 }
 
@@ -269,10 +361,30 @@ export async function getCampaignAnalytics(
   const ttlMs = options.ttlMs ?? CAMPAIGN_ANALYTICS_TTL_MS;
   if (!options.forceRefresh) {
     const cached = cache.get(cacheKey);
-    if (cached && isFresh(cached, now, ttlMs)) return cached.value;
+    if (
+      cached &&
+      cached.aggregateVersion === CAMPAIGN_ANALYTICS_AGGREGATE_VERSION &&
+      isFresh(cached, now, ttlMs)
+    ) {
+      return cached.value;
+    }
   }
 
-  const state = stateFor(campaignId);
+  const analytics = buildAnalytics(campaignId, campaign, stateFor(campaignId), now);
+  cache.set(cacheKey, {
+    value: analytics,
+    cachedAt: now,
+    aggregateVersion: CAMPAIGN_ANALYTICS_AGGREGATE_VERSION,
+  });
+  return analytics;
+}
+
+function buildAnalytics(
+  campaignId: string,
+  campaign: CampaignRecord,
+  state: CampaignAnalyticsState,
+  now: number,
+): CampaignAnalytics {
   const sponsors = new Set([
     ...campaign.sponsors.map((sponsor) => sponsor.address),
     ...state.contributions.map((contribution) => contribution.sponsor),
@@ -284,7 +396,7 @@ export async function getCampaignAnalytics(
   const average = contributionCount === 0 ? 0n : fallbackTotal / BigInt(contributionCount);
   const pagesViewed = state.totalViews;
 
-  const analytics: CampaignAnalytics = {
+  return {
     campaignId,
     pagesViewed,
     uniqueViewers: state.views.size,
@@ -297,9 +409,71 @@ export async function getCampaignAnalytics(
     refundRate: toRate(state.refunds, contributionCount),
     updatedAt: now,
   };
+}
 
-  cache.set(cacheKey, { value: analytics, cachedAt: now });
-  return analytics;
+/**
+ * Rebuild a campaign's aggregate from scratch and compare it against the
+ * incrementally maintained totals.
+ *
+ * This is the authoritative reconciliation path: it replays the supplied event
+ * log through a fresh reducer state (deduping by event id, so late and
+ * duplicate events are folded exactly once) and reports whether the
+ * incremental aggregate matches. When `apply` is true the rebuilt state
+ * replaces the incremental state and the cache is invalidated.
+ */
+export async function recomputeCampaignAnalytics(
+  campaignId: string,
+  events: readonly CampaignAnalyticsEvent[],
+  dataSource = getCampaignDataSource(),
+  now = Date.now(),
+  options: { apply?: boolean } = {},
+): Promise<CampaignAnalyticsReconciliation> {
+  const campaign = await getCampaign(campaignId, dataSource);
+  if (!campaign) throw new Error("Campaign not found");
+
+  const rebuilt: CampaignAnalyticsState = {
+    totalViews: 0,
+    views: new Set(),
+    contributions: [],
+    refunds: 0,
+    version: 0,
+    appliedEventIds: new Set(),
+  };
+  for (const event of events) applyEvent(rebuilt, event);
+
+  const incrementalState = stateFor(campaignId);
+  const incremental = buildAnalytics(campaignId, campaign, incrementalState, now);
+  const recomputed = buildAnalytics(campaignId, campaign, rebuilt, now);
+
+  const mismatches: string[] = [];
+  const fields: Array<keyof CampaignAnalytics> = [
+    "pagesViewed",
+    "uniqueViewers",
+    "contributions",
+    "sponsors",
+    "averageContributionSize",
+    "refunds",
+  ];
+  for (const field of fields) {
+    if (incremental[field] !== recomputed[field]) {
+      mismatches.push(`${field}: incremental=${incremental[field]} recomputed=${recomputed[field]}`);
+    }
+  }
+
+  if (options.apply) {
+    states.set(campaignId, rebuilt);
+    invalidateCampaignAnalyticsCache(campaignId, now);
+  }
+
+  return {
+    campaignId,
+    aggregateVersion: CAMPAIGN_ANALYTICS_AGGREGATE_VERSION,
+    incrementalVersion: incrementalState.version,
+    consistent: mismatches.length === 0,
+    mismatches,
+    incremental,
+    recomputed,
+  };
 }
 
 export function seedCampaignAnalytics(campaignId: string, state: Partial<CampaignAnalyticsState>): void {
@@ -308,6 +482,8 @@ export function seedCampaignAnalytics(campaignId: string, state: Partial<Campaig
     views: state.views ?? new Set(),
     contributions: state.contributions ?? [],
     refunds: state.refunds ?? 0,
+    version: state.version ?? 0,
+    appliedEventIds: state.appliedEventIds ?? new Set(),
   });
   invalidateCampaignAnalyticsCache(campaignId);
 }

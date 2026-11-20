@@ -94,6 +94,84 @@ export function shouldNotify(
   return isDigestDue(prefs, lastNotifiedAt, now);
 }
 
+// ── Idempotency ───────────────────────────────────────────────────────────────
+
+/**
+ * Stable idempotency key for a (event, recipient, channel) triple (#226).
+ * Replays of the same domain event resolve to the same key so the outbox can
+ * deduplicate without relying on wall-clock time or delivery ordering.
+ */
+export function buildNotificationIdempotencyKey(
+  eventId: string,
+  recipient: string,
+  channel: NotificationChannel,
+): string {
+  const trimmedEvent = eventId.trim();
+  const trimmedRecipient = recipient.trim().toLowerCase();
+  if (!trimmedEvent) throw new Error("eventId is required to build an idempotency key");
+  if (!trimmedRecipient) throw new Error("recipient is required to build an idempotency key");
+  return `notif:${channel}:${trimmedRecipient}:${trimmedEvent}`;
+}
+
+// ── Opt-out / suppression ─────────────────────────────────────────────────────
+
+/**
+ * Whether the sponsor's preferences suppress delivery of this event at send
+ * time. Opt-outs are honored here (not at receipt) so a preference change
+ * between enqueue and delivery still takes effect.
+ */
+export function isSuppressedByPreferences(
+  prefs: { frequency: NotificationFrequency; channel?: NotificationChannel } | null | undefined,
+  event: ProgressEvent,
+): boolean {
+  if (!prefs) return true;
+  // Milestones always notify; progress digests only when the sponsor opted in.
+  if (isMilestoneEvent(event)) return false;
+  return prefs.frequency === "milestones";
+}
+
+// ── Delivery state machine ────────────────────────────────────────────────────
+
+export const NOTIFICATION_DELIVERY_STATES = ["queued", "sent", "suppressed", "failed"] as const;
+export type NotificationDeliveryState = (typeof NOTIFICATION_DELIVERY_STATES)[number];
+
+/** Terminal states never transition again; replays are no-ops. */
+export const TERMINAL_DELIVERY_STATES: readonly NotificationDeliveryState[] = [
+  "sent",
+  "suppressed",
+  "failed",
+];
+
+const DELIVERY_TRANSITIONS: Record<NotificationDeliveryState, readonly NotificationDeliveryState[]> = {
+  queued: ["sent", "suppressed", "failed"],
+  sent: [],
+  suppressed: [],
+  failed: [],
+};
+
+export function isTerminalDeliveryState(state: NotificationDeliveryState): boolean {
+  return TERMINAL_DELIVERY_STATES.includes(state);
+}
+
+export function canTransitionDelivery(
+  from: NotificationDeliveryState,
+  to: NotificationDeliveryState,
+): boolean {
+  return DELIVERY_TRANSITIONS[from].includes(to);
+}
+
+/**
+ * Applies a delivery transition. Returns the next state, or `null` when the
+ * transition is invalid (e.g. replaying a terminal record) so callers can
+ * treat it as an idempotent no-op rather than an error.
+ */
+export function transitionDelivery(
+  from: NotificationDeliveryState,
+  to: NotificationDeliveryState,
+): NotificationDeliveryState | null {
+  return canTransitionDelivery(from, to) ? to : null;
+}
+
 // ── Validation helper ─────────────────────────────────────────────────────────
 
 /**

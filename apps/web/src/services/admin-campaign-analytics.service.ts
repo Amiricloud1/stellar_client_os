@@ -30,6 +30,11 @@ import {
   type PageInfo,
   type SortDirection,
 } from "@/services/pagination.service";
+import {
+  CAMPAIGN_AGGREGATE_VERSION,
+  reduceCampaignAggregates,
+  type CampaignAggregate,
+} from "@/services/campaign-aggregate.service";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -54,6 +59,10 @@ export interface SponsorshipEvent {
 export interface AdminAnalyticsDataSource {
   getCampaigns(network: string): Promise<CampaignImpactRecord[]>;
   getSponsorships(network: string): Promise<SponsorshipEvent[]>;
+  /** Optional incremental aggregate state; absent means "no aggregates yet". */
+  getAggregates?(network: string): Promise<AdminAnalyticsAggregateState | null>;
+  /** Optional full rebuild hook; returns the freshly recomputed state. */
+  rebuildAggregates?(network: string): Promise<AdminAnalyticsAggregateState>;
 }
 
 export interface SponsorGrowthPoint {
@@ -111,6 +120,21 @@ export interface AdminCampaignAnalytics {
     /** Unix seconds, exclusive. */
     end: number;
   };
+  /**
+   * Reconciliation status of the incremental aggregates backing this snapshot.
+   * `drift` is true when the incremental totals disagree with a full
+   * recomputation, so operators can trigger a rebuild.
+   */
+  aggregates: {
+    /** Version of the aggregate reducer that produced the totals. */
+    version: number;
+    /** Unix seconds of the last full recomputation, or `null` if never run. */
+    lastFullRecomputeAt: number | null;
+    /** True when incremental totals differ from a full recomputation. */
+    drift: boolean;
+    /** Number of campaigns whose incremental totals drifted. */
+    driftedCampaigns: number;
+  };
   network: string;
   generatedAt: number;
 }
@@ -118,6 +142,22 @@ export interface AdminCampaignAnalytics {
 export interface AdminAnalyticsQuery {
   network?: string;
   windowDays?: number;
+}
+
+/** Incremental aggregate state supplied by the data source, if any. */
+export interface AdminAnalyticsAggregateState {
+  version: number;
+  lastFullRecomputeAt: number | null;
+  aggregates: readonly CampaignAggregate[];
+}
+
+/** Result of a full aggregate rebuild. */
+export interface AdminAnalyticsRebuildResult {
+  version: number;
+  rebuiltAt: number;
+  campaigns: number;
+  /** Campaigns whose incremental totals differed from the rebuild. */
+  driftedCampaigns: number;
 }
 
 /** Sortable fields for the admin analytics campaign list. */
@@ -291,6 +331,31 @@ export function computeAdminAnalyticsCampaignList(
 }
 
 /**
+ * Compare incremental aggregates against a full recomputation of the same
+ * campaigns. Returns the number of campaigns whose totals drifted.
+ */
+export function countDriftedCampaigns(
+  campaigns: readonly CampaignImpactRecord[],
+  aggregates: readonly CampaignAggregate[],
+): number {
+  const incremental = new Map(aggregates.map((a) => [a.campaignId, a]));
+  const full = reduceCampaignAggregates(campaigns);
+  let drifted = 0;
+  for (const expected of full) {
+    const actual = incremental.get(expected.campaignId);
+    if (
+      !actual ||
+      actual.totalRaisedStroops !== expected.totalRaisedStroops ||
+      actual.sponsorCount !== expected.sponsorCount ||
+      actual.eventCount !== expected.eventCount
+    ) {
+      drifted += 1;
+    }
+  }
+  return drifted;
+}
+
+/**
  * Compute the admin snapshot.
  *
  * @param now - Unix seconds the window ends at (exclusive).
@@ -298,12 +363,22 @@ export function computeAdminAnalyticsCampaignList(
 export function computeAdminCampaignAnalytics(
   campaigns: readonly CampaignImpactRecord[],
   sponsorships: readonly SponsorshipEvent[],
-  options: { now: number; windowDays?: number; network?: string },
+  options: {
+    now: number;
+    windowDays?: number;
+    network?: string;
+    aggregates?: AdminAnalyticsAggregateState | null;
+  },
 ): AdminCampaignAnalytics {
   const windowDays = normalizeWindowDays(options.windowDays);
   const end = Math.floor(options.now);
   const start = end - windowDays * DAY_SECONDS;
   const previousStart = start - windowDays * DAY_SECONDS;
+
+  const aggregateState = options.aggregates ?? null;
+  const driftedCampaigns = aggregateState
+    ? countDriftedCampaigns(campaigns, aggregateState.aggregates)
+    : 0;
 
   // Campaigns, trees, CO2, completion, total revenue.
   const status = { active: 0, successful: 0, claimed: 0, failed: 0 };
@@ -383,6 +458,12 @@ export function computeAdminCampaignAnalytics(
       growthRate: growthRate(inWindowXlm, previousWindowXlm),
     },
     window: { days: windowDays, start, end },
+    aggregates: {
+      version: aggregateState?.version ?? CAMPAIGN_AGGREGATE_VERSION,
+      lastFullRecomputeAt: aggregateState?.lastFullRecomputeAt ?? null,
+      drift: driftedCampaigns > 0,
+      driftedCampaigns,
+    },
     network: options.network ?? "testnet",
     generatedAt: end,
   };
@@ -454,15 +535,63 @@ export class AdminCampaignAnalyticsService {
 
   async getSnapshot(query: AdminAnalyticsQuery = {}): Promise<AdminCampaignAnalytics> {
     const network = query.network ?? "testnet";
-    const [campaigns, sponsorships] = await Promise.all([
+    const [campaigns, sponsorships, aggregates] = await Promise.all([
       this.dataSource.getCampaigns(network),
       this.dataSource.getSponsorships(network),
+      this.dataSource.getAggregates
+        ? this.dataSource.getAggregates(network)
+        : Promise.resolve(null),
     ]);
     return computeAdminCampaignAnalytics(campaigns, sponsorships, {
       now: this.clock(),
       windowDays: query.windowDays,
       network,
+      aggregates,
     });
+  }
+
+  /**
+   * Rebuild the incremental aggregates from a full recomputation. Callers must
+   * be authorized as admin at the route boundary; this method assumes the
+   * caller has already been authorized.
+   */
+  async rebuildAggregates(
+    query: AdminAnalyticsQuery = {},
+  ): Promise<AdminAnalyticsRebuildResult> {
+    const network = query.network ?? "testnet";
+    const campaigns = await this.dataSource.getCampaigns(network);
+    const rebuiltAt = this.clock();
+
+    let state: AdminAnalyticsAggregateState;
+    if (this.dataSource.rebuildAggregates) {
+      state = await this.dataSource.rebuildAggregates(network);
+    } else {
+      const previous = this.dataSource.getAggregates
+        ? await this.dataSource.getAggregates(network)
+        : null;
+      state = {
+        version: CAMPAIGN_AGGREGATE_VERSION,
+        lastFullRecomputeAt: rebuiltAt,
+        aggregates: reduceCampaignAggregates(campaigns),
+      };
+      // Report drift against the previous incremental state, if any.
+      const driftedCampaigns = previous
+        ? countDriftedCampaigns(campaigns, previous.aggregates)
+        : 0;
+      return {
+        version: state.version,
+        rebuiltAt,
+        campaigns: campaigns.length,
+        driftedCampaigns,
+      };
+    }
+
+    return {
+      version: state.version,
+      rebuiltAt,
+      campaigns: campaigns.length,
+      driftedCampaigns: countDriftedCampaigns(campaigns, state.aggregates),
+    };
   }
 
   /**
