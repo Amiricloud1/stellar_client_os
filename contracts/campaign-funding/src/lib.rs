@@ -192,6 +192,32 @@ pub enum DataKey {
     GroupSponsorshipCount(u64),
     /// Group sponsorship details keyed by campaign and group ID.
     GroupSponsorship(u64, u64),
+    
+    // PHASE 1: Objective 3 - Network Binding
+    /// Unique deployment identity capturing network and contract address (instance storage).
+    DeploymentIdentity,
+    /// Network registry binding for assets keyed by asset address (persistent storage).
+    NetworkRegistry(Address),
+    
+    // PHASE 2: Objective 1 - Campaign Retirement
+    /// Campaign lifecycle state keyed by campaign ID (persistent storage).
+    CampaignLifecycle(u64),
+    /// Retirement timestamp for a campaign keyed by campaign ID (persistent storage).
+    RetirementTimestamp(u64),
+    
+    // PHASE 3: Objective 2 - Granular Pause Controls
+    /// Operation pause flags keyed by campaign ID (persistent storage).
+    OperationPauseFlags(u64),
+    
+    // PHASE 4: Objective 4 - Asset Metadata & Risk
+    /// Asset metadata keyed by token address (persistent storage).
+    AssetMetadata(Address),
+    /// Asset review status keyed by token address (persistent storage).
+    AssetReviewStatus(Address),
+    /// Asset risk flags keyed by token address (persistent storage).
+    AssetRiskFlags(Address),
+    /// Issuer risk registry keyed by issuer address (persistent storage).
+    IssuerRiskRegistry(Address),
 }
 
 /// Current lifecycle state of a campaign.
@@ -214,6 +240,126 @@ pub enum CampaignStatus {
     VerificationFailed,
     /// Campaign has been temporarily halted by the admin.
     Paused,
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 1: Objective 3 - Network Binding
+// ---------------------------------------------------------------------------
+
+/// Unique deployment identity capturing the network context and contract address.
+/// This struct is stored once at contract initialization and serves as proof
+/// of the specific Stellar network and deployment location.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeploymentIdentity {
+    /// Hash of the network identifier (e.g., Stellar testnet, public network).
+    /// Prevents cross-network attacks and fund mixing.
+    pub network_id: BytesN<32>,
+    /// The address of this contract instance on the network.
+    pub contract_address: Address,
+    /// Unix timestamp (seconds) when this contract was deployed.
+    /// Enables ordering and verification of deployment sequence.
+    pub deploy_timestamp: u64,
+}
+
+/// Asset-to-network binding for verification that assets belong to the intended network.
+/// Each asset can be bound to exactly one network, preventing cross-network asset swaps.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetNetworkBinding {
+    /// The token/asset contract address being bound.
+    pub asset: Address,
+    /// The network this asset is verified to belong to.
+    pub network_id: BytesN<32>,
+    /// Whether the binding has been cryptographically verified by validators.
+    pub verified: bool,
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 2: Objective 1 - Campaign Retirement
+// ---------------------------------------------------------------------------
+
+/// Campaign lifecycle state enum defining the extended state machine.
+/// Extends `CampaignStatus` to include retirement and read-only migration states.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CampaignLifecycle {
+    /// Campaign is in normal operation (corresponds to any CampaignStatus except Paused).
+    Active = 0,
+    /// Campaign has transitioned to read-only migration mode.
+    /// All write operations (deposits, payouts) are forbidden.
+    /// Existing data is preserved for auditing and historical reference.
+    ReadOnlyMigration = 1,
+    /// Campaign is fully retired and archived.
+    /// Contract storage is no longer actively managed; historical queries only.
+    RetiredReadOnly = 2,
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 3: Objective 2 - Granular Pause Controls
+// ---------------------------------------------------------------------------
+
+/// Fine-grained operation pause flags allowing independent control of operations.
+/// This enables targeted pausing of deposits, payouts, or claims without
+/// completely freezing the campaign (which CampaignStatus::Paused would do).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationPauseFlags {
+    /// If true, new deposits/contributions are prevented.
+    pub pause_deposits: bool,
+    /// If true, fund payouts and releases are prevented.
+    pub pause_payouts: bool,
+    /// If true, contributor refund claims are prevented.
+    pub pause_claims: bool,
+    /// If true, admin operations (like fee changes) are prevented.
+    pub pause_admin: bool,
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 4: Objective 4 - Asset Metadata & Risk
+// ---------------------------------------------------------------------------
+
+/// Asset metadata tracking issuer identity and verification status.
+/// Enables campaign creators to vet which tokens are acceptable.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetMetadata {
+    /// The token contract address.
+    pub token: Address,
+    /// The issuer/creator of this token.
+    pub issuer: Address,
+    /// Unix timestamp (seconds) when this asset was first verified.
+    pub verified_at: u64,
+    /// Unix timestamp (seconds) of the most recent review or update.
+    pub last_review: u64,
+}
+
+/// Asset review status tracking verification and flag state.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetReviewStatus {
+    /// Asset is awaiting initial review.
+    Pending = 0,
+    /// Asset has been reviewed and approved for use in campaigns.
+    Approved = 1,
+    /// Asset has been flagged for risk, scam, or other issues.
+    Flagged = 2,
+    /// Asset is permanently retired from use.
+    Retired = 3,
+}
+
+/// Risk flags aggregating multiple forms of asset risk assessment.
+/// Each flag represents a specific category of risk that may make an asset
+/// unsuitable for campaign funding.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetRiskFlags {
+    /// Issuer has poor reputation or history of scams/fraud.
+    pub reputation_risk: bool,
+    /// Asset has low liquidity or concentrated holders.
+    pub liquidity_risk: bool,
+    /// Asset is held by a small number of whales (concentration risk).
+    pub concentration_risk: bool,
 }
 
 /// Single entry in a campaign's status history.
@@ -281,6 +427,23 @@ pub struct Campaign {
     /// 1 = dry season (standard rate), 2 = rainy season (2× enhanced rate).
     /// Used by `mint_carbon_credits` to compute per-sponsor token amounts.
     pub co2_multiplier: u32,
+    
+    // PHASE 1: Objective 3 - Network Binding
+    /// SHA-256 hash of the deployment network identifier.
+    /// Ensures this campaign cannot be cross-chain attacked or replayed.
+    pub deployment_id: BytesN<32>,
+    /// SHA-256 hash of the network this campaign belongs to.
+    /// Used to verify all funding tokens are from the same network.
+    pub network_id: BytesN<32>,
+    
+    // PHASE 2: Objective 1 - Campaign Retirement
+    /// Extended lifecycle state including retirement tracking.
+    pub lifecycle_state: CampaignLifecycle,
+    
+    // PHASE 3: Objective 2 - Granular Pause Controls
+    /// Fine-grained pause flags for individual operations.
+    /// Allows selective freezing without full campaign pause.
+    pub pause_flags: OperationPauseFlags,
 }
 
 /// A single co-creator on a campaign team and the share of the proceeds they
@@ -570,6 +733,159 @@ pub struct SpeciesProofVerifiedEvent {
     pub tree_count: u32,
 }
 
+// ---------------------------------------------------------------------------
+// PHASE 1: Objective 3 - Network Binding Events
+// ---------------------------------------------------------------------------
+
+/// Emitted once when the contract is initialized with network identity binding.
+#[contractevent]
+#[derive(Clone)]
+pub struct DeploymentIdentityInitializedEvent {
+    /// SHA-256 hash uniquely identifying the Stellar network.
+    pub network_id: BytesN<32>,
+    /// This contract's address on the network.
+    pub contract_address: Address,
+    /// Unix timestamp when deployment was recorded.
+    pub deploy_timestamp: u64,
+}
+
+/// Emitted when an asset is bound to the network for the first time.
+#[contractevent]
+#[derive(Clone)]
+pub struct AssetNetworkBindingCreatedEvent {
+    /// The token contract address.
+    pub asset: Address,
+    /// The network ID this asset belongs to.
+    pub network_id: BytesN<32>,
+    /// Whether verification was performed.
+    pub verified: bool,
+}
+
+/// Emitted when an asset's network binding is verified by validators.
+#[contractevent]
+#[derive(Clone)]
+pub struct AssetNetworkBindingVerifiedEvent {
+    /// The token contract address.
+    pub asset: Address,
+    /// Network ID verification confirmed.
+    pub network_id: BytesN<32>,
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 2: Objective 1 - Campaign Retirement Events
+// ---------------------------------------------------------------------------
+
+/// Emitted when a campaign transitions to read-only migration mode.
+/// No new contributions can be made, but existing funds remain accessible.
+#[contractevent]
+#[derive(Clone)]
+pub struct CampaignMigratedToReadOnlyEvent {
+    /// The campaign being migrated.
+    pub campaign_id: u64,
+    /// Unix timestamp when migration occurred.
+    pub migrated_at: u64,
+    /// Total funds held in the campaign at time of migration.
+    pub total_raised: i128,
+}
+
+/// Emitted when a campaign is fully retired and archived.
+#[contractevent]
+#[derive(Clone)]
+pub struct CampaignRetiredEvent {
+    /// The campaign being retired.
+    pub campaign_id: u64,
+    /// Unix timestamp when retirement occurred.
+    pub retired_at: u64,
+    /// Final reason/status code for retirement.
+    pub reason: String,
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 3: Objective 2 - Granular Pause Events
+// ---------------------------------------------------------------------------
+
+/// Emitted when pause flags are set for a campaign.
+#[contractevent]
+#[derive(Clone)]
+pub struct CampaignOperationsPausedEvent {
+    /// The campaign affected.
+    pub campaign_id: u64,
+    /// Whether deposits are now paused.
+    pub pause_deposits: bool,
+    /// Whether payouts are now paused.
+    pub pause_payouts: bool,
+    /// Whether claims are now paused.
+    pub pause_claims: bool,
+    /// Whether admin operations are now paused.
+    pub pause_admin: bool,
+    /// Admin who triggered the pause.
+    pub paused_by: Address,
+}
+
+/// Emitted when pause flags are cleared for a campaign.
+#[contractevent]
+#[derive(Clone)]
+pub struct CampaignOperationsResumedEvent {
+    /// The campaign affected.
+    pub campaign_id: u64,
+    /// Admin who triggered the resume.
+    pub resumed_by: Address,
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 4: Objective 4 - Asset Metadata & Risk Events
+// ---------------------------------------------------------------------------
+
+/// Emitted when asset metadata is registered.
+#[contractevent]
+#[derive(Clone)]
+pub struct AssetMetadataRegisteredEvent {
+    /// The token contract address.
+    pub token: Address,
+    /// The issuer of the token.
+    pub issuer: Address,
+    /// Unix timestamp of verification.
+    pub verified_at: u64,
+}
+
+/// Emitted when asset review status changes.
+#[contractevent]
+#[derive(Clone)]
+pub struct AssetReviewStatusChangedEvent {
+    /// The token contract address.
+    pub token: Address,
+    /// New review status.
+    pub status: AssetReviewStatus,
+    /// Who changed the status.
+    pub changed_by: Address,
+}
+
+/// Emitted when asset risk flags are updated.
+#[contractevent]
+#[derive(Clone)]
+pub struct AssetRiskFlagsUpdatedEvent {
+    /// The token contract address.
+    pub token: Address,
+    /// Whether reputation risk is flagged.
+    pub reputation_risk: bool,
+    /// Whether liquidity risk is flagged.
+    pub liquidity_risk: bool,
+    /// Whether concentration risk is flagged.
+    pub concentration_risk: bool,
+    /// Who made the update.
+    pub updated_by: Address,
+}
+
+/// Emitted when issuer risk profile is registered.
+#[contractevent]
+#[derive(Clone)]
+pub struct IssuerRiskRegisteredEvent {
+    /// The issuer address.
+    pub issuer: Address,
+    /// Overall risk assessment string (e.g., "HIGH", "MEDIUM", "LOW").
+    pub risk_level: String,
+}
+
 /// Entitlement unlocked by a campaign's verified tree count.
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -786,6 +1102,44 @@ pub enum Error {
     UnauthorizedVerifier = 42,
     /// Escrow account is currently disputed.
     EscrowDisputed = 43,
+    
+    // PHASE 1: Network Binding Errors
+    /// Network identity has not been initialized.
+    NetworkIdentityNotInitialized = 44,
+    /// Network identity has already been initialized.
+    NetworkIdentityAlreadyInitialized = 45,
+    /// Asset network binding does not match the expected network.
+    NetworkBindingMismatch = 46,
+    /// Asset has not been bound to a network.
+    AssetNotBound = 47,
+    
+    // PHASE 2: Campaign Retirement Errors
+    /// Campaign is in read-only migration mode and cannot accept new operations.
+    CampaignInReadOnlyMode = 48,
+    /// Campaign is fully retired and cannot be accessed for active operations.
+    CampaignRetired = 49,
+    /// Operation attempted on campaign not in retirement lifecycle.
+    InvalidRetirementState = 50,
+    
+    // PHASE 3: Pause Control Errors
+    /// Deposit operations are currently paused for this campaign.
+    OperationDepositsPaused = 51,
+    /// Payout operations are currently paused for this campaign.
+    OperationPayoutsPaused = 52,
+    /// Claim operations are currently paused for this campaign.
+    OperationClaimsPaused = 53,
+    /// Admin operations are currently paused for this campaign.
+    OperationAdminPaused = 54,
+    
+    // PHASE 4: Asset Metadata & Risk Errors
+    /// Asset metadata has not been registered.
+    AssetMetadataNotFound = 55,
+    /// Asset has been flagged and cannot be used for campaigns.
+    AssetFlagged = 56,
+    /// Asset has been retired and is no longer usable.
+    AssetRetired = 57,
+    /// Issuer has high-risk profile and is not approved for fundraising.
+    IssuerHighRisk = 58,
 }
 
 #[cfg(test)]

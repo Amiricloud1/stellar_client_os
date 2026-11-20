@@ -1,0 +1,459 @@
+================================================================================
+FOUR OBJECTIVES: VISUAL REFERENCE & ARCHITECTURE SUMMARY
+================================================================================
+
+Quick Navigation:
+  [1] OBJECTIVE 1: Campaign Retirement & Migration
+  [2] OBJECTIVE 2: Granular Operation Pause
+  [3] OBJECTIVE 3: Network & Deployment Binding
+  [4] OBJECTIVE 4: Asset Metadata & Risk Management
+  [5] DATA MODEL OVERVIEW
+  [6] CONTRACT FUNCTION MATRIX
+  [7] ERROR CODE REFERENCE
+
+================================================================================
+[1] OBJECTIVE 1: Campaign Retirement & Migration
+================================================================================
+
+STATE TRANSITIONS:
+┌─────────────┐
+│   Active    │  (NEW campaigns accept all operations)
+└──────┬──────┘
+       │ initiate_retirement(id, deadline_days)
+       ↓
+┌──────────────────────────────────────────┐
+│ ReadOnlyMigration                        │  (Migration window open)
+│ (can claim, verify; cannot contribute)   │  (Users have time to act)
+└──────┬───────────────────────────────────┘
+       │ finalize_retirement() [after deadline]
+       ↓
+┌──────────────────────────────────────────┐
+│ RetiredReadOnly                          │  (Full archive mode)
+│ (historical reads only; no state change) │  (Can only query past data)
+└──────────────────────────────────────────┘
+
+ALTERNATIVE PATH (Supersedence):
+┌─────────────┐      mark_superseded()      ┌──────────────────────────┐
+│   Active    │ ──────────────────────────→ │ SupersededBy(new_id)     │
+└─────────────┘     (link to replacement)    │ (redirect to new_campaign)│
+                                            └──────────────────────────┘
+
+OPERATIONS ALLOWED (Matrix):
+┌──────────────┬─────────┬──────────────┬────────────┬─────────────┐
+│ Operation    │ Active  │ ReadOnly­    │ Retired­   │ Superseded  │
+│              │         │ Migration    │ ReadOnly   │             │
+├──────────────┼─────────┼──────────────┼────────────┼─────────────┤
+│ contribute() │    ✓    │      ✗       │     ✗      │      ✗      │
+│ claim()      │    ✓    │      ✓       │     ✗      │      ✗      │
+│ verify()     │    ✓    │      ✓       │     ✗      │      ✗      │
+│ refund()     │    ✓    │      ✓       │     ✗      │      ✗      │
+│ get_data()   │    ✓    │      ✓       │     ✓      │   redirect  │
+└──────────────┴─────────┴──────────────┴────────────┴─────────────┘
+
+NEW STORAGE:
+  DataKey::CampaignLifecycle(u64)          → CampaignLifecycle enum
+  DataKey::CampaignRetiredAt(u64)          → u64 timestamp
+  DataKey::MigrationRetirementDeadline(u64) → u64 deadline
+
+NEW FUNCTIONS:
+  initiate_retirement(campaign_id, days)   → void [admin only]
+  finalize_retirement(campaign_id)         → void [anyone, after deadline]
+  mark_superseded(old_id, new_id)          → void [admin only]
+  get_campaign_lifecycle(campaign_id)      → CampaignLifecycle
+
+NEW EVENTS:
+  CampaignRetirementInitiatedEvent
+  CampaignTransitionedToRetiredEvent
+  CampaignSupersedededEvent
+
+ERROR CODE: 45 (CampaignRetired)
+
+================================================================================
+[2] OBJECTIVE 2: Granular Operation Pause
+================================================================================
+
+PAUSE FLAGS BITMASK:
+┌────────────────────────────────────────────────────────────────┐
+│ OperationPauseFlags {                                          │
+│   pause_deposits: bool    ← block contribute()                 │
+│   pause_payouts: bool     ← block claim_funds()                │
+│   pause_claims: bool      ← block refund_claim()               │
+│   pause_admin: bool       ← block verify, dispute, assign_*    │
+│ }                                                              │
+└────────────────────────────────────────────────────────────────┘
+
+CRITICAL INVARIANT (Fund Redirection Prevention):
+┌──────────────────────────────────────────────────────────────┐
+│ IF pause_payouts == true THEN pause_admin == true             │
+│                                                               │
+│ Rationale: If payouts are frozen, ALL fund-moving ops must   │
+│            be frozen. Otherwise admin could:                 │
+│   1. Pause payouts                                           │
+│   2. Approve a dispute that redirects funds                  │
+│   3. Unpause payouts & claim to redirected address           │
+│                                                               │
+│ This invariant closes that attack vector.                    │
+└──────────────────────────────────────────────────────────────┘
+
+VALID PAUSE CONFIGURATIONS:
+✓  pause_deposits=true,  pause_payouts=false, pause_claims=false, pause_admin=false
+✓  pause_deposits=false, pause_payouts=false, pause_claims=true,  pause_admin=false
+✓  pause_deposits=false, pause_payouts=true,  pause_claims=true,  pause_admin=true
+✓  pause_deposits=true,  pause_payouts=true,  pause_claims=true,  pause_admin=true
+
+INVALID PAUSE CONFIGURATIONS:
+✗  pause_deposits=false, pause_payouts=true,  pause_claims=false, pause_admin=false
+   └─→ REJECTED: pause_payouts=true requires pause_admin=true
+✗  pause_deposits=true,  pause_payouts=true,  pause_claims=false, pause_admin=false
+   └─→ REJECTED: pause_payouts=true requires pause_admin=true
+
+AUDIT TRAIL:
+┌─────────────────────────────────────────────────┐
+│ PauseAuditEntry {                              │
+│   campaign_id: u64                             │
+│   timestamp: u64                               │
+│   changed_by: Address                          │
+│   old_flags: OperationPauseFlags               │
+│   new_flags: OperationPauseFlags               │
+│   reason: String    ← e.g., "Fraud suspected" │
+│ }                                              │
+└─────────────────────────────────────────────────┘
+
+NEW STORAGE:
+  DataKey::OperationPauseFlags(u64)     → OperationPauseFlags struct
+  DataKey::PauseAuditLog(u64, u32)      → PauseAuditEntry struct
+
+NEW FUNCTIONS:
+  set_operation_pause_flags(id, flags, reason) → void [admin only]
+  get_operation_pause_flags(id)                → OperationPauseFlags
+  get_pause_audit_log(id, start, limit)       → Vec<PauseAuditEntry>
+
+NEW EVENTS:
+  OperationPauseChangedEvent
+
+ERROR CODES: 46–50
+  46 = DepositsPaused
+  47 = PayoutsPaused
+  48 = ClaimsPaused
+  49 = AdminOperationsPaused
+  50 = PauseConfigurationInvalid
+
+OPERATION GUARD PATTERN:
+┌──────────────────────────────────────────────────────────────┐
+│ fn contribute(...) {                                         │
+│     let flags = get_pause_flags(campaign_id);               │
+│     if flags.pause_deposits {                               │
+│         panic_with_error!(&env, Error::DepositsPaused);    │
+│     }                                                        │
+│     // ... rest of operation ...                            │
+│ }                                                            │
+└──────────────────────────────────────────────────────────────┘
+
+================================================================================
+[3] OBJECTIVE 3: Network & Deployment Binding
+================================================================================
+
+DEPLOYMENT IDENTITY (Set once at initialization):
+┌────────────────────────────────────────────────────────────────┐
+│ DeploymentIdentity {                                           │
+│   contract_address: Address        ← env.current_contract_address()
+│   network_id: String               ← e.g., "mainnet", "testnet"
+│   initialized_at: u64              ← env.ledger().timestamp()
+│   deployment_version: u64          ← e.g., 1, 2, 3 (increment on redeployment)
+│ }                                                              │
+└────────────────────────────────────────────────────────────────┘
+
+CAMPAIGN BINDING (Captured at creation):
+┌────────────────────────────────────────────────────────────────┐
+│ Campaign {                                                     │
+│   id: u64                                                     │
+│   creator: Address                                            │
+│   // ... existing fields ...                                  │
+│                                                               │
+│   // NEW: Deployment context                                 │
+│   deployment_id: u64       ← snapshot of deployment_version  │
+│   network_id: String       ← snapshot of deployment's network│
+│ }                                                              │
+└────────────────────────────────────────────────────────────────┘
+
+LOOKUP GUARD (All operations must verify):
+┌──────────────────────────────────────────────────────────────────┐
+│ fn assert_same_network_and_deployment(                           │
+│     env: &Env,                                                   │
+│     campaign: &Campaign,                                         │
+│ ) {                                                              │
+│     let deployment = env.storage().instance()                   │
+│         .get(&DataKey::DeploymentIdentity)                      │
+│         .unwrap();                                              │
+│                                                                  │
+│     if campaign.network_id != deployment.network_id {           │
+│         panic_with_error!(env, Error::NetworkMismatch);        │
+│     }                                                            │
+│     if campaign.deployment_id != deployment.deployment_version {│
+│         panic_with_error!(env, Error::DeploymentMismatch);     │
+│     }                                                            │
+│ }                                                                │
+└──────────────────────────────────────────────────────────────────┘
+
+CROSS-NETWORK ATTACK PREVENTION:
+┌──────────────────────────────────────────────────────────────────┐
+│ Testnet (network_id="testnet", deployment=1)                    │
+│   Campaign #123 created (network_id="testnet", deployment_id=1) │
+│                                                                  │
+│ Attacker redeploys contract to Mainnet (network_id="mainnet")   │
+│   Tries to claim campaign #123                                  │
+│   BLOCKED: campaign.network_id="testnet" != deployment.network_id="mainnet"
+│   Error: NetworkMismatch                                        │
+│                                                                  │
+│ Result: Campaign #123 cannot be aliased across networks.        │
+└──────────────────────────────────────────────────────────────────┘
+
+NEW STORAGE:
+  DataKey::DeploymentIdentity          → DeploymentIdentity struct
+
+MODIFIED FUNCTIONS:
+  initialize(admin, fee_collector, fee_rate,
+    network_id,          ← NEW: e.g., "mainnet"
+    deployment_version)  ← NEW: e.g., 1
+
+NEW FUNCTIONS:
+  get_deployment_identity()                    → DeploymentIdentity
+  verify_campaign_network(id, expected_network) → bool
+
+NEW EVENTS:
+  DeploymentInitializedEvent
+  NetworkMismatchDetectedEvent
+
+ERROR CODES: 51–52
+  51 = NetworkMismatch
+  52 = DeploymentMismatch
+
+================================================================================
+[4] OBJECTIVE 4: Asset Metadata & Risk Management
+================================================================================
+
+ASSET REVIEW STATUS (Lifecycle):
+┌──────────────────────────────────────────┐
+│ AssetReviewStatus {                      │
+│   Unreviewed   ← default; not audited   │
+│   Approved     ← vetted; safe to use    │
+│   Flagged      ← known issues; warning  │
+│   Deprecated   ← compromised; reject    │
+│ }                                        │
+└──────────────────────────────────────────┘
+
+ASSET METADATA REGISTRY:
+┌───────────────────────────────────────────────────────────────┐
+│ AssetMetadata {                                              │
+│   token_address: Address               ← e.g., USDC token   │
+│   asset_code: String                   ← e.g., "USDC"       │
+│   issuer_account: String               ← Stellar issuer     │
+│   issuer_name: String                  ← e.g., "Circle Inc" │
+│   issuer_verification_url: String      ← transparency doc   │
+│   review_status: AssetReviewStatus     ← current status     │
+│   last_review_timestamp: u64           ← when reviewed      │
+│   last_reviewed_by: Address            ← which admin        │
+│   canonical_network_id: String         ← network bound to   │
+│ }                                                            │
+└───────────────────────────────────────────────────────────────┘
+
+ASSET RISK FLAG (Issue tracking):
+┌───────────────────────────────────────────────────────────────┐
+│ AssetRiskFlag {                                              │
+│   token_address: Address                ← which token       │
+│   flag_reason: String      ← e.g., "Issuer bankrupt"        │
+│   flagged_at: u64          ← timestamp                       │
+│   flagged_by: Address      ← which admin                     │
+│   estimated_severity: u32  ← 1-10 scale                     │
+│   remediation_info: String ← action: "migrate to USDC"      │
+│ }                                                            │
+└───────────────────────────────────────────────────────────────┘
+
+CAMPAIGN TOKEN STATUS (Query result):
+┌───────────────────────────────────────────────────────────────┐
+│ CampaignTokenStatus {                                         │
+│   campaign_id: u64                     ← which campaign      │
+│   token_address: Address               ← which token        │
+│   asset_metadata: Option<AssetMetadata> ← full info         │
+│   review_status_at_creation: Status    ← snapshot at time   │
+│   current_review_status: Status        ← status now         │
+│   active_risk_flags: Vec<RiskFlag>     ← known issues       │
+│   timestamp_queried: u64               ← when queried       │
+│ }                                                            │
+└───────────────────────────────────────────────────────────────┘
+
+CAMPAIGN TOKEN BINDING (Snapshot at creation):
+┌────────────────────────────────────────────────────────────────┐
+│ Campaign {                                                    │
+│   // ... existing fields ...                                 │
+│                                                              │
+│   // NEW: Token status snapshot at creation time            │
+│   token_review_status: AssetReviewStatus                    │
+│ }                                                            │
+│                                                              │
+│ Purpose: Audit trail — "Was this campaign funded with a    │
+│          flagged token? Check campaign.token_review_status" │
+└────────────────────────────────────────────────────────────────┘
+
+OPERATIONS ALLOWED (Token status matrix):
+┌──────────────────┬──────────┬──────────┬─────────┬────────────┐
+│ Token Status     │ New Camp │ Contrib  │ Claim   │ Verify     │
+├──────────────────┼──────────┼──────────┼─────────┼────────────┤
+│ Unreviewed       │    ✓+W   │    ✓+W   │    ✓    │     ✓      │
+│ Approved         │    ✓     │    ✓     │    ✓    │     ✓      │
+│ Flagged          │    ✓+W   │    ✓+W   │    ✓+W  │     ✓      │
+│ Deprecated       │    ✗     │    ✗     │    ✓    │     ✓      │
+└──────────────────┴──────────┴──────────┴─────────┴────────────┘
+W = Warn/Log warning event but allow
+
+NEW STORAGE:
+  DataKey::AssetMetadata(Address)         → AssetMetadata
+  DataKey::AssetRiskFlags(Address, u32)   → AssetRiskFlag
+  DataKey::AssetRiskFlagCount(Address)    → u32 count
+  DataKey::AssetReviewHistory(Address, u32) → audit log
+
+NEW FUNCTIONS:
+  register_asset_metadata(metadata)                 → void [admin]
+  update_asset_review_status(token, status, reason) → void [admin]
+  raise_asset_risk_flag(token, reason, severity, remediation_info) → void [admin]
+  clear_asset_risk_flag(token, flag_index)         → void [admin]
+  get_asset_metadata(token)               → Option<AssetMetadata>
+  get_asset_risk_flags(token, start, limit) → Vec<AssetRiskFlag>
+  get_campaign_token_status(campaign_id)  → CampaignTokenStatus
+
+NEW EVENTS:
+  AssetMetadataRegisteredEvent
+  AssetReviewStatusChangedEvent
+  AssetRiskFlagRaisedEvent
+  AssetRiskFlagClearedEvent
+
+ERROR CODES: 53–56
+  53 = TokenDeprecated
+  54 = AssetAlreadyRegistered
+  55 = AssetNotRegistered
+  56 = InvalidRiskSeverity
+
+================================================================================
+[5] DATA MODEL OVERVIEW (All Objectives Combined)
+================================================================================
+
+NEW ENUMS (2):
+  CampaignLifecycle { Active, ReadOnlyMigration, RetiredReadOnly, SupersededBy(u64) }
+  AssetReviewStatus { Unreviewed, Approved, Flagged, Deprecated }
+
+NEW STRUCTS (8):
+  OperationPauseFlags { pause_deposits, pause_payouts, pause_claims, pause_admin }
+  PauseAuditEntry { campaign_id, timestamp, changed_by, old_flags, new_flags, reason }
+  DeploymentIdentity { contract_address, network_id, initialized_at, deployment_version }
+  AssetMetadata { token_address, asset_code, issuer_account, issuer_name, ... }
+  AssetRiskFlag { token_address, flag_reason, flagged_at, flagged_by, severity, remediation }
+  CampaignTokenStatus { campaign_id, token_address, asset_metadata, review_status_at_creation, ... }
+  [2 more internal structs]
+
+CAMPAIGN STRUCT EXTENSIONS (4 fields):
+  deployment_id: u64                           ← from Objective 3
+  network_id: soroban_sdk::String             ← from Objective 3
+  token_review_status: AssetReviewStatus      ← from Objective 4
+  [1 more from existing code]
+
+NEW DATAKEY VARIANTS (11):
+  CampaignLifecycle(u64)                       [Obj 1]
+  CampaignRetiredAt(u64)                       [Obj 1]
+  MigrationRetirementDeadline(u64)             [Obj 1]
+  OperationPauseFlags(u64)                     [Obj 2]
+  PauseAuditLog(u64, u32)                      [Obj 2]
+  DeploymentIdentity                           [Obj 3]
+  AssetMetadata(Address)                       [Obj 4]
+  AssetRiskFlags(Address, u32)                 [Obj 4]
+  AssetRiskFlagCount(Address)                  [Obj 4]
+  AssetReviewHistory(Address, u32)             [Obj 4]
+  [1 more from existing or future]
+
+================================================================================
+[6] CONTRACT FUNCTION MATRIX (14 New Entry Points)
+================================================================================
+
+OBJECTIVE 1 (4 functions):
+  initiate_retirement(campaign_id: u64, deadline_in_days: u32) → void [admin]
+  finalize_retirement(campaign_id: u64) → void [anyone]
+  mark_superseded(old_id: u64, new_id: u64) → void [admin]
+  get_campaign_lifecycle(campaign_id: u64) → CampaignLifecycle
+
+OBJECTIVE 2 (3 functions):
+  set_operation_pause_flags(id: u64, flags: OperationPauseFlags, reason: String) → void [admin]
+  get_operation_pause_flags(id: u64) → OperationPauseFlags
+  get_pause_audit_log(id: u64, start: u32, limit: u32) → Vec<PauseAuditEntry>
+
+OBJECTIVE 3 (3 functions):
+  [initialize signature extended with network_id, deployment_version]
+  get_deployment_identity() → DeploymentIdentity
+  verify_campaign_network(id: u64, expected_network: String) → bool
+
+OBJECTIVE 4 (7 functions):
+  register_asset_metadata(metadata: AssetMetadata) → void [admin]
+  update_asset_review_status(token: Address, status: AssetReviewStatus, reason: String) → void [admin]
+  raise_asset_risk_flag(token: Address, reason: String, severity: u32, remediation: String) → void [admin]
+  clear_asset_risk_flag(token: Address, flag_index: u32) → void [admin]
+  get_asset_metadata(token: Address) → Option<AssetMetadata>
+  get_asset_risk_flags(token: Address, start: u32, limit: u32) → Vec<AssetRiskFlag>
+  get_campaign_token_status(campaign_id: u64) → Option<CampaignTokenStatus>
+
+================================================================================
+[7] ERROR CODE REFERENCE (9 New Error Codes)
+================================================================================
+
+45 | CampaignRetired        | Objective 1 | State change on retired campaign
+46 | DepositsPaused         | Objective 2 | contribute() blocked by pause_deposits
+47 | PayoutsPaused          | Objective 2 | claim_funds() blocked by pause_payouts
+48 | ClaimsPaused           | Objective 2 | refund_claim() blocked by pause_claims
+49 | AdminOperationsPaused  | Objective 2 | verify/dispute blocked by pause_admin
+50 | PauseConfigurationInvalid | Objective 2 | Invalid pause config (e.g., payouts without admin)
+51 | NetworkMismatch        | Objective 3 | Campaign network ≠ deployment network
+52 | DeploymentMismatch     | Objective 3 | Campaign deployment ≠ current deployment
+53 | TokenDeprecated        | Objective 4 | Cannot use Deprecated token for new campaign
+
+================================================================================
+CROSS-OBJECTIVE CALL GRAPH
+================================================================================
+
+initialize()
+  ├─ Set DeploymentIdentity [Obj 3]
+  └─ (All campaigns created after get network/deployment context)
+
+contribute()
+  ├─ Check campaign.status [existing]
+  ├─ Check deployment_id & network_id [Obj 3]
+  ├─ Check pause_deposits flag [Obj 2]
+  ├─ Check token review_status [Obj 4]
+  └─ Check lifecycle != RetiredReadOnly [Obj 1]
+
+claim_funds()
+  ├─ Check campaign.status [existing]
+  ├─ Check deployment_id & network_id [Obj 3]
+  ├─ Check pause_payouts flag [Obj 2]
+  └─ Check lifecycle != RetiredReadOnly [Obj 1]
+
+verify_campaign()
+  ├─ Check deployment_id & network_id [Obj 3]
+  ├─ Check pause_admin flag [Obj 2]
+  └─ Check lifecycle != RetiredReadOnly [Obj 1]
+
+set_operation_pause_flags()
+  ├─ Enforce invariant: pause_payouts ⟹ pause_admin [Obj 2]
+  └─ Log to PauseAuditLog [Obj 2]
+
+create_campaign()
+  ├─ Capture network_id & deployment_id [Obj 3]
+  ├─ Check token.review_status == Deprecated ⟹ reject [Obj 4]
+  └─ Snapshot token_review_status [Obj 4]
+
+================================================================================
+END OF VISUAL REFERENCE
+================================================================================
+
+For detailed information, see:
+  ✓ FOUR_OBJECTIVES_INDEX.md            (navigation & overview)
+  ✓ FOUR_OBJECTIVES_SUMMARY.md           (high-level reference)
+  ✓ FOUR_OBJECTIVES_SPECIFICATION.md     (full architecture)
+  ✓ FOUR_OBJECTIVES_GAPS_ANALYSIS.md     (current → proposed)
+
