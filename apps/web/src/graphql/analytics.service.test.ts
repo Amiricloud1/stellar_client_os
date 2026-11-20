@@ -431,6 +431,149 @@ describe("AnalyticsService.getSponsorImpact", () => {
   });
 });
 
+// ── cache stampede protection (#235) ─────────────────────────────────────────
+
+describe("AnalyticsService cache coalescing and stale serving (#235)", () => {
+  function deferredSource(records: StreamRecord[] = STREAMS) {
+    let calls = 0;
+    let resolveNext: (() => void) | null = null;
+    const source: StreamDataSource = {
+      getStreams: async () => {
+        calls += 1;
+        if (resolveNext) {
+          await new Promise<void>((resolve) => {
+            resolveNext = resolve;
+          });
+        }
+        return records;
+      },
+    };
+    return {
+      source,
+      getCalls: () => calls,
+      gate: () => {
+        let release!: () => void;
+        const wait = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        resolveNext = release;
+        return wait;
+      },
+    };
+  }
+
+  it("coalesces concurrent identical cold reads into a single backend fetch", async () => {
+    const { source, getCalls } = deferredSource();
+    const svc = new AnalyticsService(source);
+
+    const [a, b, c] = await Promise.all([
+      svc.getGlobalMetrics(),
+      svc.getGlobalMetrics(),
+      svc.getGlobalMetrics(),
+    ]);
+
+    expect(getCalls()).toBe(1);
+    expect(a).toEqual(b);
+    expect(b).toEqual(c);
+  });
+
+  it("does not coalesce reads with different filters", async () => {
+    const { source, getCalls } = deferredSource();
+    const svc = new AnalyticsService(source);
+
+    await Promise.all([
+      svc.getRegionMetrics({ region: "NG" }),
+      svc.getRegionMetrics({ region: "GH" }),
+    ]);
+
+    expect(getCalls()).toBe(2);
+  });
+
+  it("serves bounded stale data with an explicit stale indicator when the backend fails", async () => {
+    let fail = false;
+    const source: StreamDataSource = {
+      getStreams: async () => {
+        if (fail) throw new Error("backend down");
+        return STREAMS;
+      },
+    };
+    const svc = new AnalyticsService(source, { ttlMs: 0, staleTtlMs: 60_000 });
+
+    const fresh = await svc.getGlobalMetrics();
+    expect(fresh.totalStreams).toBe(5);
+
+    fail = true;
+    const stale = await svc.getGlobalMetrics();
+    expect(stale.totalStreams).toBe(5);
+    expect(stale.cacheState).toBe("stale");
+    expect(stale.staleAgeMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("surfaces the failure once the stale window is exhausted", async () => {
+    let fail = false;
+    const source: StreamDataSource = {
+      getStreams: async () => {
+        if (fail) throw new Error("backend down");
+        return STREAMS;
+      },
+    };
+    const svc = new AnalyticsService(source, { ttlMs: 0, staleTtlMs: 0 });
+
+    await svc.getGlobalMetrics();
+    fail = true;
+
+    await expect(svc.getGlobalMetrics()).rejects.toThrow("backend down");
+  });
+
+  it("recovers to fresh state after a backend failure clears", async () => {
+    let fail = false;
+    const source: StreamDataSource = {
+      getStreams: async () => {
+        if (fail) throw new Error("backend down");
+        return STREAMS;
+      },
+    };
+    const svc = new AnalyticsService(source, { ttlMs: 0, staleTtlMs: 60_000 });
+
+    await svc.getGlobalMetrics();
+    fail = true;
+    expect((await svc.getGlobalMetrics()).cacheState).toBe("stale");
+
+    fail = false;
+    const recovered = await svc.getGlobalMetrics();
+    expect(recovered.cacheState).toBe("fresh");
+    expect(recovered.totalStreams).toBe(5);
+  });
+
+  it("does not share cached results across tenants or principals", async () => {
+    const { source, getCalls } = deferredSource();
+    const svc = new AnalyticsService(source);
+
+    await svc.getGlobalMetrics({ tenantId: "tenant-a", principalId: "user-1" });
+    await svc.getGlobalMetrics({ tenantId: "tenant-b", principalId: "user-1" });
+    await svc.getGlobalMetrics({ tenantId: "tenant-a", principalId: "user-2" });
+
+    expect(getCalls()).toBe(3);
+  });
+
+  it("does not leak a failed in-flight read to later callers", async () => {
+    let attempts = 0;
+    const source: StreamDataSource = {
+      getStreams: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("transient");
+        return STREAMS;
+      },
+    };
+    const svc = new AnalyticsService(source, { ttlMs: 0, staleTtlMs: 0 });
+
+    await expect(svc.getGlobalMetrics()).rejects.toThrow("transient");
+    const retried = await svc.getGlobalMetrics();
+    expect(retried.totalStreams).toBe(5);
+    expect(attempts).toBe(2);
+  });
+});
+
 // ── authoritative ledger validation (#82) ────────────────────────────────────
 
 describe("AnalyticsService.getGlobalMetricsWithAuthority (#82)", () => {
