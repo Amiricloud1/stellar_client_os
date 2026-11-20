@@ -12,6 +12,9 @@ import type { CampaignDataSource, CampaignQueryInput } from "@/services/campaign
 import { getCampaignSequelService } from "@/services/campaign-sequel.service";
 import { getCampaignAnalyticsDashboard } from "@/services/campaign-analytics-dashboard.service";
 import { getGrantProgramService } from "@/services/grant-program.service";
+import { getCampaignExportService } from "@/services/campaign-export.service";
+import { getCampaignSearchService } from "@/services/campaign-search.service";
+import { getCampaignWebhookService } from "@/services/campaign-webhook.service";
 import {
   buildPageInfo,
   normalizePagination,
@@ -137,6 +140,71 @@ function toProgramPayload(program: import("@/services/grant-program.service").Gr
     ...program,
     createdAt: Math.floor(program.createdAt / 1000),
     updatedAt: Math.floor(program.updatedAt / 1000),
+  };
+}
+
+/**
+ * Require an authenticated account id for account-scoped resolvers.
+ * Throws an explicit authorization error when the context is anonymous.
+ */
+function requireAccountId(ctx: ResolverContext): string {
+  if (!ctx.accountId) {
+    throw new Error("UNAUTHENTICATED: an authenticated account is required");
+  }
+  return ctx.accountId;
+}
+
+/**
+ * Require the `admin` role for operator-only mutations (issue #230).
+ */
+function requireAdmin(ctx: ResolverContext): string {
+  const accountId = requireAccountId(ctx);
+  if (!ctx.roles || !ctx.roles.includes("admin")) {
+    throw new Error("FORBIDDEN: operator role 'admin' is required");
+  }
+  return accountId;
+}
+
+/**
+ * Map a campaign export job to its public GraphQL shape. The artifact URL is
+ * only exposed once the job has completed; FAILED/EXPIRED jobs surface their
+ * terminal state and error message so clients can react explicitly.
+ */
+function toCampaignExportJobPayload(job: import("@/services/campaign-export.service").CampaignExportJob) {
+  const isTerminal = job.status === "COMPLETED" || job.status === "FAILED" || job.status === "EXPIRED";
+  return {
+    id: job.id,
+    campaignId: job.campaignId,
+    status: job.status,
+    progress: job.progress,
+    format: job.format,
+    artifactUrl: job.status === "COMPLETED" ? job.artifactUrl ?? null : null,
+    error: job.error ?? null,
+    attempts: job.attempts,
+    maxAttempts: job.maxAttempts,
+    createdAt: Math.floor(job.createdAt / 1000),
+    updatedAt: Math.floor(job.updatedAt / 1000),
+    expiresAt: job.expiresAt ? Math.floor(job.expiresAt / 1000) : null,
+    completedAt: job.completedAt ? Math.floor(job.completedAt / 1000) : null,
+    isTerminal,
+  };
+}
+
+/**
+ * Map a webhook redelivery attempt to its public GraphQL shape (issue #230).
+ */
+function toWebhookRedeliveryPayload(attempt: import("@/services/campaign-webhook.service").WebhookRedeliveryAttempt) {
+  return {
+    id: attempt.id,
+    eventId: attempt.eventId,
+    subscriptionId: attempt.subscriptionId,
+    status: attempt.status,
+    attemptNumber: attempt.attemptNumber,
+    requestedBy: attempt.requestedBy,
+    responseStatus: attempt.responseStatus ?? null,
+    error: attempt.error ?? null,
+    createdAt: Math.floor(attempt.createdAt / 1000),
+    completedAt: attempt.completedAt ? Math.floor(attempt.completedAt / 1000) : null,
   };
 }
 
@@ -477,6 +545,62 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         const subscriptions = await getWebhookSubscriptionService().listSubscriptions(accountId);
         return paginate(subscriptions.map(toWebhookPayload), args.pagination);
       },
+
+      /**
+       * Fetch the status of a large campaign export job (issue #228).
+       *
+       * Jobs are scoped to the requesting account: a job owned by another
+       * account is reported as NOT_FOUND rather than leaking its existence.
+       * FAILED and EXPIRED jobs are returned with their terminal state and
+       * error so clients can surface recovery options.
+       */
+      campaignExportJob: async (
+        _: unknown,
+        rawArgs: { id: string },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Query.campaignExportJob", ctx, rawArgs, "id");
+        const accountId = requireAccountId(ctx);
+        const job = await getCampaignExportService().getJob(accountId, args.id);
+        if (!job) {
+          throw new Error(`NOT_FOUND: campaign export job ${args.id} not found`);
+        }
+        return toCampaignExportJobPayload(job);
+      },
+
+      /**
+       * Bounded batch read for campaign discovery (issue #231).
+       *
+       * `ids` is capped at the service's maximum batch size; exceeding the cap
+       * is rejected up front so a single request cannot drive unbounded cost.
+       * Missing or unauthorized campaigns are reported per-id in `errors`
+       * rather than failing the whole batch.
+       */
+      campaignDiscoveryBatch: async (
+        _: unknown,
+        rawArgs: { ids: string[]; network?: Network },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Query.campaignDiscoveryBatch", ctx, rawArgs, "ids");
+        if (!Array.isArray(args.ids) || args.ids.length === 0) {
+          throw new Error("BAD_USER_INPUT: ids must be a non-empty list");
+        }
+        const service = getCampaignSearchService(ctx.campaignDataSource);
+        if (args.ids.length > service.maxBatchSize) {
+          throw new Error(
+            `BAD_USER_INPUT: ids exceeds maximum batch size of ${service.maxBatchSize}`,
+          );
+        }
+        const result = await service.searchBatch(args.ids, { network: args.network });
+        return {
+          items: result.items.map(toCampaignPayload),
+          errors: result.errors.map((error) => ({
+            id: error.id,
+            code: error.code,
+            message: error.message,
+          })),
+        };
+      },
     },
     Mutation: {
       cloneCampaign: async (
@@ -566,6 +690,44 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         const accountId = requireAccountId(ctx);
         const subscription = await getWebhookSubscriptionService().revokeSubscription(accountId, args.id);
         return toWebhookPayload(subscription);
+      },
+
+      /**
+       * Enqueue a large campaign export as an asynchronous job (issue #228).
+       *
+       * The job is owned by the requesting account; progress, expiry and
+       * retry state are exposed via `campaignExportJob`.
+       */
+      enqueueCampaignExport: async (
+        _: unknown,
+        rawArgs: { campaignId: string; format?: "CSV" | "JSON" },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Mutation.enqueueCampaignExport", ctx, rawArgs, "campaignId");
+        const accountId = requireAccountId(ctx);
+        const job = await getCampaignExportService().enqueueExport(accountId, {
+          campaignId: args.campaignId,
+          format: args.format,
+        });
+        return toCampaignExportJobPayload(job);
+      },
+
+      /**
+       * Operator-initiated webhook redelivery (issue #230).
+       *
+       * Requires the `admin` role. The original event payload and signature
+       * inputs are preserved; each authorized attempt is recorded and
+       * returned so operators have an audit trail.
+       */
+      redeliverWebhook: async (
+        _: unknown,
+        rawArgs: { eventId: string },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Mutation.redeliverWebhook", ctx, rawArgs, "eventId");
+        const accountId = requireAdmin(ctx);
+        const attempt = await getCampaignWebhookService().redeliverEvent(accountId, args.eventId);
+        return toWebhookRedeliveryPayload(attempt);
       },
     },
   };

@@ -84,11 +84,22 @@ export const ROUTE_POLICIES: readonly RoutePolicyEntry[] = [
   { path: '/api/orders', policy: 'authenticated' },
   { path: '/api/orders/:id', policy: 'authenticated' },
   { path: '/api/notifications', policy: 'authenticated' },
+  // Campaign discovery batch reads (issue #231). Bounded batch reads are
+  // scoped to the caller; ownership/visibility is enforced in the service.
+  { path: '/api/campaigns/discovery/batch', policy: 'authenticated' },
+  // Large campaign exports run as asynchronous jobs (issue #228). The
+  // artifact retrieval route additionally verifies job ownership in the
+  // service layer; the policy boundary only requires a valid session.
+  { path: '/api/campaigns/:id/exports', policy: 'authenticated' },
+  { path: '/api/campaigns/:id/exports/:jobId', policy: 'authenticated' },
 
   // ── Privileged ────────────────────────────────────────────────────────────
   { path: '/api/admin/users', policy: 'privileged', roles: DEFAULT_PRIVILEGED_ROLES },
   { path: '/api/admin/users/:id', policy: 'privileged', roles: DEFAULT_PRIVILEGED_ROLES },
   { path: '/api/admin/settings', policy: 'privileged', roles: DEFAULT_PRIVILEGED_ROLES },
+  // Audited operator webhook redelivery (issue #230). Each manual attempt is
+  // recorded; only privileged operators may trigger a redelivery.
+  { path: '/api/admin/webhooks/:id/redeliver', policy: 'privileged', roles: DEFAULT_PRIVILEGED_ROLES },
 ] as const;
 
 /** Minimal shape of the session object the guard understands. */

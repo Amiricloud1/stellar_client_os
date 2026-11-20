@@ -6,6 +6,12 @@ import {
   createItemBodySchema,
   updateItemBodySchema,
   searchQuerySchema,
+  exportJobBodySchema,
+  exportJobStatusQuerySchema,
+  exportArtifactQuerySchema,
+  webhookRedeliveryBodySchema,
+  batchReadQuerySchema,
+  batchReadResponseSchema,
 } from './api-schemas';
 
 describe('pathIdSchema', () => {
@@ -245,5 +251,178 @@ describe('parseRequest', () => {
       expect(Array.isArray(issue.path)).toBe(true);
       expect(typeof issue.message).toBe('string');
     }
+  });
+});
+
+describe('exportJobBodySchema', () => {
+  it('accepts a valid export request', () => {
+    const result = exportJobBodySchema.safeParse({ campaignId: 'camp_1', format: 'csv' });
+    expect(result.success).toBe(true);
+  });
+
+  it('defaults format to csv', () => {
+    const result = exportJobBodySchema.safeParse({ campaignId: 'camp_1' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.format).toBe('csv');
+    }
+  });
+
+  it('rejects a missing campaignId', () => {
+    const result = exportJobBodySchema.safeParse({ format: 'csv' });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects an unsupported format', () => {
+    const result = exportJobBodySchema.safeParse({ campaignId: 'camp_1', format: 'xml' });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects unknown keys via .strict()', () => {
+    const result = exportJobBodySchema.safeParse({ campaignId: 'camp_1', rogue: true });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('exportJobStatusQuerySchema', () => {
+  it('accepts an empty query', () => {
+    const result = exportJobStatusQuerySchema.safeParse({});
+    expect(result.success).toBe(true);
+  });
+
+  it('coerces includeArtifact boolean strings', () => {
+    const result = exportJobStatusQuerySchema.safeParse({ includeArtifact: 'true' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.includeArtifact).toBe(true);
+    }
+  });
+
+  it('rejects unknown keys via .strict()', () => {
+    const result = exportJobStatusQuerySchema.safeParse({ rogue: 'x' });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('exportArtifactQuerySchema', () => {
+  it('accepts a valid signed token', () => {
+    const result = exportArtifactQuerySchema.safeParse({ token: 'signed-token' });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects a missing token (unauthorized artifact access)', () => {
+    const result = exportArtifactQuerySchema.safeParse({});
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects an empty token', () => {
+    const result = exportArtifactQuerySchema.safeParse({ token: '' });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects unknown keys via .strict()', () => {
+    const result = exportArtifactQuerySchema.safeParse({ token: 't', rogue: 1 });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('webhookRedeliveryBodySchema', () => {
+  it('accepts a valid redelivery request', () => {
+    const result = webhookRedeliveryBodySchema.safeParse({
+      destinationId: 'dest_1',
+      eventId: 'evt_1',
+      reason: 'operator retry after outage',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects a missing reason (audit trail required)', () => {
+    const result = webhookRedeliveryBodySchema.safeParse({
+      destinationId: 'dest_1',
+      eventId: 'evt_1',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects an empty reason', () => {
+    const result = webhookRedeliveryBodySchema.safeParse({
+      destinationId: 'dest_1',
+      eventId: 'evt_1',
+      reason: '',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a missing destinationId', () => {
+    const result = webhookRedeliveryBodySchema.safeParse({ eventId: 'evt_1', reason: 'r' });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects unknown keys via .strict()', () => {
+    const result = webhookRedeliveryBodySchema.safeParse({
+      destinationId: 'dest_1',
+      eventId: 'evt_1',
+      reason: 'r',
+      rogue: true,
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('batchReadQuerySchema', () => {
+  it('accepts a bounded batch of ids', () => {
+    const result = batchReadQuerySchema.safeParse({ ids: 'a,b,c' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.ids).toEqual(['a', 'b', 'c']);
+    }
+  });
+
+  it('rejects an empty ids list', () => {
+    const result = batchReadQuerySchema.safeParse({ ids: '' });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects an oversized batch', () => {
+    const ids = Array.from({ length: 101 }, (_, i) => `id${i}`).join(',');
+    const result = batchReadQuerySchema.safeParse({ ids });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts a batch at the max boundary', () => {
+    const ids = Array.from({ length: 100 }, (_, i) => `id${i}`).join(',');
+    const result = batchReadQuerySchema.safeParse({ ids });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects unknown keys via .strict()', () => {
+    const result = batchReadQuerySchema.safeParse({ ids: 'a', rogue: 'x' });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('batchReadResponseSchema', () => {
+  it('accepts a success envelope', () => {
+    const result = batchReadResponseSchema.safeParse({
+      items: [{ id: 'a' }],
+      errors: [],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts a partial-error envelope', () => {
+    const result = batchReadResponseSchema.safeParse({
+      items: [{ id: 'a' }],
+      errors: [{ id: 'b', code: 'not_found', message: 'missing' }],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects an error entry missing a code', () => {
+    const result = batchReadResponseSchema.safeParse({
+      items: [],
+      errors: [{ id: 'b', message: 'missing' }],
+    });
+    expect(result.success).toBe(false);
   });
 });
