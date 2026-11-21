@@ -157,3 +157,52 @@ export interface EvidenceIntegrity {
   /** Whether the integrity check can be safely retried. */
   retryable: boolean;
 }
+
+/**
+ * Independent donor consent purposes. Recognition (public acknowledgement),
+ * receipt (transactional donation receipts) and communications (marketing and
+ * updates) are granted and revoked separately so a donor can opt into one
+ * without the others.
+ */
+export type ConsentPurpose = 'recognition' | 'receipt' | 'communications';
+
+/**
+ * State of a single consent purpose. `revoked` is terminal for the current
+ * version: a new grant must be recorded as a new version so downstream
+ * consumers can detect the change.
+ */
+export type ConsentPurposeState = 'granted' | 'revoked';
+
+/**
+ * A versioned consent decision for one purpose. Every grant or revocation
+ * appends a new record with a monotonically increasing `version`, so the
+ * history is auditable and downstream consumers can detect stale consent by
+ * comparing the version they last observed.
+ */
+export interface ConsentRecord {
+  /** Stable identifier of the donor the consent belongs to. */
+  donorId: string;
+  purpose: ConsentPurpose;
+  state: ConsentPurposeState;
+  /** Monotonic version, starting at 1 for the first decision per purpose. */
+  version: number;
+  /** ISO timestamp when this version was recorded at the authoritative boundary. */
+  recordedAt: string;
+  /** Actor (user or service id) that recorded this version. */
+  recordedBy: string;
+  /** Optional operator/donor-facing reason for the change. */
+  reason?: string;
+}
+
+/**
+ * Authoritative consent snapshot for a donor, keyed by purpose. Mirrors the
+ * API response so the offline cache can enforce consent at the boundary and
+ * surface explicit revocation state instead of trusting stale UI state.
+ */
+export interface DonorConsent {
+  donorId: string;
+  /** Latest version per purpose; a missing purpose means no decision yet. */
+  purposes: Partial<Record<ConsentPurpose, ConsentRecord>>;
+  /** ISO timestamp of the most recent consent change. */
+  updatedAt: string;
+}
