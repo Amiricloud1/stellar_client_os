@@ -72,6 +72,28 @@ to the workspace is enough to bring it into the deployment build.
 - Run `pnpm build:contracts` locally before opening a PR that touches
   `contracts/`; CI runs the same check.
 
+## Step-up authorization for high-impact administration
+
+High-impact administrative actions (role/permission changes, key rotation,
+fund-moving configuration, and other actions flagged as high-impact) require
+step-up authorization. Enforcement happens at the authoritative server-side
+action boundary — never rely on UI gating alone. Two paths satisfy step-up:
+
+- **Fresh re-authentication**: the operator re-authenticates and the action is
+  allowed within a configurable freshness window. Once the window lapses the
+  action is rejected with an explicit `step-up required` / `expired` state and
+  the operator must re-authenticate.
+- **Second-approver (dual-control)**: a distinct second approver authorizes the
+  action. Self-approval is rejected; a denied or missing approval surfaces an
+  explicit `denied` state.
+
+Emergency (break-glass) access is bounded and auditable: it is time-limited,
+records who requested it, what action it covers, why, and when it expires, and
+emits an audit log entry on grant and expiry. Operators see explicit
+`emergency access active` / `expired` states. When adding a high-impact action,
+mark it as such at the boundary and cover the success path plus the
+step-up-required, expired, denied, and emergency-access cases in tests.
+
 ## What reviewers check
 
 - Scope: only the linked issue(s); no unrelated refactors or dependency churn.
