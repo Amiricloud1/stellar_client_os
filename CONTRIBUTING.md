@@ -94,6 +94,29 @@ emits an audit log entry on grant and expiry. Operators see explicit
 mark it as such at the boundary and cover the success path plus the
 step-up-required, expired, denied, and emergency-access cases in tests.
 
+## Privacy exports and deletion
+
+Privacy export and deletion requests are handled at the authoritative
+server-side boundary, not in the client. Eligibility, legal-retention
+exceptions, and linked-data rules are all enforced there so a request cannot
+bypass them by calling the API directly.
+
+- **Exports** return only records the requester is authorized to receive. The
+  export is verified before it is handed back; an unverified or partially
+  assembled export surfaces an explicit `pending` / `failed` state rather than
+  a silently incomplete file.
+- **Deletion** erases eligible records while honoring explicit legal-retention
+  exceptions. Records under retention are reported back as retained (with the
+  reason) instead of being deleted, and linked records are handled per the
+  linked-data rules so no orphaned or dangling references remain.
+- **Failure and recovery** are explicit: a failed export or deletion is
+  retryable, and operators can see whether a request is `pending`, `completed`,
+  `partially completed` (retained records), or `failed`.
+
+When changing this behavior, cover the principal success path plus the
+boundary (ineligible/retained records), authorization (wrong requester), and
+retry cases in tests, and update the owning package's docs.
+
 ## What reviewers check
 
 - Scope: only the linked issue(s); no unrelated refactors or dependency churn.
