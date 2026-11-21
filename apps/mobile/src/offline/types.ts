@@ -90,3 +90,70 @@ export interface PrivacyRequestResult {
   /** Whether the request can be safely retried. */
   retryable: boolean;
 }
+
+/**
+ * Content digest recorded for an uploaded evidence file. The digest is a
+ * tamper-evidence signal only: it lets operators detect that stored bytes no
+ * longer match what was uploaded. It does NOT prove the evidence is truthful
+ * or authentic, and must never be presented as such.
+ */
+export interface EvidenceDigest {
+  /** Digest algorithm, e.g. `sha256`. */
+  algorithm: string;
+  /** Lowercase hex-encoded content digest of the uploaded bytes. */
+  value: string;
+  /** Size in bytes of the digested content. */
+  byteLength: number;
+  /** ISO timestamp when the digest was recorded at the upload boundary. */
+  recordedAt: string;
+}
+
+/**
+ * One entry in an evidence file's replacement history. Every re-upload or
+ * replacement appends an entry so the prior content digest is never lost.
+ */
+export interface EvidenceReplacement {
+  /** Monotonic revision number, starting at 1 for the original upload. */
+  revision: number;
+  /** Digest of the content at this revision. */
+  digest: EvidenceDigest;
+  /** ISO timestamp when this revision replaced the previous content. */
+  replacedAt: string;
+  /** Actor (user or service id) that performed the replacement. */
+  replacedBy: string;
+  /** Optional operator-facing reason for the replacement. */
+  reason?: string;
+}
+
+/**
+ * Integrity state of an uploaded evidence file as reported by the
+ * authoritative upload/persistence boundary.
+ *
+ * - `verified`: stored bytes match the recorded digest.
+ * - `mismatch`: stored bytes no longer match the recorded digest (tampering or
+ *   corruption detected); operators must review before relying on the file.
+ * - `unverified`: no digest has been recorded yet (e.g. legacy uploads); the
+ *   file can be re-verified by re-uploading or running a backfill.
+ */
+export type EvidenceIntegrityStatus = 'verified' | 'mismatch' | 'unverified';
+
+/**
+ * Integrity record for an uploaded evidence file. Mirrors the authoritative
+ * API response so the offline cache can surface explicit failure and recovery
+ * states instead of silently trusting cached bytes.
+ */
+export interface EvidenceIntegrity {
+  /** Stable identifier of the evidence file. */
+  evidenceId: string;
+  status: EvidenceIntegrityStatus;
+  /** Digest of the current content, absent for `unverified` legacy uploads. */
+  currentDigest?: EvidenceDigest;
+  /** Full replacement history, oldest first. */
+  replacements: EvidenceReplacement[];
+  /** ISO timestamp of the most recent integrity verification. */
+  verifiedAt?: string;
+  /** Operator-facing message describing a failure or recovery step. */
+  message?: string;
+  /** Whether the integrity check can be safely retried. */
+  retryable: boolean;
+}
