@@ -1,5 +1,11 @@
 #![no_std]
 #![allow(deprecated)]
+
+// Module imports for the four objectives
+pub mod events;
+pub mod fund_authorization;
+pub mod operations;
+
 use soroban_sdk::{
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype,
     panic_with_error, token, Address, Env, Symbol, Vec,
