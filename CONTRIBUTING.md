@@ -72,6 +72,51 @@ to the workspace is enough to bring it into the deployment build.
 - Run `pnpm build:contracts` locally before opening a PR that touches
   `contracts/`; CI runs the same check.
 
+## Step-up authorization for high-impact administration
+
+High-impact administrative actions (role/permission changes, key rotation,
+fund-moving configuration, and other actions flagged as high-impact) require
+step-up authorization. Enforcement happens at the authoritative server-side
+action boundary — never rely on UI gating alone. Two paths satisfy step-up:
+
+- **Fresh re-authentication**: the operator re-authenticates and the action is
+  allowed within a configurable freshness window. Once the window lapses the
+  action is rejected with an explicit `step-up required` / `expired` state and
+  the operator must re-authenticate.
+- **Second-approver (dual-control)**: a distinct second approver authorizes the
+  action. Self-approval is rejected; a denied or missing approval surfaces an
+  explicit `denied` state.
+
+Emergency (break-glass) access is bounded and auditable: it is time-limited,
+records who requested it, what action it covers, why, and when it expires, and
+emits an audit log entry on grant and expiry. Operators see explicit
+`emergency access active` / `expired` states. When adding a high-impact action,
+mark it as such at the boundary and cover the success path plus the
+step-up-required, expired, denied, and emergency-access cases in tests.
+
+## Privacy exports and deletion
+
+Privacy export and deletion requests are handled at the authoritative
+server-side boundary, not in the client. Eligibility, legal-retention
+exceptions, and linked-data rules are all enforced there so a request cannot
+bypass them by calling the API directly.
+
+- **Exports** return only records the requester is authorized to receive. The
+  export is verified before it is handed back; an unverified or partially
+  assembled export surfaces an explicit `pending` / `failed` state rather than
+  a silently incomplete file.
+- **Deletion** erases eligible records while honoring explicit legal-retention
+  exceptions. Records under retention are reported back as retained (with the
+  reason) instead of being deleted, and linked records are handled per the
+  linked-data rules so no orphaned or dangling references remain.
+- **Failure and recovery** are explicit: a failed export or deletion is
+  retryable, and operators can see whether a request is `pending`, `completed`,
+  `partially completed` (retained records), or `failed`.
+
+When changing this behavior, cover the principal success path plus the
+boundary (ineligible/retained records), authorization (wrong requester), and
+retry cases in tests, and update the owning package's docs.
+
 ## What reviewers check
 
 - Scope: only the linked issue(s); no unrelated refactors or dependency churn.
