@@ -11,6 +11,7 @@ doctest = false
 
 [dependencies]
 soroban-sdk.workspace = true
+operation-registry = { path = "../operation-registry" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

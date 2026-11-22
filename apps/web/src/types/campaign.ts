@@ -78,6 +78,26 @@ export interface CampaignData {
   uniqueContributors?: number;
   contributionCount?: number;
   sustainabilityScore?: CampaignSustainabilityScore;
+  /**
+   * Version of the incremental aggregate logic that produced the totals above.
+   * Optional for backward compatibility with campaigns served by older backends.
+   */
+  aggregateVersion?: number;
+  /**
+   * Identifier of the last contribution event folded into the incremental
+   * aggregates. Used to detect duplicate or out-of-order event delivery.
+   */
+  lastProcessedEventId?: string;
+  /**
+   * Timestamp (ms since epoch) of the last successful reconciliation against a
+   * full recomputation. Absent when the campaign has never been reconciled.
+   */
+  lastReconciledAt?: number;
+  /**
+   * True when the incremental totals diverged from the full recomputation.
+   * UI should surface this state and gate on it until reconciliation succeeds.
+   */
+  driftDetected?: boolean;
 }
 
 export interface CampaignFilterOptions {
@@ -87,4 +107,66 @@ export interface CampaignFilterOptions {
   region: Region | "All";
   progressRange: "All" | "0-25%" | "25-50%" | "50-75%" | "75-100%" | "100%+";
   sortBy: "trending" | "newest" | "progress" | "target";
+}
+
+/**
+ * Categories of checks performed by the pre-launch readiness checklist.
+ */
+export type ReadinessCategory =
+  | "metadata"
+  | "network"
+  | "assetSupport"
+  | "milestones"
+  | "payoutTerms";
+
+/**
+ * Outcome of a single readiness check.
+ * - "pass": requirement satisfied.
+ * - "fail": requirement violated; deployment must be blocked.
+ * - "warning": non-blocking concern; deployment may proceed.
+ */
+export type ReadinessStatus = "pass" | "fail" | "warning";
+
+export interface ReadinessCheck {
+  /** Stable identifier for the check (e.g. "metadata.title"). */
+  id: string;
+  category: ReadinessCategory;
+  status: ReadinessStatus;
+  /** Human-readable summary of the check result. */
+  message: string;
+  /** Actionable guidance shown to operators when status is not "pass". */
+  remediation?: string;
+}
+
+export interface ReadinessCategorySummary {
+  category: ReadinessCategory;
+  status: ReadinessStatus;
+  passed: number;
+  failed: number;
+  warnings: number;
+  total: number;
+}
+
+/**
+ * Result of validating a campaign before deployment.
+ * `ready` is true only when no check has status "fail".
+ */
+export interface CampaignReadinessResult {
+  ready: boolean;
+  /** True when at least one check is a "warning" but none failed. */
+  hasWarnings: boolean;
+  checks: ReadinessCheck[];
+  categories: ReadinessCategorySummary[];
+  /** Checks that failed, surfaced for explicit operator recovery. */
+  blockers: ReadinessCheck[];
+  /** ISO timestamp of when the checklist was evaluated. */
+  evaluatedAt: string;
+}
+
+/**
+ * Campaign record as persisted/validated at the authoritative boundary.
+ * `readiness` is populated by the readiness checklist prior to deployment.
+ */
+export interface CampaignRecord extends CampaignData {
+  readiness?: CampaignReadinessResult;
 }

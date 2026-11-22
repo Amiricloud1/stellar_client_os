@@ -11,12 +11,25 @@
  * Uses a cache-aside pattern with a 5-minute TTL (300 seconds) to balance
  * freshness with reduced database load during high traffic periods.
  *
- * # Key Design (schema v1)
- * Keys are namespaced as `campaign:progress:v1:{campaignId}` for individual
- * campaign metrics. The `v1` segment is a schema version: bump it whenever the
- * shape of {@link CampaignProgressMetrics} changes so that entries written by
- * an older deployment can never be deserialized into the new shape. Old
- * versions are simply abandoned and expire via their TTL.
+ * # Key Design (schema v2)
+ * Keys are namespaced as `campaign:progress:v2:{campaignId}` for individual
+ * campaign metrics. The `v2` segment is a schema version: bump it whenever the
+ * shape of {@link CampaignProgressMetrics} changes *or* whenever the aggregate
+ * reducer changes (see {@link AGGREGATE_VERSION}) so that entries written by an
+ * older deployment can never be deserialized into the new shape or served as
+ * authoritative totals.
+ *
+ * # Aggregate Versioning & Migration
+ * Every entry additionally carries an `aggregateVersion` field. On read, an
+ * entry whose `aggregateVersion` does not equal {@link AGGREGATE_VERSION} is
+ * treated as a miss and deleted, so a rolling deploy that mixes old and new
+ * reducers can never serve stale aggregate totals. Bumping the version is a
+ * two-part change: bump {@link AGGREGATE_VERSION} (invalidates values in place)
+ * and, if the value shape changed, bump {@link KEY_SCHEMA_VERSION} (moves keys
+ * to a new namespace). Old keys are not rewritten; they are abandoned and
+ * expire via their TTL, which bounds the migration window to the TTL. No
+ * backfill is required — the first read after a bump is a miss and the caller
+ * recomputes from the database.
  *
  * # Freshness Budget
  * Every entry carries a `calculatedAt` timestamp. An entry is considered
@@ -69,6 +82,12 @@ export interface CampaignProgressMetrics {
   co2ImpactKg: number;
   /** Unix timestamp (ms) when these metrics were calculated */
   calculatedAt: number;
+  /**
+   * Version of the aggregate reducer that produced these metrics.
+   * Entries with a different version are treated as misses (see
+   * {@link AGGREGATE_VERSION}).
+   */
+  aggregateVersion: number;
 }
 
 /** Options for cache operations */
@@ -81,7 +100,14 @@ export interface CacheOptions {
 
 const KEY_PREFIX = "campaign:progress";
 /** Schema version segment embedded in every key. Bump on shape changes. */
-const KEY_SCHEMA_VERSION = "v1";
+const KEY_SCHEMA_VERSION = "v2";
+/**
+ * Version of the incremental aggregate reducer. Bump whenever the reducer's
+ * output for the same set of events could change (e.g. late/duplicate event
+ * handling, rounding, ordering). Entries written under a different version are
+ * never served; they are deleted on read and recomputed by the caller.
+ */
+export const AGGREGATE_VERSION = 2;
 /** Default cache TTL: 5 minutes (300 seconds) */
 const DEFAULT_TTL_SECONDS = 300;
 
@@ -133,12 +159,16 @@ export class CampaignProgressCache {
     return Math.min(parsed, ttlMs);
   }
 
-  /** Returns true when the entry is within the freshness budget. */
+  /**
+   * Returns true when the entry was produced by the current aggregate reducer
+   * and is within the freshness budget.
+   */
   private isFresh(
     metrics: CampaignProgressMetrics,
     options?: CacheOptions,
     now: number = Date.now()
   ): boolean {
+    if (metrics.aggregateVersion !== AGGREGATE_VERSION) return false;
     if (typeof metrics.calculatedAt !== "number") return false;
     const age = now - metrics.calculatedAt;
     // Reject future-dated entries (clock skew) beyond a small tolerance.
@@ -178,6 +208,8 @@ export class CampaignProgressCache {
 
   /**
    * Store campaign progress metrics with TTL.
+   * The entry is stamped with {@link AGGREGATE_VERSION} so that a later
+   * version bump invalidates it automatically.
    * Silently no-ops when Redis is unavailable.
    */
   async set(
@@ -188,7 +220,10 @@ export class CampaignProgressCache {
     try {
       const key = buildProgressKey(metrics.campaignId);
       const ttl = this.getTTL(options);
-      const serialized = JSON.stringify(metrics);
+      const serialized = JSON.stringify({
+        ...metrics,
+        aggregateVersion: AGGREGATE_VERSION,
+      });
       
       if (ttl > 0) {
         await this.redis.setex(key, ttl, serialized);
@@ -324,10 +359,12 @@ export class CampaignProgressCache {
             if (this.isFresh(metrics, options, now)) {
               result.set(campaignIds[i], metrics);
             } else {
+              // Stale, or written by a different aggregate version: drop it.
               staleKeys.push(keys[i]);
             }
           } catch {
-            // Skip invalid JSON
+            // Invalid JSON: drop it so it can be recomputed.
+            staleKeys.push(keys[i]);
           }
         }
       }

@@ -13,6 +13,19 @@ import {
 
 export type CampaignStatus = "DRAFT" | "PENDING_VERIFICATION" | "ACTIVE" | "PAUSED" | "COMPLETED" | "FAILED";
 
+export type {
+  CampaignReadinessCategory,
+  CampaignReadinessCheck,
+  CampaignReadinessReport,
+  CampaignReadinessInput,
+} from "./campaign-readiness.service";
+import {
+  evaluateCampaignReadiness,
+  assertCampaignReady,
+  type CampaignReadinessReport,
+  type CampaignReadinessInput,
+} from "./campaign-readiness.service";
+
 export type CampaignSortField =
   | "createdAt"
   | "updatedAt"
@@ -911,7 +924,7 @@ export async function recordCampaignContribution(
   return { campaign: updated, milestones: newlyReached };
 }
 
-export async function createCampaign(input: {
+export interface CreateCampaignInput {
   id?: string;
   creator: string;
   creatorEmail?: string;
@@ -942,7 +955,30 @@ export async function createCampaign(input: {
   sponsors?: SponsorRecord[];
   network?: "testnet" | "mainnet";
   nonprofitPartner?: Omit<CampaignNonprofitPartner, "verificationStatus" | "verifiedAt" | "verifiedBy">;
-}, dataSource = getCampaignDataSource(), now = Date.now()): Promise<CampaignRecord> {
+  /** Optional payout terms validated by the pre-launch readiness checklist. */
+  payoutTerms?: CampaignReadinessInput["payoutTerms"];
+  /** Optional milestone plan validated by the pre-launch readiness checklist. */
+  milestones?: CampaignReadinessInput["milestones"];
+  /** Optional asset support declaration validated by the readiness checklist. */
+  assetSupport?: CampaignReadinessInput["assetSupport"];
+  /** When true, creation fails if the readiness checklist has blocking issues. */
+  enforceReadiness?: boolean;
+}
+
+/**
+ * Evaluate the pre-launch readiness checklist for a campaign record.
+ *
+ * The checklist validates required metadata, network, asset support,
+ * milestones, and payout terms. It is a pure read: it never mutates the
+ * campaign and is safe to call from UI, API, and deployment paths.
+ */
+export function getCampaignReadiness(
+  campaign: Partial<CampaignRecord> & Partial<CampaignReadinessInput>,
+): CampaignReadinessReport {
+  return evaluateCampaignReadiness(campaign);
+}
+
+export async function createCampaign(input: CreateCampaignInput, dataSource = getCampaignDataSource(), now = Date.now()): Promise<CampaignRecord> {
   if (input.coordinates !== undefined) {
     const { latitude, longitude } = input.coordinates;
     if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
@@ -997,6 +1033,19 @@ gpsLocations: input.gpsLocations,
   };
   campaign.statusHistory[0].campaignId = campaign.id;
   campaign.statusHistory[0].id = `${campaign.id}:${now}:0`;
+
+  // Surface readiness failures at the authoritative creation boundary. When
+  // enforcement is requested, blocking issues abort the write with an explicit
+  // error so operators can recover by fixing the metadata and retrying.
+  if (input.enforceReadiness) {
+    assertCampaignReady({
+      ...campaign,
+      payoutTerms: input.payoutTerms,
+      milestones: input.milestones,
+      assetSupport: input.assetSupport,
+    });
+  }
+
   return persistCampaign(dataSource, campaign);
 }
 
@@ -1207,6 +1256,13 @@ export async function transitionCampaignStatus(
   if (campaign.status === toStatus) return campaign;
   if (!allowedTransitions[campaign.status].includes(toStatus)) {
     throw new Error(`Invalid campaign status transition: ${campaign.status} -> ${toStatus}`);
+  }
+
+  // Launching a campaign (DRAFT -> PENDING_VERIFICATION) requires the
+  // pre-launch readiness checklist to pass. Failures are surfaced explicitly
+  // so the creator/operator can fix the metadata and retry.
+  if (campaign.status === "DRAFT" && toStatus === "PENDING_VERIFICATION") {
+    assertCampaignReady(campaign);
   }
 
   // The status change and its history entry are committed atomically.
@@ -1441,6 +1497,299 @@ export async function exportCampaign(campaignId: string, format: "csv" | "json",
   return { document, body: format === "json" ? JSON.stringify(document, null, 2) : campaignExportToCsv(document) };
 }
 
+/* ------------------------------------------------------------------------- *
+ * Asynchronous campaign export jobs (issue #228)
+ *
+ * Large exports are processed as bounded background jobs so a request never
+ * blocks on an unbounded read. The job record is the authoritative state:
+ * status, progress, attempts and expiry are all enforced at this service
+ * boundary. Artifacts are only handed out to the requester (or an admin) and
+ * only while the job is SUCCEEDED and unexpired.
+ * ------------------------------------------------------------------------- */
+
+export type CampaignExportFormat = "csv" | "json";
+
+export type CampaignExportJobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "EXPIRED";
+
+export interface CampaignExportJob {
+  id: string;
+  campaignId: string;
+  requesterId: string;
+  format: CampaignExportFormat;
+  status: CampaignExportJobStatus;
+  /** Completion percentage in the inclusive range [0, 100]. */
+  progress: number;
+  /** Number of processing attempts started so far. */
+  attempts: number;
+  maxAttempts: number;
+  createdAt: number;
+  updatedAt: number;
+  /** Absolute timestamp after which the artifact is no longer retrievable. */
+  expiresAt: number;
+  /** Key identifying the stored artifact once the job succeeds. */
+  artifactKey?: string;
+  /** Explicit failure reason when `status` is FAILED. */
+  error?: string;
+}
+
+export interface CampaignExportJobStore {
+  save(job: CampaignExportJob): Promise<CampaignExportJob>;
+  get(jobId: string): Promise<CampaignExportJob | null>;
+  saveArtifact(artifactKey: string, body: string): Promise<void>;
+  getArtifact(artifactKey: string): Promise<string | null>;
+}
+
+export class InMemoryCampaignExportJobStore implements CampaignExportJobStore {
+  private jobs = new Map<string, CampaignExportJob>();
+  private artifacts = new Map<string, string>();
+
+  async save(job: CampaignExportJob): Promise<CampaignExportJob> {
+    const stored = { ...job };
+    this.jobs.set(job.id, stored);
+    return { ...stored };
+  }
+
+  async get(jobId: string): Promise<CampaignExportJob | null> {
+    const job = this.jobs.get(jobId);
+    return job ? { ...job } : null;
+  }
+
+  async saveArtifact(artifactKey: string, body: string): Promise<void> {
+    this.artifacts.set(artifactKey, body);
+  }
+
+  async getArtifact(artifactKey: string): Promise<string | null> {
+    return this.artifacts.get(artifactKey) ?? null;
+  }
+}
+
+export interface CampaignExportJobOptions {
+  /** Lifetime of the artifact after the job is created. */
+  ttlMs?: number;
+  /** Maximum processing attempts before the job is marked FAILED. */
+  maxAttempts?: number;
+  /** Maximum number of sponsors processed per bounded work unit. */
+  batchSize?: number;
+}
+
+export const CAMPAIGN_EXPORT_DEFAULT_TTL_MS = 60 * 60 * 1000;
+export const CAMPAIGN_EXPORT_DEFAULT_MAX_ATTEMPTS = 3;
+export const CAMPAIGN_EXPORT_DEFAULT_BATCH_SIZE = 100;
+
+let defaultExportJobStore: CampaignExportJobStore | undefined;
+
+export function getCampaignExportJobStore(): CampaignExportJobStore {
+  return (defaultExportJobStore ??= new InMemoryCampaignExportJobStore());
+}
+
+export function setCampaignExportJobStore(store: CampaignExportJobStore): void {
+  defaultExportJobStore = store;
+}
+
+export class CampaignExportJobError extends Error {
+  constructor(
+    message: string,
+    readonly code:
+      | "NOT_FOUND"
+      | "FORBIDDEN"
+      | "EXPIRED"
+      | "NOT_READY"
+      | "FAILED"
+      | "ATTEMPTS_EXHAUSTED"
+      | "INVALID_STATE",
+  ) {
+    super(message);
+    this.name = "CampaignExportJobError";
+  }
+}
+
+function isExportJobExpired(job: CampaignExportJob, now: number): boolean {
+  return now >= job.expiresAt;
+}
+
+/** Mark a job EXPIRED once its artifact lifetime has elapsed. */
+function expireIfNeeded(job: CampaignExportJob, now: number): CampaignExportJob {
+  if (job.status === "EXPIRED") return job;
+  if (job.status !== "SUCCEEDED" && job.status !== "FAILED") return job;
+  if (!isExportJobExpired(job, now)) return job;
+  return { ...job, status: "EXPIRED", updatedAt: now };
+}
+
+/** Enqueue a bounded asynchronous export job for a campaign. */
+export async function enqueueExport(
+  campaignId: string,
+  requesterId: string,
+  format: CampaignExportFormat = "csv",
+  options: CampaignExportJobOptions = {},
+  store: CampaignExportJobStore = getCampaignExportJobStore(),
+  now = Date.now(),
+): Promise<CampaignExportJob> {
+  if (!requesterId.trim()) throw new CampaignExportJobError("requesterId is required", "FORBIDDEN");
+  const ttlMs = options.ttlMs ?? CAMPAIGN_EXPORT_DEFAULT_TTL_MS;
+  if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
+    throw new CampaignExportJobError("ttlMs must be a positive number", "INVALID_STATE");
+  }
+  const maxAttempts = Math.max(1, Math.floor(options.maxAttempts ?? CAMPAIGN_EXPORT_DEFAULT_MAX_ATTEMPTS));
+  const job: CampaignExportJob = {
+    id: crypto.randomUUID(),
+    campaignId,
+    requesterId,
+    format,
+    status: "QUEUED",
+    progress: 0,
+    attempts: 0,
+    maxAttempts,
+    createdAt: now,
+    updatedAt: now,
+    expiresAt: now + ttlMs,
+  };
+  return store.save(job);
+}
+
+/** Read a job's status. Only the requester (or an admin) may observe it. */
+export async function getExportJob(
+  jobId: string,
+  requesterId: string,
+  store: CampaignExportJobStore = getCampaignExportJobStore(),
+  now = Date.now(),
+  isAdmin = false,
+): Promise<CampaignExportJob> {
+  const job = await store.get(jobId);
+  if (!job) throw new CampaignExportJobError(`Export job ${jobId} not found`, "NOT_FOUND");
+  if (!isAdmin && job.requesterId !== requesterId) {
+    throw new CampaignExportJobError("Not authorized to view this export job", "FORBIDDEN");
+  }
+  const effective = expireIfNeeded(job, now);
+  if (effective !== job) return store.save(effective);
+  return effective;
+}
+
+/**
+ * Process one bounded unit of work for an export job.
+ *
+ * Each call starts (or resumes) an attempt, advances progress by at most
+ * `batchSize` sponsors, and commits the artifact once complete. Attempts are
+ * capped at `maxAttempts`; once exhausted the job is marked FAILED with an
+ * explicit error. Expired jobs are never processed.
+ */
+export async function runExportJob(
+  jobId: string,
+  dataSource: CampaignDataSource = getCampaignDataSource(),
+  store: CampaignExportJobStore = getCampaignExportJobStore(),
+  options: CampaignExportJobOptions = {},
+  now = Date.now(),
+): Promise<CampaignExportJob> {
+  const job = await store.get(jobId);
+  if (!job) throw new CampaignExportJobError(`Export job ${jobId} not found`, "NOT_FOUND");
+
+  const effective = expireIfNeeded(job, now);
+  if (effective.status === "EXPIRED") {
+    if (effective !== job) await store.save(effective);
+    throw new CampaignExportJobError(`Export job ${jobId} has expired`, "EXPIRED");
+  }
+  if (effective.status === "SUCCEEDED") return effective;
+  if (effective.status === "FAILED") {
+    throw new CampaignExportJobError(effective.error ?? `Export job ${jobId} failed`, "FAILED");
+  }
+  if (effective.attempts >= effective.maxAttempts) {
+    const failed: CampaignExportJob = {
+      ...effective,
+      status: "FAILED",
+      error: `Export job exceeded ${effective.maxAttempts} attempts`,
+      updatedAt: now,
+    };
+    await store.save(failed);
+    throw new CampaignExportJobError(failed.error!, "ATTEMPTS_EXHAUSTED");
+  }
+
+  const batchSize = Math.max(1, Math.floor(options.batchSize ?? CAMPAIGN_EXPORT_DEFAULT_BATCH_SIZE));
+  const running: CampaignExportJob = {
+    ...effective,
+    status: "RUNNING",
+    attempts: effective.attempts + 1,
+    updatedAt: now,
+  };
+  await store.save(running);
+
+  try {
+    const campaign = await getCampaign(running.campaignId, dataSource);
+    if (!campaign) {
+      const failed: CampaignExportJob = {
+        ...running,
+        status: "FAILED",
+        error: `Campaign ${running.campaignId} not found`,
+        updatedAt: now,
+      };
+      await store.save(failed);
+      throw new CampaignExportJobError(failed.error!, "FAILED");
+    }
+
+    const document = campaignToExportDocument(campaign);
+    const total = Math.max(1, document.sponsors.length);
+    const processed = Math.min(total, batchSize);
+    const progress = Math.min(100, Math.round((processed / total) * 100));
+
+    if (processed < total) {
+      // Bounded work: persist partial progress and let the caller resume.
+      return store.save({ ...running, progress, updatedAt: now });
+    }
+
+    const body = running.format === "json"
+      ? JSON.stringify(document, null, 2)
+      : campaignExportToCsv(document);
+    const artifactKey = `campaign-export:${running.id}`;
+    await store.saveArtifact(artifactKey, body);
+    return store.save({
+      ...running,
+      status: "SUCCEEDED",
+      progress: 100,
+      artifactKey,
+      updatedAt: now,
+    });
+  } catch (error) {
+    if (error instanceof CampaignExportJobError) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    const failed: CampaignExportJob = {
+      ...running,
+      status: running.attempts >= running.maxAttempts ? "FAILED" : "QUEUED",
+      error: message,
+      updatedAt: now,
+    };
+    await store.save(failed);
+    throw new CampaignExportJobError(message, "FAILED");
+  }
+}
+
+/**
+ * Retrieve the artifact for a completed export job.
+ *
+ * Enforces ownership (requester or admin), expiry, and readiness at the
+ * authoritative boundary before returning the stored body.
+ */
+export async function getExportArtifact(
+  jobId: string,
+  requesterId: string,
+  store: CampaignExportJobStore = getCampaignExportJobStore(),
+  now = Date.now(),
+  isAdmin = false,
+): Promise<string> {
+  const job = await getExportJob(jobId, requesterId, store, now, isAdmin);
+  if (job.status === "EXPIRED") {
+    throw new CampaignExportJobError(`Export job ${jobId} has expired`, "EXPIRED");
+  }
+  if (job.status === "FAILED") {
+    throw new CampaignExportJobError(job.error ?? `Export job ${jobId} failed`, "FAILED");
+  }
+  if (job.status !== "SUCCEEDED" || !job.artifactKey) {
+    throw new CampaignExportJobError(`Export job ${jobId} is not ready`, "NOT_READY");
+  }
+  const body = await store.getArtifact(job.artifactKey);
+  if (body === null) {
+    throw new CampaignExportJobError(`Export artifact for ${jobId} is unavailable`, "NOT_FOUND");
+  }
+  return body;
+}
+
 export function calculateCampaignCarbonCredits(campaign: Partial<CampaignRecord> = {}): bigint {
   const baseCredits = BigInt(campaign.treeCount ?? 0);
   const uniqueCountries = new Set(campaign.countries ?? []);
@@ -1630,4 +1979,54 @@ export async function applyCampaignChainCorrection(
     updatedAt: now,
   };
   return persistCampaign(dataSource, corrected);
+}
+
+/**
+ * Update mutable campaign metadata and re-run the readiness checklist.
+ *
+ * When `enforceReadiness` is set, blocking readiness issues abort the update
+ * before any write occurs, leaving the committed record untouched so the
+ * caller can correct the input and retry. Returns `null` when the campaign is
+ * unknown.
+ */
+export async function updateCampaignMetadata(
+  campaignId: string,
+  patch: Partial<CreateCampaignInput>,
+  dataSource: CampaignDataSource = getCampaignDataSource(),
+  now = Date.now(),
+): Promise<{ campaign: CampaignRecord; readiness: CampaignReadinessReport } | null> {
+  const campaign = await getCampaign(campaignId, dataSource);
+  if (!campaign) return null;
+  const next: CampaignRecord = {
+    ...campaign,
+    name: patch.name ?? campaign.name,
+    description: patch.description ?? campaign.description,
+    location: patch.location ?? campaign.location,
+    countries: patch.countries ?? campaign.countries,
+    speciesTags: patch.speciesTags ?? campaign.speciesTags,
+    region: patch.region ?? campaign.region,
+    treeSpecies: patch.treeSpecies ?? campaign.treeSpecies,
+    species: patch.species ?? campaign.species,
+    treeCount: patch.treeCount ?? campaign.treeCount,
+    co2SequestrationKg: patch.co2SequestrationKg ?? campaign.co2SequestrationKg,
+    goalAmount: patch.goalAmount ?? campaign.goalAmount,
+    network: patch.network ?? campaign.network,
+    updatedAt: now,
+  };
+  const readiness = evaluateCampaignReadiness({
+    ...next,
+    payoutTerms: patch.payoutTerms,
+    milestones: patch.milestones,
+    assetSupport: patch.assetSupport,
+  });
+  if (patch.enforceReadiness && !readiness.ready) {
+    assertCampaignReady({
+      ...next,
+      payoutTerms: patch.payoutTerms,
+      milestones: patch.milestones,
+      assetSupport: patch.assetSupport,
+    });
+  }
+  const saved = await persistCampaign(dataSource, next);
+  return { campaign: saved, readiness };
 }

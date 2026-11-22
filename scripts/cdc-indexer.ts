@@ -17,12 +17,24 @@
  *      so restarts resume from the correct position without gaps or
  *      duplicate processing.
  *
+ * # Partitioning (issue #217)
+ *
+ * Ingestion is partitioned by `(network, deploymentId)`. Each partition has
+ * its own cursor, backfill job state, and health record, and runs in its own
+ * independent loop. A stalled or failing partition therefore cannot block
+ * ingestion for any other deployment: errors are isolated per partition and
+ * surfaced explicitly as `healthy` / `degraded` / `stalled` states.
+ *
+ * Partition identity is `"<network>:<deploymentId>"`. The legacy single
+ * `INDEXER_ID` cursor is migrated into the partition for the configured
+ * network + deployment on first start (see `migrateLegacyCursor`).
+ *
  * # Table schemas
  *
  * ```sql
  * CREATE TABLE IF NOT EXISTS stream_events (
  *   id              BIGSERIAL PRIMARY KEY,
- *   event_id        TEXT        NOT NULL UNIQUE,   -- <ledger>-<txHash>-<eventIndex> (Issue #1)
+ *   event_id        TEXT        NOT NULL UNIQUE,   -- <ledger>-<tx_index>-<event_index>
  *   contract_id     TEXT        NOT NULL,
  *   event_type      TEXT        NOT NULL,          -- stream_created|updated|cancelled|completed
  *   ledger_sequence BIGINT      NOT NULL,
@@ -38,12 +50,33 @@
  * );
  *
  * CREATE TABLE IF NOT EXISTS cdc_cursors (
- *   indexer_id       TEXT        PRIMARY KEY,
- *   last_ledger      BIGINT      NOT NULL,
- *   last_tx_hash     TEXT,                         -- Issue #1: Compound cursor
- *   last_event_index BIGINT,                       -- Issue #1: Compound cursor
- *   last_timestamp   TIMESTAMPTZ,                  -- Issue #1: Compound cursor
- *   updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ *   indexer_id      TEXT        PRIMARY KEY,       -- "<network>:<deploymentId>"
+ *   last_ledger     BIGINT      NOT NULL,
+ *   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ * );
+ *
+ * CREATE TABLE IF NOT EXISTS cdc_backfill_jobs (
+ *   partition_id    TEXT        NOT NULL,
+ *   job_id          TEXT        NOT NULL,
+ *   from_ledger     BIGINT      NOT NULL,
+ *   to_ledger       BIGINT      NOT NULL,
+ *   next_ledger     BIGINT      NOT NULL,
+ *   status          TEXT        NOT NULL,          -- pending|running|completed|failed
+ *   attempts        INTEGER     NOT NULL DEFAULT 0,
+ *   last_error      TEXT,
+ *   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ *   PRIMARY KEY (partition_id, job_id)
+ * );
+ *
+ * CREATE TABLE IF NOT EXISTS cdc_partition_health (
+ *   partition_id    TEXT        PRIMARY KEY,
+ *   network         TEXT        NOT NULL,
+ *   deployment_id   TEXT        NOT NULL,
+ *   state           TEXT        NOT NULL,          -- healthy|degraded|stalled
+ *   last_success_at TIMESTAMPTZ,
+ *   last_error      TEXT,
+ *   consecutive_failures INTEGER NOT NULL DEFAULT 0,
+ *   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
  * );
  * ```
  *
@@ -55,11 +88,14 @@
  * | CONTRACT_IDS          | ✓        | —                                        | Comma-separated Soroban contract IDs |
  * | STELLAR_RPC_URL       | ✗        | https://soroban-testnet.stellar.org      | Soroban RPC endpoint |
  * | NETWORK_PASSPHRASE    | ✗        | Test SDF Network ; September 2015        | Stellar network passphrase |
+ * | NETWORK               | ✗        | derived from passphrase                  | Network label used for partitioning |
+ * | DEPLOYMENT_ID         | ✗        | default                                  | Deployment identifier used for partitioning |
  * | POLL_INTERVAL_SECONDS | ✗        | 5                                        | Seconds between event polls |
  * | LEDGER_LOOKBACK       | ✗        | 1000                                     | Ledgers to look back on first start |
  * | MAX_EVENTS_PER_POLL   | ✗        | 200                                      | Max events fetched per poll cycle |
- * | INDEXER_ID            | ✗        | fundable_stream_indexer                  | Unique ID for the cursor row |
+ * | INDEXER_ID            | ✗        | fundable_stream_indexer                  | Legacy cursor ID (migrated into partition) |
  * | DRY_RUN               | ✗        | false                                    | Parse events but skip DB writes |
+ * | STALL_THRESHOLD_SECONDS | ✗      | 120                                      | Age of last success before a partition is `stalled` |
  *
  * # Running
  *
@@ -74,6 +110,8 @@ import {
   type SorobanEvent,
 } from "@stellar/stellar-sdk";
 import { Server as RpcServer } from "@stellar/stellar-sdk/rpc";
+import { WebhookService } from "../apps/web/src/services/webhook.service";
+import path from "path";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -86,11 +124,7 @@ export type StreamEventType =
   | "unknown";
 
 export interface StreamEvent {
-  /**
-   * Unique event identifier: <ledger>-<txHash>-<eventIndex>
-   * Issue #1: Compound key prevents duplication/reordering for equal timestamps
-   * and concurrent ingestion.
-   */
+  /** Unique event identifier: <ledger>-<txIndex>-<eventIndex> */
   eventId: string;
   contractId: string;
   eventType: StreamEventType;
@@ -113,12 +147,47 @@ export interface StreamEvent {
 export interface CdcCursor {
   indexerId: string;
   lastLedger: number;
-  /** Issue #1: Compound cursor - transaction hash for stable deduplication */
-  lastTxHash: string | null;
-  /** Issue #1: Compound cursor - event index for ordering within same txHash */
-  lastEventIndex: number | null;
-  /** Issue #1: Compound cursor - timestamp for tiebreaker ordering */
-  lastTimestamp: string | null;
+  updatedAt: string;
+}
+
+/**
+ * A partition of the indexer: one network + one deployment. Each partition
+ * owns its cursor, backfill jobs, and health record.
+ */
+export interface Partition {
+  /** Stable partition key: "<network>:<deploymentId>" */
+  id: string;
+  network: string;
+  deploymentId: string;
+  contractIds: string[];
+  rpcUrl: string;
+  networkPassphrase: string;
+}
+
+export type PartitionState = "healthy" | "degraded" | "stalled";
+
+export interface PartitionHealth {
+  partitionId: string;
+  network: string;
+  deploymentId: string;
+  state: PartitionState;
+  lastSuccessAt: string | null;
+  lastError: string | null;
+  consecutiveFailures: number;
+  updatedAt: string;
+}
+
+export type BackfillStatus = "pending" | "running" | "completed" | "failed";
+
+export interface BackfillJob {
+  partitionId: string;
+  jobId: string;
+  fromLedger: number;
+  toLedger: number;
+  nextLedger: number;
+  status: BackfillStatus;
+  attempts: number;
+  lastError: string | null;
   updatedAt: string;
 }
 
@@ -127,11 +196,14 @@ export interface IndexerConfig {
   contractIds: string[];
   rpcUrl: string;
   networkPassphrase: string;
+  network: string;
+  deploymentId: string;
   pollIntervalSeconds: number;
   ledgerLookback: number;
   maxEventsPerPoll: number;
   indexerId: string;
   dryRun: boolean;
+  stallThresholdSeconds: number;
 }
 
 export type LogLevel = "info" | "warn" | "error" | "debug";
@@ -151,6 +223,8 @@ export class IndexerError extends Error {
       | "DB_ERROR"
       | "RPC_ERROR"
       | "PARSE_ERROR"
+      | "UNKNOWN_DEPLOYMENT"
+      | "UNAUTHORIZED"
   ) {
     super(message);
     this.name = "IndexerError";
@@ -174,6 +248,22 @@ export function log(
   };
   const out = level === "error" || level === "warn" ? process.stderr : process.stdout;
   out.write(JSON.stringify(entry) + "\n");
+}
+
+// ── Partition helpers ─────────────────────────────────────────────────────────
+
+/** Build the stable partition key for a network + deployment pair. */
+export function partitionId(network: string, deploymentId: string): string {
+  return `${network}:${deploymentId}`;
+}
+
+/** Derive a human-readable network label from a passphrase. */
+export function deriveNetworkLabel(passphrase: string): string {
+  if (passphrase === Networks.PUBLIC) return "public";
+  if (passphrase === Networks.TESTNET) return "testnet";
+  if (passphrase === Networks.FUTURENET) return "futurenet";
+  if (passphrase === Networks.SANDBOX) return "sandbox";
+  return "custom";
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -210,16 +300,42 @@ export function loadConfig(): IndexerConfig {
     }
   }
 
+  const networkPassphrase = process.env.NETWORK_PASSPHRASE ?? Networks.TESTNET;
+  const network = process.env.NETWORK ?? deriveNetworkLabel(networkPassphrase);
+  const deploymentId = process.env.DEPLOYMENT_ID ?? "default";
+
+  if (!network.trim()) {
+    throw new IndexerError("NETWORK must not be empty", "CONFIG_ERROR");
+  }
+  if (!deploymentId.trim()) {
+    throw new IndexerError("DEPLOYMENT_ID must not be empty", "CONFIG_ERROR");
+  }
+
   return {
     databaseUrl,
     contractIds,
     rpcUrl: process.env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org",
-    networkPassphrase: process.env.NETWORK_PASSPHRASE ?? Networks.TESTNET,
+    networkPassphrase,
+    network,
+    deploymentId,
     pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 5),
     ledgerLookback: Number(process.env.LEDGER_LOOKBACK ?? 1_000),
     maxEventsPerPoll: Number(process.env.MAX_EVENTS_PER_POLL ?? 200),
     indexerId: process.env.INDEXER_ID ?? "fundable_stream_indexer",
     dryRun: process.env.DRY_RUN === "true",
+    stallThresholdSeconds: Number(process.env.STALL_THRESHOLD_SECONDS ?? 120),
+  };
+}
+
+/** Build the partition descriptor for the configured network + deployment. */
+export function buildPartition(config: IndexerConfig): Partition {
+  return {
+    id: partitionId(config.network, config.deploymentId),
+    network: config.network,
+    deploymentId: config.deploymentId,
+    contractIds: config.contractIds,
+    rpcUrl: config.rpcUrl,
+    networkPassphrase: config.networkPassphrase,
   };
 }
 
@@ -270,102 +386,110 @@ export async function ensureSchema(db: DbClient): Promise<void> {
 
   await db.query(`
     CREATE TABLE IF NOT EXISTS cdc_cursors (
-      indexer_id         TEXT        PRIMARY KEY,
-      last_ledger        BIGINT      NOT NULL,
-      last_tx_hash       TEXT,
-      last_event_index   BIGINT,
-      last_timestamp     TIMESTAMPTZ,
-      updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      indexer_id  TEXT        PRIMARY KEY,
+      last_ledger BIGINT      NOT NULL,
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
 
   await db.query(`
-    CREATE TABLE IF NOT EXISTS sponsor_signups (
-      sponsor_address TEXT PRIMARY KEY,
-      signup_date     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    CREATE TABLE IF NOT EXISTS cdc_backfill_jobs (
+      partition_id TEXT        NOT NULL,
+      job_id       TEXT        NOT NULL,
+      from_ledger  BIGINT      NOT NULL,
+      to_ledger    BIGINT      NOT NULL,
+      next_ledger  BIGINT      NOT NULL,
+      status       TEXT        NOT NULL,
+      attempts     INTEGER     NOT NULL DEFAULT 0,
+      last_error   TEXT,
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (partition_id, job_id)
     )
   `);
 
   await db.query(`
-    CREATE TABLE IF NOT EXISTS sponsorships (
-      id              BIGSERIAL PRIMARY KEY,
-      sponsor_address TEXT        NOT NULL REFERENCES sponsor_signups(sponsor_address),
-      stream_id       TEXT        NOT NULL,
-      amount          NUMERIC     NOT NULL,
-      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
+    CREATE INDEX IF NOT EXISTS idx_cdc_backfill_jobs_partition
+      ON cdc_backfill_jobs (partition_id, status)
   `);
 
   await db.query(`
-    CREATE INDEX IF NOT EXISTS idx_sponsorships_sponsor_address ON sponsorships(sponsor_address)
-  `);
-  
-  await db.query(`
-    CREATE INDEX IF NOT EXISTS idx_sponsorships_created_at ON sponsorships(created_at)
+    CREATE TABLE IF NOT EXISTS cdc_partition_health (
+      partition_id         TEXT        PRIMARY KEY,
+      network              TEXT        NOT NULL,
+      deployment_id        TEXT        NOT NULL,
+      state                TEXT        NOT NULL,
+      last_success_at      TIMESTAMPTZ,
+      last_error           TEXT,
+      consecutive_failures INTEGER     NOT NULL DEFAULT 0,
+      updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
   `);
 }
 
 /**
- * Read the last processed cursor for this indexer instance.
+ * Read the last processed ledger for a partition.
  * Returns `null` if no cursor exists (first run).
- * Issue #1: Returns compound cursor with ledger, txHash, eventIndex.
  */
 export async function getCursor(
   db: DbClient,
   indexerId: string
-): Promise<CdcCursor | null> {
-  const result = await db.query<{
-    last_ledger: string;
-    last_tx_hash: string | null;
-    last_event_index: string | null;
-    last_timestamp: string | null;
-    updated_at: string;
-  }>(
-    "SELECT last_ledger, last_tx_hash, last_event_index, last_timestamp, updated_at FROM cdc_cursors WHERE indexer_id = $1",
+): Promise<number | null> {
+  const result = await db.query<{ last_ledger: string }>(
+    "SELECT last_ledger FROM cdc_cursors WHERE indexer_id = $1",
     [indexerId]
   );
   if (result.rows.length === 0) return null;
-  const row = result.rows[0];
-  return {
-    indexerId,
-    lastLedger: Number(row.last_ledger),
-    lastTxHash: row.last_tx_hash,
-    lastEventIndex: row.last_event_index ? Number(row.last_event_index) : null,
-    lastTimestamp: row.last_timestamp,
-    updatedAt: row.updated_at,
-  };
+  return Number(result.rows[0].last_ledger);
 }
 
 /**
- * Persist the latest processed compound cursor.
- * Issue #1: Saves ledger, txHash, eventIndex for stable deduplication.
+ * Persist the latest processed ledger sequence for a partition.
  */
 export async function setCursor(
   db: DbClient,
   indexerId: string,
-  cursor: Omit<CdcCursor, "indexerId" | "updatedAt">
+  lastLedger: number
 ): Promise<void> {
   await db.query(
-    `INSERT INTO cdc_cursors (
-       indexer_id, last_ledger, last_tx_hash, last_event_index,
-       last_timestamp, updated_at
-     )
-     VALUES ($1, $2, $3, $4, $5, NOW())
+    `INSERT INTO cdc_cursors (indexer_id, last_ledger, updated_at)
+     VALUES ($1, $2, NOW())
      ON CONFLICT (indexer_id)
-     DO UPDATE SET
-       last_ledger = EXCLUDED.last_ledger,
-       last_tx_hash = EXCLUDED.last_tx_hash,
-       last_event_index = EXCLUDED.last_event_index,
-       last_timestamp = EXCLUDED.last_timestamp,
-       updated_at = NOW()`,
-    [
-      indexerId,
-      cursor.lastLedger,
-      cursor.lastTxHash,
-      cursor.lastEventIndex,
-      cursor.lastTimestamp,
-    ]
+     DO UPDATE SET last_ledger = EXCLUDED.last_ledger, updated_at = NOW()`,
+    [indexerId, lastLedger]
   );
+}
+
+/**
+ * Migrate a legacy single-indexer cursor into the partition cursor.
+ *
+ * Older deployments stored a cursor under `INDEXER_ID` (e.g.
+ * `fundable_stream_indexer`). On first start of a partitioned deployment we
+ * copy that value into the partition cursor if — and only if — the partition
+ * cursor does not yet exist. This preserves resume position across the
+ * upgrade without duplicating or skipping ledgers.
+ *
+ * Returns `true` if a migration occurred.
+ */
+export async function migrateLegacyCursor(
+  db: DbClient,
+  legacyIndexerId: string,
+  partition: Partition
+): Promise<boolean> {
+  if (legacyIndexerId === partition.id) return false;
+
+  const existing = await getCursor(db, partition.id);
+  if (existing !== null) return false;
+
+  const legacy = await getCursor(db, legacyIndexerId);
+  if (legacy === null) return false;
+
+  await setCursor(db, partition.id, legacy);
+  log("info", "Migrated legacy cursor into partition", {
+    partitionId: partition.id,
+    legacyIndexerId,
+    lastLedger: legacy,
+  });
+  return true;
 }
 
 /**
@@ -400,30 +524,294 @@ export async function insertEvents(
         ev.rawXdr,
       ]
     );
-
-    if ((result as unknown as { rowCount: number }).rowCount > 0) {
-      inserted++;
-      
-      // If it's a stream creation, track the sponsor
-      if (ev.eventType === "stream_created" && ev.sender) {
-        // Upsert sponsor signup
-        await db.query(
-          `INSERT INTO sponsor_signups (sponsor_address)
-           VALUES ($1)
-           ON CONFLICT (sponsor_address) DO NOTHING`,
-          [ev.sender]
-        );
-
-        // Record the sponsorship
-        await db.query(
-          `INSERT INTO sponsorships (sponsor_address, stream_id, amount)
-           VALUES ($1, $2, $3)`,
-          [ev.sender, ev.streamId, ev.amount]
-        );
-      }
-    }
+    // pg returns rowCount for INSERT
+    if ((result as unknown as { rowCount: number }).rowCount > 0) inserted++;
   }
   return inserted;
+}
+
+// ── Partition health ──────────────────────────────────────────────────────────
+
+/**
+ * Compute the explicit health state for a partition from its persisted
+ * record. A partition with no recorded success and no failures is `healthy`
+ * (it has simply not run yet). A partition whose last success is older than
+ * the stall threshold is `stalled` regardless of failure count.
+ */
+export function computePartitionState(
+  health: Pick<PartitionHealth, "lastSuccessAt" | "consecutiveFailures">,
+  stallThresholdSeconds: number,
+  now: number = Date.now()
+): PartitionState {
+  if (health.lastSuccessAt) {
+    const ageSeconds = (now - new Date(health.lastSuccessAt).getTime()) / 1_000;
+    if (ageSeconds > stallThresholdSeconds) return "stalled";
+  }
+  if (health.consecutiveFailures > 0) return "degraded";
+  return "healthy";
+}
+
+/** Read the persisted health record for a partition, if any. */
+export async function getPartitionHealth(
+  db: DbClient,
+  partitionIdValue: string
+): Promise<PartitionHealth | null> {
+  const result = await db.query<{
+    partition_id: string;
+    network: string;
+    deployment_id: string;
+    state: PartitionState;
+    last_success_at: string | null;
+    last_error: string | null;
+    consecutive_failures: number;
+    updated_at: string;
+  }>(
+    `SELECT partition_id, network, deployment_id, state, last_success_at,
+            last_error, consecutive_failures, updated_at
+       FROM cdc_partition_health
+      WHERE partition_id = $1`,
+    [partitionIdValue]
+  );
+  if (result.rows.length === 0) return null;
+  const row = result.rows[0];
+  return {
+    partitionId: row.partition_id,
+    network: row.network,
+    deploymentId: row.deployment_id,
+    state: row.state,
+    lastSuccessAt: row.last_success_at
+      ? new Date(row.last_success_at).toISOString()
+      : null,
+    lastError: row.last_error,
+    consecutiveFailures: Number(row.consecutive_failures),
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+/**
+ * Record a successful poll cycle for a partition. Resets the failure counter
+ * and marks the partition `healthy`.
+ */
+export async function recordPartitionSuccess(
+  db: DbClient,
+  partition: Partition
+): Promise<void> {
+  await db.query(
+    `INSERT INTO cdc_partition_health (
+       partition_id, network, deployment_id, state, last_success_at,
+       last_error, consecutive_failures, updated_at
+     ) VALUES ($1, $2, $3, 'healthy', NOW(), NULL, 0, NOW())
+     ON CONFLICT (partition_id) DO UPDATE SET
+       state = 'healthy',
+       last_success_at = NOW(),
+       last_error = NULL,
+       consecutive_failures = 0,
+       updated_at = NOW()`,
+    [partition.id, partition.network, partition.deploymentId]
+  );
+}
+
+/**
+ * Record a failed poll cycle for a partition. Increments the failure counter,
+ * stores the error, and derives the explicit state (`degraded` or `stalled`).
+ * Returns the resulting state so callers can surface it.
+ */
+export async function recordPartitionFailure(
+  db: DbClient,
+  partition: Partition,
+  error: string,
+  stallThresholdSeconds: number
+): Promise<PartitionState> {
+  const existing = await getPartitionHealth(db, partition.id);
+  const consecutiveFailures = (existing?.consecutiveFailures ?? 0) + 1;
+  const lastSuccessAt = existing?.lastSuccessAt ?? null;
+  const state = computePartitionState(
+    { lastSuccessAt, consecutiveFailures },
+    stallThresholdSeconds
+  );
+
+  await db.query(
+    `INSERT INTO cdc_partition_health (
+       partition_id, network, deployment_id, state, last_success_at,
+       last_error, consecutive_failures, updated_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+     ON CONFLICT (partition_id) DO UPDATE SET
+       state = EXCLUDED.state,
+       last_error = EXCLUDED.last_error,
+       consecutive_failures = EXCLUDED.consecutive_failures,
+       updated_at = NOW()`,
+    [
+      partition.id,
+      partition.network,
+      partition.deploymentId,
+      state,
+      lastSuccessAt,
+      error,
+      consecutiveFailures,
+    ]
+  );
+
+  return state;
+}
+
+// ── Backfill jobs ─────────────────────────────────────────────────────────────
+
+/** Enqueue a backfill job scoped to a partition. */
+export async function enqueueBackfill(
+  db: DbClient,
+  partition: Partition,
+  jobId: string,
+  fromLedger: number,
+  toLedger: number
+): Promise<void> {
+  if (fromLedger > toLedger) {
+    throw new IndexerError(
+      `Invalid backfill range: fromLedger ${fromLedger} > toLedger ${toLedger}`,
+      "CONFIG_ERROR"
+    );
+  }
+  await db.query(
+    `INSERT INTO cdc_backfill_jobs (
+       partition_id, job_id, from_ledger, to_ledger, next_ledger, status,
+       attempts, last_error, updated_at
+     ) VALUES ($1, $2, $3, $4, $3, 'pending', 0, NULL, NOW())
+     ON CONFLICT (partition_id, job_id) DO NOTHING`,
+    [partition.id, jobId, fromLedger, toLedger]
+  );
+}
+
+/** List backfill jobs for a partition (optionally filtered by status). */
+export async function listBackfills(
+  db: DbClient,
+  partitionIdValue: string,
+  status?: BackfillStatus
+): Promise<BackfillJob[]> {
+  const params: unknown[] = [partitionIdValue];
+  let sql = `SELECT partition_id, job_id, from_ledger, to_ledger, next_ledger,
+                    status, attempts, last_error, updated_at
+               FROM cdc_backfill_jobs
+              WHERE partition_id = $1`;
+  if (status) {
+    params.push(status);
+    sql += ` AND status = $2`;
+  }
+  sql += ` ORDER BY job_id`;
+
+  const result = await db.query<{
+    partition_id: string;
+    job_id: string;
+    from_ledger: string;
+    to_ledger: string;
+    next_ledger: string;
+    status: BackfillStatus;
+    attempts: number;
+    last_error: string | null;
+    updated_at: string;
+  }>(sql, params);
+
+  return result.rows.map((row) => ({
+    partitionId: row.partition_id,
+    jobId: row.job_id,
+    fromLedger: Number(row.from_ledger),
+    toLedger: Number(row.to_ledger),
+    nextLedger: Number(row.next_ledger),
+    status: row.status,
+    attempts: Number(row.attempts),
+    lastError: row.last_error,
+    updatedAt: new Date(row.updated_at).toISOString(),
+  }));
+}
+
+/**
+ * Advance a backfill job's progress. Marks the job `completed` when the
+ * cursor reaches `to_ledger`.
+ */
+export async function advanceBackfill(
+  db: DbClient,
+  partitionIdValue: string,
+  jobId: string,
+  nextLedger: number
+): Promise<void> {
+  await db.query(
+    `UPDATE cdc_backfill_jobs
+        SET next_ledger = $3,
+            status = CASE WHEN $3 > to_ledger THEN 'completed' ELSE 'running' END,
+            updated_at = NOW()
+      WHERE partition_id = $1 AND job_id = $2`,
+    [partitionIdValue, jobId, nextLedger]
+  );
+}
+
+/**
+ * Record a failed backfill attempt. Increments `attempts` and stores the
+ * error. The job remains retryable (`failed`) unless it has exhausted its
+ * attempts budget, in which case it stays `failed` for operator inspection.
+ */
+export async function failBackfill(
+  db: DbClient,
+  partitionIdValue: string,
+  jobId: string,
+  error: string
+): Promise<void> {
+  await db.query(
+    `UPDATE cdc_backfill_jobs
+        SET status = 'failed',
+            attempts = attempts + 1,
+            last_error = $3,
+            updated_at = NOW()
+      WHERE partition_id = $1 AND job_id = $2`,
+    [partitionIdValue, jobId, error]
+  );
+}
+
+/**
+ * Reset a failed backfill job so it can be retried. Only jobs belonging to
+ * the given partition are affected — a partition cannot retry another
+ * partition's jobs.
+ */
+export async function retryBackfill(
+  db: DbClient,
+  partitionIdValue: string,
+  jobId: string
+): Promise<boolean> {
+  const result = await db.query(
+    `UPDATE cdc_backfill_jobs
+        SET status = 'pending',
+            last_error = NULL,
+            updated_at = NOW()
+      WHERE partition_id = $1 AND job_id = $2 AND status = 'failed'`,
+    [partitionIdValue, jobId]
+  );
+  return (result as unknown as { rowCount: number }).rowCount > 0;
+}
+
+// ── Operator authorization ────────────────────────────────────────────────────
+
+/**
+ * Authorize an operator action against a partition.
+ *
+ * Operators may only act on partitions they are explicitly scoped to. An
+ * operator with no scope (empty list) is treated as unauthorized for every
+ * partition — least privilege by default. Unknown deployments are rejected
+ * with `UNKNOWN_DEPLOYMENT` so callers can distinguish a typo from a
+ * permission problem.
+ */
+export function authorizeOperator(
+  operator: { id: string; allowedPartitions: string[] },
+  partition: Partition | null
+): void {
+  if (!partition) {
+    throw new IndexerError(
+      "Unknown deployment: partition does not exist",
+      "UNKNOWN_DEPLOYMENT"
+    );
+  }
+  if (!operator.allowedPartitions.includes(partition.id)) {
+    throw new IndexerError(
+      `Operator ${operator.id} is not authorized for partition ${partition.id}`,
+      "UNAUTHORIZED"
+    );
+  }
 }
 
 // ── Event parsing ─────────────────────────────────────────────────────────────
@@ -450,22 +838,15 @@ export function parseEventType(topics: string[]): StreamEventType {
  *
  * This parser is defensive — missing fields are set to null rather than
  * throwing, so a malformed event does not halt the indexer.
- * 
- * Issue #1: Event ID format upgraded to stable compound key:
- * <ledger>-<txHash>-<eventIndex> to prevent duplication and reordering
- * for events with equal timestamps and concurrent ingestion.
  */
 export function parseStreamEvent(
   rawEvent: SorobanEvent,
   ledgerSequence: number,
   ledgerTimestamp: number
 ): StreamEvent {
-  // Issue #1: Compound cursor - include txHash for stable deduplication
-  const eventIndex = rawEvent.id ?? "0";
-  const txHash = rawEvent.txHash ?? "unknown";
-  const eventId = `${ledgerSequence}-${txHash}-${eventIndex}`;
-  
+  const eventId = `${ledgerSequence}-${rawEvent.id ?? "0"}`;
   const contractId = rawEvent.contractId ?? "";
+  const txHash = rawEvent.txHash ?? "";
   const rawXdr = rawEvent.value?.xdr ?? "";
 
   // Parse topics
@@ -576,215 +957,60 @@ export async function getCurrentLedger(rpc: RpcServer): Promise<number> {
 // ── Main poll cycle ───────────────────────────────────────────────────────────
 
 /**
- * Run one full poll cycle:
- *   1. Read compound cursor from DB.
+ * Run one full poll cycle for a single partition:
+ *   1. Read the partition cursor from DB.
  *   2. Fetch events since cursor (or lookback) from RPC.
  *   3. Parse and upsert into stream_events.
- *   4. Advance compound cursor to latest ledger.
+ *   4. Advance the partition cursor to latest ledger.
+ *   5. Record partition health (success or failure).
+ *
+ * Errors are isolated to this partition: they are recorded against the
+ * partition's health row and never thrown to the caller, so a stalled
+ * partition cannot block other partitions' loops.
  *
  * Returns the number of new events indexed.
- * Issue #1: Uses compound cursor (ledger, txHash, eventIndex) for stable ordering.
  */
 export async function runPollCycle(
   db: DbClient,
   rpc: RpcServer,
-  config: IndexerConfig
+  config: IndexerConfig,
+  partition: Partition = buildPartition(config)
 ): Promise<number> {
-  // Step 1: determine start ledger from compound cursor
-  const cursor = await getCursor(db, config.indexerId);
-  let currentLedger: number;
   try {
-    currentLedger = await getCurrentLedger(rpc);
+    return await runPollCycleInner(db, rpc, config, partition);
   } catch (err) {
-    log("error", "Failed to fetch current ledger — aborting cycle", {
-      error: (err as Error).message,
+    const message = (err as Error).message;
+    log("error", "Poll cycle failed for partition — isolating", {
+      partitionId: partition.id,
+      error: message,
     });
-    return 0;
-  }
-
-  const startLedger =
-    cursor !== null
-      ? cursor.lastLedger + 1
-      : Math.max(1, currentLedger - config.ledgerLookback);
-
-  if (startLedger > currentLedger) {
-    log("debug", "Already at latest ledger — nothing to index", {
-      currentLedger,
-      lastCursorLedger: cursor?.lastLedger,
-    });
-    return 0;
-  }
-
-  log("info", "Poll cycle started", {
-    startLedger,
-    currentLedger,
-    contracts: config.contractIds.length,
-    dryRun: config.dryRun,
-    compoundCursor: cursor ? {
-      ledger: cursor.lastLedger,
-      txHash: cursor.lastTxHash?.substring(0, 8) + "...",
-      eventIndex: cursor.lastEventIndex,
-    } : null,
-  });
-
-  // Step 2: fetch events
-  let rawEvents: SorobanEvent[];
-  try {
-    rawEvents = await fetchEvents(
-      rpc,
-      config.contractIds,
-      startLedger,
-      config.maxEventsPerPoll
-    );
-  } catch (err) {
-    log("error", "Failed to fetch events", { error: (err as Error).message });
-    return 0;
-  }
-
-  log("info", `Fetched ${rawEvents.length} raw events`, {
-    startLedger,
-    currentLedger,
-  });
-
-  // Step 3: parse events and track latest for compound cursor
-  const parsedEvents: StreamEvent[] = [];
-  let latestEventLedger = startLedger;
-  let latestEventTxHash: string | null = null;
-  let latestEventIndex: number | null = null;
-  let latestEventTimestamp: string | null = null;
-
-  for (const raw of rawEvents) {
     try {
-      const parsed = parseStreamEvent(
-        raw,
-        raw.ledger ?? startLedger,
-        raw.ledgerClosedAt
-          ? Math.floor(new Date(raw.ledgerClosedAt).getTime() / 1_000)
-          : Math.floor(Date.now() / 1_000)
+      const state = await recordPartitionFailure(
+        db,
+        partition,
+        message,
+        config.stallThresholdSeconds
       );
-      parsedEvents.push(parsed);
-
-      // Update latest event position for compound cursor
-      latestEventLedger = parsed.ledgerSequence;
-      latestEventTxHash = parsed.txHash;
-      latestEventIndex = Number(parsed.eventId.split("-")[2]) || 0;
-      latestEventTimestamp = parsed.ledgerTimestamp;
-    } catch (err) {
-      log("warn", "Failed to parse event — skipping", {
-        eventId: raw.id,
-        error: (err as Error).message,
+      log("warn", "Partition marked unhealthy", {
+        partitionId: partition.id,
+        state,
+      });
+    } catch (healthErr) {
+      log("error", "Failed to record partition failure", {
+        partitionId: partition.id,
+        error: (healthErr as Error).message,
       });
     }
+    return 0;
   }
-
-  // Step 4: write to DB (unless dry run) and advance compound cursor
-  let indexed = 0;
-  if (!config.dryRun) {
-    try {
-      indexed = await insertEvents(db, parsedEvents);
-      // Issue #1: Update compound cursor with full position info
-      await setCursor(db, config.indexerId, {
-        lastLedger: currentLedger,
-        lastTxHash: latestEventTxHash,
-        lastEventIndex: latestEventIndex,
-        lastTimestamp: latestEventTimestamp,
-      });
-    } catch (err) {
-      log("error", "Failed to write events to database", {
-        error: (err as Error).message,
-      });
-      return 0;
-    }
-  } else {
-    indexed = parsedEvents.length;
-    log("info", "DRY RUN — skipping database writes", {
-      parsedCount: parsedEvents.length,
-    });
-  }
-
-  log("info", "Poll cycle complete", {
-    rawEvents: rawEvents.length,
-    parsed: parsedEvents.length,
-    indexed,
-    currentLedger,
-    newCursorPosition: {
-      ledger: latestEventLedger,
-      txHashPrefix: latestEventTxHash?.substring(0, 8) + "...",
-      eventIndex: latestEventIndex,
-    },
-  });
-
-  return indexed;
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
-
-/**
- * Start the CDC indexer loop. Runs indefinitely until SIGTERM/SIGINT.
- */
-export async function startIndexer(config?: IndexerConfig): Promise<never> {
-  const resolvedConfig = config ?? loadConfig();
-
-  log("info", "CDC Indexer starting", {
-    rpcUrl: resolvedConfig.rpcUrl,
-    contracts: resolvedConfig.contractIds,
-    pollIntervalSeconds: resolvedConfig.pollIntervalSeconds,
-    ledgerLookback: resolvedConfig.ledgerLookback,
-    dryRun: resolvedConfig.dryRun,
-  });
-
-  const pool = new Pool({ connectionString: resolvedConfig.databaseUrl });
-  const rpc = new RpcServer(resolvedConfig.rpcUrl);
-
-  // Ensure schema on startup
-  const client: PoolClient = await pool.connect();
-  try {
-    await ensureSchema(client);
-    log("info", "Database schema verified");
-  } finally {
-    client.release();
-  }
-
-  let shuttingDown = false;
-  const shutdown = async () => {
-    shuttingDown = true;
-    log("info", "Shutdown signal received — waiting for current cycle to finish");
-    await pool.end();
-    log("info", "CDC Indexer stopped");
-    process.exit(0);
-  };
-
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
-
-  while (!shuttingDown) {
-    const dbClient = await pool.connect();
-    try {
-      await runPollCycle(dbClient, rpc, resolvedConfig);
-    } catch (err) {
-      log("error", "Unhandled error in poll cycle", {
-        error: (err as Error).message,
-        stack: (err as Error).stack,
-      });
-    } finally {
-      dbClient.release();
-    }
-
-    if (shuttingDown) break;
-
-    log("debug", `Sleeping ${resolvedConfig.pollIntervalSeconds}s until next cycle`);
-    await new Promise((r) => setTimeout(r, resolvedConfig.pollIntervalSeconds * 1_000));
-  }
-
-  process.exit(0);
-}
-
-// Run if invoked directly
-if (require.main === module || import.meta.url === `file://${process.argv[1]}`) {
-  startIndexer().catch((err) => {
-    log("error", "Fatal error starting CDC indexer", {
-      error: (err as Error).message,
-    });
-    process.exit(1);
-  });
-}
+async function runPollCycleInner(
+  db: DbClient,
+  rpc: RpcServer,
+  config: IndexerConfig,
+  partition: Partition
+): Promise<number> {
+  // Step 1: determine start ledger
+  const cursor = await getCursor(db, partition.id);
+  let currentLedger: number;

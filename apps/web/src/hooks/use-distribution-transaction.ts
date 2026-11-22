@@ -15,6 +15,11 @@ import {
   type WalletErrorClass,
 } from '@/utils/wallet-error-classifier';
 import type { DistributionState } from '@/types/distribution';
+import {
+  createTransactionLifecycle,
+  type TransactionLifecycle,
+  type TransactionStage,
+} from '@/utils/transaction-lifecycle';
 
 const IS_MAINNET = process.env.NEXT_PUBLIC_STELLAR_NETWORK === 'public';
 const HORIZON_URL = IS_MAINNET
@@ -113,6 +118,10 @@ export interface DistributionTransactionError {
   /** Form snapshot captured at submission time; never mutated. */
   state: DistributionState;
   tokenAddress: string;
+  /** Lifecycle stage the transaction was in when it failed. */
+  stage?: TransactionStage;
+  /** Persisted lifecycle id, so a reload can resume polling. */
+  lifecycleId?: string;
 }
 
 /**
@@ -127,6 +136,7 @@ export function useDistributionTransaction() {
   const { address, signTransaction, connect } = useWallet();
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [lastError, setLastError] = useState<DistributionTransactionError | null>(null);
+  const [lifecycle, setLifecycle] = useState<TransactionLifecycle | null>(null);
 
   const clearError = useCallback(() => setLastError(null), []);
 
@@ -247,6 +257,17 @@ export function useDistributionTransaction() {
       setIsSubmitting(true);
       notify.loading('Building transaction...');
 
+      // Persisted lifecycle: records each stage transition (approval →
+      // submission → ledger confirmation → settlement) so the UI can render a
+      // confirmation timeline and recover after a reload.
+      const txLifecycle = createTransactionLifecycle({
+        networkPassphrase: NETWORK_PASSPHRASE,
+        tokenAddress,
+        recipientCount: recipients.length,
+      });
+      setLifecycle(txLifecycle);
+      txLifecycle.transition('building');
+
       // Bind the whole simulation/signing/confirmation flow to the network
       // identity observed at the start. Any network switch aborts the flow.
       const guard = createChainBoundGuard({
@@ -282,6 +303,7 @@ export function useDistributionTransaction() {
         // Simulation is complete; ensure the network has not changed since.
         guard.assertNetworkUnchanged();
 
+        txLifecycle.transition('awaiting-approval');
         notify.loading('Awaiting wallet signature...');
 
         // Wrap the wallet's signTransaction (returns string) into the shape
@@ -293,6 +315,7 @@ export function useDistributionTransaction() {
           const signedTxXdr = await signTransaction(xdr);
           // And again after signing, before the signed envelope is broadcast.
           guard.assertNetworkUnchanged();
+          txLifecycle.transition('submitted');
           return { signedTxXdr };
         };
 
@@ -303,6 +326,8 @@ export function useDistributionTransaction() {
         guard.assertNetworkUnchanged();
 
         const txHash = sent.sendTransactionResponse?.hash ?? '';
+        txLifecycle.transition('confirmed', { txHash });
+        txLifecycle.transition('settled', { txHash });
         notify.success(
           txHash,
           `Successfully distributed to ${recipients.length} recipient${recipients.length > 1 ? 's' : ''}`
@@ -311,12 +336,16 @@ export function useDistributionTransaction() {
         return true;
       } catch (err) {
         const classified = classifyWalletError(err);
+        const failedStage = txLifecycle.getStage();
+        txLifecycle.transition('failed', { message: classified.message });
         const failure: DistributionTransactionError = {
           errorClass: classified.errorClass,
           message: classified.message,
           action: classified.action,
           state,
           tokenAddress,
+          stage: failedStage,
+          lifecycleId: txLifecycle.id,
         };
         setLastError(failure);
 
@@ -338,5 +367,5 @@ export function useDistributionTransaction() {
     [address, signTransaction, networkPassphrase]
   );
 
-  return { execute, isSubmitting, lastError, clearError, recover };
+  return { execute, isSubmitting, lastError, clearError, recover, lifecycle };
 }

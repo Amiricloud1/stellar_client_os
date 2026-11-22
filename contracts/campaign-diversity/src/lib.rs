@@ -4,6 +4,8 @@ use soroban_sdk::{
     Bytes, BytesN, Env, String, Vec,
 };
 
+mod metadata;
+
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
@@ -44,6 +46,17 @@ pub enum DataKey {
     PlantingCount(u64),
     /// Current storage schema version (instance storage).
     SchemaVersion,
+    /// Monotonically increasing metadata version for a campaign, keyed by
+    /// campaign_id (persistent storage).  Incremented on every write to the
+    /// campaign record so that readers can detect whether their snapshot is
+    /// still current without relying on the wall-clock `updated_at` timestamp.
+    MetadataVersion(u64),
+    /// SHA-256 hash of serialized campaign metadata keyed by campaign_id
+    /// (persistent storage). Computed deterministically from metadata V1.
+    MetadataHash(u64),
+    /// Historical metadata snapshots keyed by (campaign_id, version)
+    /// (persistent storage). Stores serialized metadata for audit trails.
+    MetadataSnapshot(u64, u64),
 }
 
 /// Verification state of a single planting batch.
@@ -242,6 +255,8 @@ pub struct DiversityScoreUpdatedEvent {
     pub tree_count: u64,
     /// Environmental-value band implied by `new_score`.
     pub tier: BiodiversityTier,
+    /// Metadata version of the campaign after this score change.
+    pub metadata_version: u64,
 }
 
 /// Emitted when a campaign is sealed against further plantings.
@@ -257,6 +272,8 @@ pub struct CampaignSealedEvent {
     pub tier: BiodiversityTier,
     /// Unix timestamp (seconds) of the sealing.
     pub sealed_at: u64,
+    /// Metadata version of the campaign after sealing.
+    pub metadata_version: u64,
 }
 
 /// Emitted when the registrar role is transferred.
@@ -289,6 +306,25 @@ pub struct SchemaMigratedEvent {
     pub new_version: u32,
     /// Unix timestamp (seconds) of migration.
     pub migrated_at: u64,
+}
+
+/// Emitted when metadata hash is computed and stored for a campaign.
+///
+/// This event captures the canonical content hash of campaign metadata,
+/// enabling off-chain verification and audit trails. The hash is deterministic,
+/// making it suitable for immutable references.
+#[contractevent(topics = ["MetadataHashComputed"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataHashComputedEvent {
+    /// Campaign the metadata refers to.
+    #[topic]
+    pub campaign_id: u64,
+    /// Metadata version that was hashed.
+    pub metadata_version: u64,
+    /// SHA-256 hash of the serialized metadata.
+    pub metadata_hash: BytesN<32>,
+    /// Unix timestamp (seconds) when hash was computed.
+    pub timestamp: u64,
 }
 
 
@@ -550,6 +586,7 @@ impl CampaignDiversityContract {
             diversity_score: campaign.diversity_score,
             tier: campaign.tier,
             sealed_at: campaign.updated_at,
+            metadata_version: Self::get_metadata_version(env.clone(), campaign_id),
         }
         .publish(&env);
     }
@@ -1046,6 +1083,23 @@ impl CampaignDiversityContract {
             .unwrap_or(1)
     }
 
+    /// Return the current metadata version of a campaign.
+    ///
+    /// The version starts at 1 when the campaign is first registered and
+    /// increments by 1 on every mutation to the campaign record.  Two reads
+    /// that return the same version number saw the same logical snapshot,
+    /// regardless of the wall-clock timestamp.
+    ///
+    /// Returns 0 if the campaign has never been written (i.e. does not exist),
+    /// so callers that need to distinguish "not found" from "version 1" should
+    /// use [`Self::get_campaign`] first.
+    pub fn get_metadata_version(env: Env, campaign_id: u64) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MetadataVersion(campaign_id))
+            .unwrap_or(0)
+    }
+
     /// Perform idempotent bounded schema migration.
     ///
     /// Upgrades legacy storage layouts to the current schema version.
@@ -1108,6 +1162,155 @@ impl CampaignDiversityContract {
         Self::rescore(&env, campaign_id)
     }
 
+    // -----------------------------------------------------------------------
+    // Metadata Serialization & Verification
+    // -----------------------------------------------------------------------
+
+    /// Serialize the current metadata of a campaign using canonical V1 format.
+    ///
+    /// Returns 33 bytes containing:
+    /// - Version byte (0x01)
+    /// - campaign_id (u64, little-endian)
+    /// - diversity_score (u32, little-endian)
+    /// - species_count (u32, little-endian)
+    /// - verified_tree_count (u64, little-endian)
+    /// - updated_at (u64, little-endian)
+    ///
+    /// # Errors
+    /// * [`Error::CampaignNotFound`] — unknown campaign.
+    pub fn serialize_metadata(env: Env, campaign_id: u64) -> Bytes {
+        let campaign = Self::load_campaign(&env, campaign_id);
+        let metadata = metadata::MetadataBlobV1::new(
+            campaign.campaign_id,
+            campaign.diversity_score,
+            campaign.verified_species_count,
+            campaign.verified_tree_count,
+            campaign.updated_at,
+        );
+        metadata::serialize_metadata_v1(&env, &metadata)
+    }
+
+    /// Compute and return the SHA-256 hash of current campaign metadata.
+    ///
+    /// The hash is deterministic: identical metadata always produces the same
+    /// hash, making it suitable for immutable references and verification.
+    ///
+    /// # Arguments
+    /// * `campaign_id` — Campaign to hash.
+    ///
+    /// # Returns
+    /// 32-byte SHA-256 hash of serialized V1 metadata.
+    ///
+    /// # Errors
+    /// * [`Error::CampaignNotFound`] — unknown campaign.
+    pub fn compute_metadata_hash(env: Env, campaign_id: u64) -> BytesN<32> {
+        let campaign = Self::load_campaign(&env, campaign_id);
+        let metadata = metadata::MetadataBlobV1::new(
+            campaign.campaign_id,
+            campaign.diversity_score,
+            campaign.verified_species_count,
+            campaign.verified_tree_count,
+            campaign.updated_at,
+        );
+        metadata::compute_metadata_hash(&env, &metadata)
+    }
+
+    /// Get the stored metadata hash for a campaign (if computed).
+    ///
+    /// Returns the previously computed hash or zeros if not yet stored.
+    /// Use `compute_metadata_hash` to force recomputation.
+    ///
+    /// # Arguments
+    /// * `campaign_id` — Campaign to query.
+    ///
+    /// # Returns
+    /// 32-byte hash, or a zeroed BytesN<32> if never computed.
+    pub fn get_metadata_hash(env: Env, campaign_id: u64) -> BytesN<32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MetadataHash(campaign_id))
+            .unwrap_or_else(|| {
+                // Return zeroed hash as sentinel when not found
+                let mut zero: [u8; 32] = [0; 32];
+                BytesN::from_array(&env, &zero)
+            })
+    }
+
+    /// Store the metadata hash for a campaign (called internally on updates).
+    ///
+    /// Emits `MetadataHashComputedEvent` with the new hash.
+    /// Authority: internal only (called by state-modifying operations).
+    fn store_metadata_hash(env: &Env, campaign_id: u64) {
+        let campaign = Self::load_campaign(env, campaign_id);
+        let metadata = metadata::MetadataBlobV1::new(
+            campaign.campaign_id,
+            campaign.diversity_score,
+            campaign.verified_species_count,
+            campaign.verified_tree_count,
+            campaign.updated_at,
+        );
+
+        let hash = metadata::compute_metadata_hash(env, &metadata);
+        let version = Self::get_metadata_version(env.clone(), campaign_id);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MetadataHash(campaign_id), &hash);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::MetadataHash(campaign_id), LEDGER_THRESHOLD, LEDGER_BUMP);
+
+        // Store snapshot for audit trail (optional: expensive storage)
+        // env.storage()
+        //     .persistent()
+        //     .set(&DataKey::MetadataSnapshot(campaign_id, version), &serialized);
+
+        MetadataHashComputedEvent {
+            campaign_id,
+            metadata_version: version,
+            metadata_hash: hash,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(env);
+    }
+
+    /// Verify that a stored metadata hash matches expected content.
+    ///
+    /// Recomputes the hash of current metadata and compares against stored value.
+    /// Returns `true` if they match, `false` otherwise.
+    ///
+    /// # Arguments
+    /// * `campaign_id` — Campaign to verify.
+    /// * `expected_hash` — Hash to compare against.
+    ///
+    /// # Returns
+    /// `true` if current metadata hashes to `expected_hash`.
+    pub fn verify_metadata_hash(env: Env, campaign_id: u64, expected_hash: BytesN<32>) -> bool {
+        let computed = Self::compute_metadata_hash(env, campaign_id);
+        computed == expected_hash
+    }
+
+    /// Verify continuity of metadata updates across two versions.
+    ///
+    /// Ensures that version v1 came before v2, preventing time-travel attacks
+    /// or out-of-order verification.
+    ///
+    /// # Arguments
+    /// * `campaign_id` — Campaign to verify.
+    /// * `v1` — Earlier version number.
+    /// * `v2` — Later version number.
+    ///
+    /// # Returns
+    /// `true` if v1 < v2 and both are valid version numbers (non-zero).
+    pub fn verify_metadata_update_sequence(
+        env: Env,
+        campaign_id: u64,
+        v1: u64,
+        v2: u64,
+    ) -> bool {
+        Self::assert_campaign_exists(&env, campaign_id);
+        v1 < v2 && v1 > 0 && v2 > 0
+    }
 
     // -----------------------------------------------------------------------
     // Private helpers
@@ -1173,7 +1376,8 @@ impl CampaignDiversityContract {
     }
 
     /// Persist a [`DiversityCampaign`] and extend TTLs for both the campaign
-    /// entry and the instance storage holding the roles.
+    /// entry and the instance storage holding the roles. Also computes and
+    /// stores the canonical metadata hash for verification purposes.
     fn save_campaign(env: &Env, campaign_id: u64, campaign: &DiversityCampaign) {
         let key = DataKey::Campaign(campaign_id);
         env.storage().persistent().set(&key, campaign);
@@ -1183,6 +1387,54 @@ impl CampaignDiversityContract {
         env.storage()
             .instance()
             .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        Self::bump_metadata_version(env, campaign_id);
+        
+        // Compute and store canonical metadata hash
+        let metadata_blob = metadata::MetadataBlobV1::new(
+            campaign.campaign_id,
+            campaign.diversity_score,
+            campaign.verified_species_count,
+            campaign.verified_tree_count,
+            campaign.updated_at,
+        );
+        let hash = metadata::compute_metadata_hash(env, &metadata_blob);
+        let version = Self::get_metadata_version(env.clone(), campaign_id);
+        
+        env.storage()
+            .persistent()
+            .set(&DataKey::MetadataHash(campaign_id), &hash);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::MetadataHash(campaign_id), LEDGER_THRESHOLD, LEDGER_BUMP);
+        
+        // Emit event for metadata hash update
+        MetadataHashComputedEvent {
+            campaign_id,
+            metadata_version: version,
+            metadata_hash: hash,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(env);
+    }
+
+    /// Increment and persist the per-campaign metadata version, then return
+    /// the new value.
+    ///
+    /// The version starts at 0 (absent) and becomes 1 on the first write.
+    /// Every subsequent call to `save_campaign` moves it forward by exactly
+    /// one, giving clients a stable, content-addressable marker for a
+    /// campaign snapshot that does not depend on wall-clock time.
+    fn bump_metadata_version(env: &Env, campaign_id: u64) -> u64 {
+        let key = DataKey::MetadataVersion(campaign_id);
+        let current: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+        let next = current
+            .checked_add(1)
+            .unwrap_or_else(|| panic_with_error!(env, Error::ArithmeticOverflow));
+        env.storage().persistent().set(&key, &next);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+        next
     }
 
     /// Persist a [`SpeciesRecord`] and extend its TTL.
@@ -1293,6 +1545,7 @@ impl CampaignDiversityContract {
                 species_count,
                 tree_count: campaign.verified_tree_count,
                 tier,
+                metadata_version: Self::get_metadata_version(env.clone(), campaign_id),
             }
             .publish(env);
         }
@@ -2496,5 +2749,66 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(client.get_schema_version(), SCHEMA_VERSION);
     }
+
+    // -----------------------------------------------------------------------
+    // Metadata version
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_metadata_version_increments_on_mutation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+
+        // Registering a campaign calls save_campaign once, so the version
+        // starts at 1.
+        client.register_campaign(&1);
+        let v1 = client.get_metadata_version(&1);
+        assert_eq!(v1, 1, "version should be 1 after registration");
+
+        // Recording a planting also writes the campaign record.
+        let reporter = Address::generate(&env);
+        client.record_planting(&1, &String::from_str(&env, OAK), &50, &reporter);
+        let v2 = client.get_metadata_version(&1);
+        assert!(v2 > v1, "version should increase after record_planting");
+
+        // Verifying a planting writes the campaign record twice (once inside
+        // verify_planting before rescore, once inside rescore/save_campaign),
+        // so the version must be strictly greater than v2.
+        let planting_id = client.record_planting(&1, &String::from_str(&env, PINE), &50, &reporter);
+        client.verify_planting(&1, &planting_id);
+        let v3 = client.get_metadata_version(&1);
+        assert!(v3 > v2, "version should increase after verify_planting");
+    }
+
+    #[test]
+    fn test_metadata_version_stable_on_read() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+
+        client.register_campaign(&1);
+        plant_and_verify(&env, &client, 1, OAK, 100);
+
+        let v_before = client.get_metadata_version(&1);
+        // Pure reads must not alter the version.
+        let _ = client.get_campaign(&1);
+        let _ = client.get_diversity_score(&1);
+        let _ = client.get_tier(&1);
+        let _ = client.get_species_count(&1);
+        let _ = client.get_verified_tree_count(&1);
+        let _ = client.list_species(&1);
+        let v_after = client.get_metadata_version(&1);
+
+        assert_eq!(
+            v_before, v_after,
+            "read-only queries must not change the metadata version"
+        );
+    }
 }
+
+#[cfg(test)]
+mod test_metadata;
 

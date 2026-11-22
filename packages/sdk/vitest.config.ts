@@ -13,6 +13,16 @@ export default defineConfig({
     // `src/transactions/__tests__/resubmission.test.ts`) are intentionally NOT
     // excluded here. They are deterministic, do not touch live funds, and must
     // run in the standard suite so CI validates the safe-resubmission behavior.
+    //
+    // Likewise, the deployment registry, canonical event-mapping, projection
+    // replay, and bounded event-consumer queue suites are deterministic unit
+    // tests (no live node required) and MUST run in the standard suite:
+    //   - src/deployer/__tests__/registry.test.ts
+    //   - src/events/__tests__/mappings.test.ts
+    //   - src/events/__tests__/replay.test.ts
+    //   - src/events/__tests__/queue.test.ts
+    // They are covered by the `src/**/*.ts` include below; do not add them to
+    // `exclude`.
     exclude: [
       'src/__integration_tests__/**',
       'src/**/__tests__/integration/**',
@@ -38,6 +48,8 @@ export default defineConfig({
         'src/index.ts',                   // pure re-export barrel
         'src/deployer/index.ts',          // pure re-export barrel
         'src/deployer/types.ts',          // TypeScript type definitions only
+        'src/events/index.ts',            // pure re-export barrel
+        'src/events/types.ts',            // TypeScript type definitions only
       ],
 
       // text  → terminal summary on every run
@@ -55,6 +67,11 @@ export default defineConfig({
       // The transaction resubmission module is fully covered by its unit tests
       // (success, failure, and boundary cases), so the floors below remain
       // valid without relaxation.
+      //
+      // The deployment registry, canonical event mappings, projection replay,
+      // and bounded event-consumer queue modules are each covered by focused
+      // suites exercising the success path plus boundary, authorization, and
+      // retry/backpressure cases, so the floors below remain valid.
       thresholds: {
         lines: 80,
         statements: 80,
