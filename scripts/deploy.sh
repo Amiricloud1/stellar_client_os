@@ -74,6 +74,55 @@ NETWORK="${NETWORK:-testnet}"
 NETWORK_PASSPHRASE="${TESTNET_NETWORK_PASSPHRASE:-Test SDF Network ; September 2015}"
 DEPLOYMENTS_FILE="deployments/${NETWORK}.json"
 
+# Resolve the workspace spec version recorded with each registry entry.
+resolve_spec_version() {
+  local version=""
+  if command -v cargo &> /dev/null && [ -f contracts/Cargo.toml ]; then
+    version=$(cargo metadata --no-deps --format-version 1 --manifest-path contracts/Cargo.toml 2>/dev/null \
+      | jq -r '.packages[0].version // empty' 2>/dev/null || true)
+  fi
+  if [ -z "$version" ] && [ -f contracts/Cargo.toml ]; then
+    version=$(grep -m1 '^version' contracts/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/' || true)
+  fi
+  echo "${version:-unknown}"
+}
+
+SPEC_VERSION="$(resolve_spec_version)"
+
+# Atomically write a registry record. Exits non-zero (loudly) on failure.
+write_registry_record() {
+  local name="$1" address="$2" ledger="$3" state="$4"
+  local tmp_file
+  tmp_file="$(mktemp "${DEPLOYMENTS_FILE}.XXXXXX")" || {
+    echo "❌ Error: could not create temporary file next to $DEPLOYMENTS_FILE." >&2
+    echo "   Failed record: {\"$name\": {\"network\": \"$NETWORK\", \"address\": \"$address\", \"ledger\": $ledger, \"spec_version\": \"$SPEC_VERSION\", \"state\": \"$state\"}}" >&2
+    echo "   Recovery: ensure the deployments directory is writable, then re-run with --force." >&2
+    exit 1
+  }
+
+  if ! jq --arg name "$name" \
+        --arg network "$NETWORK" \
+        --arg address "$address" \
+        --argjson ledger "$ledger" \
+        --arg spec_version "$SPEC_VERSION" \
+        --arg state "$state" \
+        '.[$name] = {network: $network, address: $address, ledger: $ledger, spec_version: $spec_version, state: $state}' \
+        "$DEPLOYMENTS_FILE" > "$tmp_file"; then
+    rm -f "$tmp_file"
+    echo "❌ Error: failed to write registry record for '$name' to $DEPLOYMENTS_FILE." >&2
+    echo "   Failed record: {\"$name\": {\"network\": \"$NETWORK\", \"address\": \"$address\", \"ledger\": $ledger, \"spec_version\": \"$SPEC_VERSION\", \"state\": \"$state\"}}" >&2
+    echo "   Recovery: fix the registry file (must be valid JSON) or permissions, then re-run with --force." >&2
+    exit 1
+  fi
+
+  if ! mv "$tmp_file" "$DEPLOYMENTS_FILE"; then
+    rm -f "$tmp_file"
+    echo "❌ Error: failed to atomically replace $DEPLOYMENTS_FILE." >&2
+    echo "   Recovery: check filesystem permissions and re-run with --force." >&2
+    exit 1
+  fi
+}
+
 # All 15 supported workspace contracts with their respective compiled WASM artifact basenames
 # Format: "member_name:wasm_artifact_name"
 ALL_CONTRACT_SPECS=(
@@ -318,8 +367,11 @@ for SPEC in "${SELECTED_SPECS[@]}"; do
   echo ""
   echo "--- Processing: $MEMBER ($WASM_NAME.wasm) ---"
 
-  # Check if already deployed
-  EXISTING_ID=$(jq -r ".[\"$WASM_NAME\"] // .[\"$MEMBER\"] // empty" "$DEPLOYMENTS_FILE" 2>/dev/null || true)
+  # Check if already deployed (supports both registry objects and legacy strings)
+  EXISTING_ID=$(jq -r --arg name "$WASM_NAME" --arg member "$MEMBER" '
+    (.[$name] // .[$member] // empty)
+    | if type == "object" then (.address // empty) else . end
+  ' "$DEPLOYMENTS_FILE" 2>/dev/null || true)
   if [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "null" ] && [ "$FORCE_DEPLOY" != "true" ]; then
     echo "ℹ️  Already deployed at: $EXISTING_ID (skipping. Set --force or FORCE_DEPLOY=true to redeploy)"
     SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
@@ -344,18 +396,29 @@ for SPEC in "${SELECTED_SPECS[@]}"; do
   fi
 
   echo "🚀 Deploying $MEMBER to $NETWORK..."
-  CONTRACT_ID=$(stellar contract deploy \
+  if ! CONTRACT_ID=$(stellar contract deploy \
     --wasm "$WASM_PATH" \
     --source "$STELLAR_SECRET_KEY" \
     --network "$NETWORK" \
-    --network-passphrase "$NETWORK_PASSPHRASE")
+    --network-passphrase "$NETWORK_PASSPHRASE"); then
+    echo "❌ Error: deployment of $MEMBER failed." >&2
+    write_registry_record "$WASM_NAME" "" 0 "failed"
+    exit 1
+  fi
 
   echo "✅ Deployed $MEMBER! Contract ID: $CONTRACT_ID"
 
+  # Capture the ledger sequence at deployment for the registry record
+  LEDGER_SEQ=$(stellar ledger latest \
+    --network "$NETWORK" \
+    --network-passphrase "$NETWORK_PASSPHRASE" 2>/dev/null \
+    | jq -r '.sequence // .ledger // 0' 2>/dev/null || echo 0)
+  if ! [[ "$LEDGER_SEQ" =~ ^[0-9]+$ ]]; then
+    LEDGER_SEQ=0
+  fi
+
   # Persist atomically to deployments file
-  jq --arg name "$WASM_NAME" --arg id "$CONTRACT_ID" \
-    '. + {($name): $id}' \
-    "$DEPLOYMENTS_FILE" > tmp.json && mv tmp.json "$DEPLOYMENTS_FILE"
+  write_registry_record "$WASM_NAME" "$CONTRACT_ID" "$LEDGER_SEQ" "deployed"
 
   SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
 done
@@ -367,4 +430,5 @@ echo " Mode:      $([ "$IS_DRY_RUN" = "true" ] && echo "DRY-RUN (Simulated)" || 
 echo " Processed: $SUCCESS_COUNT"
 echo " Skipped:   $SKIPPED_COUNT"
 echo " Records:   $DEPLOYMENTS_FILE"
+echo " Spec:      $SPEC_VERSION"
 echo "========================================================"

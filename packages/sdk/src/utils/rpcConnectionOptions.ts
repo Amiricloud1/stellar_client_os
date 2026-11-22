@@ -81,6 +81,8 @@ export function resolveRpcServerOptions(
   options: RpcConnectionOptions = {}
 ): { allowHttp: boolean } {
   assertSecureRpcUrl(url);
+  // Validate consumer bounds eagerly so misconfiguration fails fast.
+  resolveRpcConsumerOptions(options);
 
   const requestedAllowHttp = options.allowHttp ?? false;
   if (requestedAllowHttp) {

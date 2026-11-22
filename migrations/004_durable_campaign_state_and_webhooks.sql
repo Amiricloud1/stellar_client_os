@@ -94,6 +94,41 @@
 --
 -- All statements are idempotent (IF NOT EXISTS / guarded) so the migration
 -- can be re-run safely in CI.
+--
+-- Addendum: deployment registry, canonical event mappings, replay runs, and
+-- consumer backpressure metrics
+-- ------------------------------------------------------------------------
+-- This migration also establishes the durable model for:
+--
+--   * `contract_deployments` — the validated contract deployment registry.
+--     Records network, address, deployment ledger, spec version, and
+--     lifecycle state for every environment. Uniqueness is enforced on
+--     (network, address) and on (network, environment) for the single active
+--     deployment per environment.
+--   * `contract_event_mappings` — canonical domain mappings from a
+--     (contract, event version) pair to a projection. Unknown versions are
+--     retained with `is_known = false` and a NULL projection so payloads are
+--     never dropped.
+--   * `projection_replay_runs` — deterministic replay runs across
+--     event-schema versions. A run records the source/target schema version,
+--     the comparison outcome, and the operator-visible state so cutover can
+--     be gated on a successful comparison.
+--   * `consumer_queue_metrics` — bounded-queue and concurrency observations
+--     for event consumers, used to prove bounded memory and recovery
+--     throughput under RPC or consumer outages.
+--
+-- Migration path for existing environments
+-- ----------------------------------------
+-- * All new tables are created with IF NOT EXISTS and are additive; no
+--   existing table is altered destructively.
+-- * `contract_deployments` rows are expected to be seeded by operators from
+--   the existing deployment configuration. Until seeded, consumers MUST
+--   treat the registry as empty and refuse to start (fail closed) rather
+--   than falling back to hard-coded addresses.
+-- * `contract_event_mappings` rows for known versions are seeded by the
+--   application on startup; unknown versions are inserted on first sight.
+-- * `projection_replay_runs` and `consumer_queue_metrics` start empty.
+-- * Rollback: see the DOWN section at the bottom.
 
 BEGIN;
 

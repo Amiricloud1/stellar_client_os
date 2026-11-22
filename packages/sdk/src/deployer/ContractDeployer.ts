@@ -77,6 +77,12 @@ export class ContractDeployer {
   private readonly readinessChecklist: ReadinessChecklist | undefined;
   /** Cached promise so the RPC fetch happens at most once. */
   private passphrasePromise: Promise<string> | undefined;
+  /** Optional validated deployment registry. */
+  private readonly registry: DeploymentRegistry | undefined;
+  /** Network identifier recorded in registry entries. */
+  private readonly network: string | undefined;
+  /** Contract spec version recorded in registry entries. */
+  private readonly specVersion: string | undefined;
 
   constructor(config: DeployerConfig) {
     let serverOptions: { allowHttp: boolean };
@@ -248,18 +254,29 @@ export class ContractDeployer {
     
     await this.signTransaction(preparedTx, deployer);
 
+    const wasmHash = this.deriveWasmHash(wasm);
+
     try {
       const result = await this.submitAndWait(preparedTx.toEnvelope().toXDR('base64'));
+      await this.recordDeployment({
+        contractAddress: wasmHash,
+        deploymentLedger: result.ledger,
+        txHash: result.txHash,
+        state: 'uploaded',
+      });
       return {
-        wasmHash: this.deriveWasmHash(wasm),
+        wasmHash,
         txHash: result.txHash,
         ledger: result.ledger,
         feeCharged: result.feeCharged,
       };
     } catch (err) {
+      await this.recordFailure(wasmHash, (err as any).txHash);
       if (err instanceof WasmUploadError || err instanceof DeploymentTimeoutError) throw err;
       throw new WasmUploadError(
-        `WASM upload failed: ${(err as Error).message}`,
+        `WASM upload failed: ${(err as Error).message}. ` +
+          'Recovery: verify the deployer account is funded and retry the upload; ' +
+          'the registry entry has been marked as failed.',
         (err as any).txHash,
         err as Error,
       );
@@ -297,9 +314,17 @@ export class ContractDeployer {
 
     await this.signTransaction(tx, deployer);
 
+    const contractId = await this.deriveContractId(deployerAddress, resolvedSalt);
+
     try {
       const result = await this.submitAndWait(tx.toEnvelope().toXDR('base64'));
-      const contractId = await this.deriveContractId(deployerAddress, resolvedSalt);
+      await this.recordDeployment({
+        contractAddress: contractId,
+        deploymentLedger: result.ledger,
+        txHash: result.txHash,
+        state: 'deployed',
+        wasmHash,
+      });
       return {
         contractId,
         txHash: result.txHash,
@@ -307,9 +332,12 @@ export class ContractDeployer {
         feeCharged: result.feeCharged,
       };
     } catch (err) {
+      await this.recordFailure(contractId, (err as any).txHash);
       if (err instanceof ContractInstantiationError || err instanceof DeploymentTimeoutError) throw err;
       throw new ContractInstantiationError(
-        `Contract instantiation failed: ${(err as Error).message}`,
+        `Contract instantiation failed: ${(err as Error).message}. ` +
+          'Recovery: confirm the WASM hash is installed and the deployer is authorized, ' +
+          'then retry; the registry entry has been marked as failed.',
         (err as any).txHash,
         err as Error,
       );
@@ -338,6 +366,47 @@ export class ContractDeployer {
     const upload = await this.uploadWasm(wasm, deployer);
     const deploy = await this.deployContract(upload.wasmHash, deployer, salt);
     return { upload, deploy };
+  }
+
+  // ─── Private: deployment registry ─────────────────────────────────────────
+
+  /**
+   * Records a successful deployment in the registry (when configured).
+   * Registry write failures surface as `DeployerError` with code
+   * `REGISTRY_WRITE_FAILED` so operators can retry the write.
+   */
+  private async recordDeployment(
+    entry: Omit<DeploymentRecord, 'network' | 'specVersion' | 'createdAt' | 'updatedAt'>,
+  ): Promise<void> {
+    if (!this.registry) return;
+    try {
+      await this.registry.record(entry);
+    } catch (err) {
+      throw new DeployerError(
+        `Deployment succeeded but registry write failed: ${(err as Error).message}. ` +
+          'Recovery: retry recording the deployment via the registry.',
+        'REGISTRY_WRITE_FAILED',
+        err as Error,
+      );
+    }
+  }
+
+  /**
+   * Best-effort recording of a failed deployment. Never throws so the
+   * original failure is preserved for the caller.
+   */
+  private async recordFailure(contractAddress: string, txHash?: string): Promise<void> {
+    if (!this.registry) return;
+    try {
+      await this.registry.record({
+        contractAddress,
+        deploymentLedger: 0,
+        txHash,
+        state: 'failed',
+      });
+    } catch {
+      // Swallow — the primary error is more important to surface.
+    }
   }
 
   // ─── Private: transaction builders ────────────────────────────────────────
@@ -612,3 +681,5 @@ export class ContractDeployer {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+export type { DeploymentRegistryStore };

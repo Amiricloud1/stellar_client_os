@@ -47,6 +47,40 @@ export type PaymentStreamContractEvent =
   | PaymentStreamContractEventBase<DelegationGrantedEvent>
   | PaymentStreamContractEventBase<DelegationRevokedEvent>;
 
+/**
+ * Canonical schema version for the payment-stream contract event payloads
+ * understood by this SDK. Events carrying a different version are retained
+ * verbatim (see {@link UnknownContractEventProjection}) instead of being
+ * dropped, so consumers can replay or forward them later.
+ */
+export const PAYMENT_STREAM_EVENT_SCHEMA_VERSION = 1 as const;
+
+export type PaymentStreamEventSchemaVersion =
+  typeof PAYMENT_STREAM_EVENT_SCHEMA_VERSION;
+
+/**
+ * Projection of a contract event whose schema version is not supported by
+ * this SDK. The raw event is preserved so it can be retained, replayed or
+ * upgraded once a parser for that version is available.
+ */
+export interface UnknownContractEventProjection {
+  type: "Unknown";
+  contractId: string;
+  topic: string[];
+  /** Schema version reported by the event, or `null` when absent/unparseable. */
+  schemaVersion: number | null;
+  /** The original, unmodified event payload. */
+  raw: ContractEventRaw;
+}
+
+/**
+ * Result of projecting a raw contract event onto the canonical domain model.
+ * Either a supported event was parsed, or the event was retained as unknown.
+ */
+export type ContractEventProjection =
+  | { kind: "supported"; event: PaymentStreamContractEvent }
+  | { kind: "unknown"; event: UnknownContractEventProjection };
+
 function isString(value: unknown): value is string {
   return typeof value === "string";
 }

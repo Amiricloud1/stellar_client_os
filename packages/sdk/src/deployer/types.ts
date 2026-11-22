@@ -289,6 +289,91 @@ export interface ContractDeployResult {
  * console.log(`CPU instructions: ${estimate.resources.instructions}`);
  * ```
  */
+/**
+ * Lifecycle state of a contract deployment recorded in the deployment registry.
+ *
+ * @remarks
+ * - `pending`: deployment transaction submitted but not yet confirmed.
+ * - `deployed`: confirmed on-chain, not yet promoted to the active environment.
+ * - `active`: the deployment currently serving traffic for its environment.
+ * - `deprecated`: superseded by a newer deployment but still reachable.
+ * - `failed`: deployment did not complete successfully.
+ * - `rolled_back`: was active, then reverted to a previous deployment.
+ */
+export type DeploymentLifecycleState =
+  | 'pending'
+  | 'deployed'
+  | 'active'
+  | 'deprecated'
+  | 'failed'
+  | 'rolled_back';
+
+/**
+ * A single entry in the validated contract deployment registry.
+ *
+ * Records are validated on write and on read by `DeploymentRegistry`.
+ */
+export interface DeploymentRecord {
+  /**
+   * Network the contract is deployed to.
+   *
+   * Use `'testnet'`, `'mainnet'`, or `'custom'` for the standard networks, or a
+   * free-form environment name (e.g. `'staging'`) for private environments.
+   */
+  network: StellarNetwork | string;
+
+  /**
+   * The deployed contract's Stellar address (starts with `C`, 56 characters).
+   */
+  address: string;
+
+  /**
+   * Ledger sequence number at which the deployment was confirmed.
+   */
+  deploymentLedger: number;
+
+  /**
+   * Soroban spec version the contract was built against (e.g. `'22'`).
+   */
+  specVersion: string;
+
+  /**
+   * Current lifecycle state of the deployment.
+   */
+  lifecycleState: DeploymentLifecycleState;
+
+  /**
+   * ISO-8601 timestamp of when the record was first created.
+   */
+  createdAt: string;
+
+  /**
+   * ISO-8601 timestamp of the most recent update to the record.
+   */
+  updatedAt: string;
+
+  /**
+   * Transaction hash of the deployment transaction (64 hex characters).
+   */
+  txHash: string;
+}
+
+/**
+ * Fee and resource estimate for a contract deployment transaction.
+ * 
+ * Before executing a deployment transaction, the ContractDeployer simulates it to
+ * estimate the resource consumption and calculate the required fee. This allows
+ * accurate fee estimation and helps prevent transaction failures.
+ * 
+ * @interface FeeEstimate
+ * 
+ * @example
+ * ```ts
+ * const estimate = await deployer.estimateUploadFee(wasmBuffer, keypair);
+ * console.log(`Recommended fee: ${estimate.fee} stroops`);
+ * console.log(`CPU instructions: ${estimate.resources.instructions}`);
+ * ```
+ */
 export interface FeeEstimate {
   /**
    * Recommended fee in stroops (0.00001 XLM per stoop).

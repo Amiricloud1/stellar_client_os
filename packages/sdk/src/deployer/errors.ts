@@ -98,3 +98,80 @@ export class DeploymentTimeoutError extends DeployerError {
     Object.setPrototypeOf(this, DeploymentTimeoutError.prototype);
   }
 }
+
+/**
+ * Base class for all deployment-registry failures.
+ *
+ * @remarks
+ * Registry errors are surfaced to operators so that failure and recovery
+ * states are explicit. Each subclass carries a stable `code` that can be
+ * matched programmatically (e.g. in CI or operational tooling).
+ */
+export class DeploymentRegistryError extends DeployerError {
+  constructor(message: string, code: string, originalError?: Error) {
+    super(message, code, originalError);
+    this.name = 'DeploymentRegistryError';
+    Object.setPrototypeOf(this, DeploymentRegistryError.prototype);
+  }
+}
+
+/**
+ * Thrown when a deployment record fails validation (missing fields,
+ * malformed address, unknown network, invalid lifecycle state, etc.).
+ *
+ * @remarks
+ * This is a non-recoverable error: the record must be corrected before it
+ * can be written to the registry.
+ */
+export class InvalidDeploymentRecordError extends DeploymentRegistryError {
+  public readonly field?: string;
+  constructor(message: string, field?: string, originalError?: Error) {
+    super(message, 'INVALID_DEPLOYMENT_RECORD', originalError);
+    this.name = 'InvalidDeploymentRecordError';
+    this.field = field;
+    Object.setPrototypeOf(this, InvalidDeploymentRecordError.prototype);
+  }
+}
+
+/**
+ * Thrown when a caller attempts to mutate the registry without the
+ * required authorization (e.g. missing/incorrect writer token).
+ *
+ * @remarks
+ * Non-recoverable without operator intervention: the caller must be granted
+ * write access before retrying.
+ */
+export class UnauthorizedRegistryWriteError extends DeploymentRegistryError {
+  public readonly actor?: string;
+  constructor(message = 'Unauthorized deployment registry write', actor?: string, originalError?: Error) {
+    super(message, 'UNAUTHORIZED_REGISTRY_WRITE', originalError);
+    this.name = 'UnauthorizedRegistryWriteError';
+    this.actor = actor;
+    Object.setPrototypeOf(this, UnauthorizedRegistryWriteError.prototype);
+  }
+}
+
+/**
+ * Thrown when the registry backing store cannot be read or written.
+ *
+ * @remarks
+ * Carries a `recoverable` flag and a `retryHint` so operators can decide
+ * whether to retry automatically or escalate. Transient I/O failures are
+ * typically recoverable; schema/corruption failures are not.
+ */
+export class RegistryStorageError extends DeploymentRegistryError {
+  public readonly recoverable: boolean;
+  public readonly retryHint?: string;
+  public readonly operation?: string;
+  constructor(
+    message: string,
+    options: { recoverable?: boolean; retryHint?: string; operation?: string; originalError?: Error } = {}
+  ) {
+    super(message, 'REGISTRY_STORAGE_ERROR', options.originalError);
+    this.name = 'RegistryStorageError';
+    this.recoverable = options.recoverable ?? false;
+    this.retryHint = options.retryHint;
+    this.operation = options.operation;
+    Object.setPrototypeOf(this, RegistryStorageError.prototype);
+  }
+}

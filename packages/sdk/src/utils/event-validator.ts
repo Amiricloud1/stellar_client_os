@@ -240,6 +240,35 @@ export function getEventSchema(
 }
 
 /**
+ * Resolves the schema for a contract event in a version-aware manner.
+ *
+ * - When `version` is supplied and registered, returns `{ status: 'exact' }`.
+ * - When `version` is supplied but not registered, returns `{ status: 'unknown' }`
+ *   so callers can retain the raw payload instead of dropping it.
+ * - When `version` is omitted, falls back to the latest registered schema
+ *   (`{ status: 'latest' }`) or `{ status: 'unknown' }` when none exists.
+ */
+export function resolveSchemaVersion(
+  contract: string,
+  eventName: string,
+  version?: number
+): SchemaResolution {
+  if (version !== undefined) {
+    const schema = EVENT_SCHEMAS[`${contract}:${eventName}:v${version}`];
+    if (schema) {
+      return { status: 'exact', schema, requestedVersion: version, resolvedVersion: schema.version };
+    }
+    return { status: 'unknown', requestedVersion: version };
+  }
+
+  const latest = getEventSchema(contract, eventName);
+  if (latest) {
+    return { status: 'latest', schema: latest, resolvedVersion: latest.version };
+  }
+  return { status: 'unknown' };
+}
+
+/**
  * Validates a contract event against a specific schema.
  *
  * When a `partition` is supplied, the event is rejected unless the partition
@@ -346,6 +375,44 @@ export function validateContractEvent(
     parsedPayload,
     partition,
   };
+}
+
+/**
+ * Version-aware validation entry point used by the canonical mapping layer.
+ *
+ * Resolves the schema for the given contract/event/version and validates the
+ * raw event against it. When the version is unknown, the event is NOT rejected:
+ * it is returned with `unknownVersion: true` and the raw topics/payload are
+ * preserved so downstream consumers can retain the event.
+ */
+export function validateContractEventVersioned(
+  raw: RawContractEvent,
+  contract: string,
+  eventName: string,
+  version?: number
+): ValidationResult {
+  const resolution = resolveSchemaVersion(contract, eventName, version);
+
+  if (!resolution.schema) {
+    return {
+      valid: false,
+      errors: [
+        `Unknown schema version for ${contract}:${eventName}` +
+          (version !== undefined ? ` v${version}` : ''),
+      ],
+      unknownVersion: true,
+      resolvedVersion: resolution.requestedVersion,
+      parsedTopics: Array.isArray(raw?.topic)
+        ? { raw: raw.topic }
+        : undefined,
+      parsedPayload:
+        raw && typeof raw.value === 'object' && raw.value !== null
+          ? { raw: raw.value }
+          : undefined,
+    };
+  }
+
+  return validateContractEvent(raw, resolution.schema);
 }
 
 /**

@@ -23,9 +23,15 @@ import {
   type PaymentStreamContractEventType,
   PAYMENT_STREAM_EVENT_TYPES,
 } from "./events.js";
+import {
+  mapContractEvent,
+  type ContractEventMapping,
+  type UnknownContractEvent,
+} from "./contractEventMapping.js";
 
 export type { ContractEventRaw, PaymentStreamContractEvent, PaymentStreamContractEventType };
 export { PAYMENT_STREAM_EVENT_TYPES };
+export type { ContractEventMapping, UnknownContractEvent };
 
 export interface SorobanEventParserOptions {
   /** Optional contract ID to scope parsing to a specific contract. */
@@ -43,8 +49,17 @@ export interface SorobanEventParserOptions {
 }
 
 export interface ParseResult<T> {
+  /** Events mapped to a known, supported contract-event projection. */
   parsed: T[];
-  /** Raw events that could not be parsed (unknown topic or malformed payload). */
+  /**
+   * Events whose version/topic is not supported. Payloads are retained
+   * verbatim so callers can persist or forward them for later processing.
+   */
+  unknown: UnknownContractEvent[];
+  /**
+   * Raw events that could not be parsed at all (malformed payloads).
+   * These are surfaced explicitly rather than silently dropped.
+   */
   skipped: ContractEventRaw[];
 }
 
@@ -123,27 +138,51 @@ export class SorobanEventParser {
     if (!this.inScope(event)) {
       return null;
     }
-    return parsePaymentStreamContractEvent(event);
+    return mapContractEvent(event);
   }
 
   /**
-   * Parse an array of raw events, returning successfully parsed events and
-   * a list of skipped (unrecognized / malformed) events.
+   * Parse a single raw event. Returns `null` if the event is filtered out by
+   * the configured `contractId` or if the payload is malformed. Unknown event
+   * versions are returned as an `unknown` mapping (payload retained).
+   */
+  parse(event: ContractEventRaw): PaymentStreamContractEvent | UnknownContractEvent | null {
+    const mapping = this.map(event);
+    if (mapping === null || mapping.kind === "malformed") {
+      return null;
+    }
+    return mapping.event;
+  }
+
+  /**
+   * Parse an array of raw events, partitioning them into supported
+   * projections (`parsed`), retained unknown versions (`unknown`), and
+   * malformed payloads (`skipped`).
    */
   parseAll(events: readonly ContractEventRaw[]): ParseResult<PaymentStreamContractEvent> {
     const parsed: PaymentStreamContractEvent[] = [];
+    const unknown: UnknownContractEvent[] = [];
     const skipped: ContractEventRaw[] = [];
 
     for (const event of events) {
-      const result = this.parse(event);
-      if (result !== null) {
-        parsed.push(result);
-      } else {
-        skipped.push(event);
+      const mapping = this.map(event);
+      if (mapping === null) {
+        continue;
+      }
+      switch (mapping.kind) {
+        case "known":
+          parsed.push(mapping.event);
+          break;
+        case "unknown":
+          unknown.push(mapping.event);
+          break;
+        case "malformed":
+          skipped.push(event);
+          break;
       }
     }
 
-    return { parsed, skipped };
+    return { parsed, unknown, skipped };
   }
 
   /**
@@ -217,6 +256,14 @@ export class SorobanEventParser {
   ): Extract<PaymentStreamContractEvent, { type: T }>[] {
     const { parsed } = this.parseAll(rawEvents);
     return this.filter(parsed, type);
+  }
+
+  /**
+   * Convenience: parse raw events and return only the retained unknown
+   * (unsupported version) events.
+   */
+  parseUnknown(rawEvents: readonly ContractEventRaw[]): UnknownContractEvent[] {
+    return this.parseAll(rawEvents).unknown;
   }
 
   /**
