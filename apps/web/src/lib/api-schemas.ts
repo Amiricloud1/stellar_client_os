@@ -135,6 +135,119 @@ export const listCampaignsQuerySchema = paginationSchema;
 export const listSubscriptionsQuerySchema = paginationSchema;
 
 /* -------------------------------------------------------------------------- */
+/* Campaign discovery batch (issue #231)                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Hard cap on the number of campaigns a single discovery batch may request.
+ * Services and routes share this limit so batch cost stays bounded.
+ */
+export const MAX_DISCOVERY_BATCH_SIZE = 100;
+
+export const DEFAULT_DISCOVERY_BATCH_SIZE = 20;
+
+export const campaignDiscoveryBatchQuerySchema = z
+  .object({
+    // Explicit campaign ids to fetch. Bounded to avoid unbounded IN clauses.
+    ids: z
+      .union([
+        z.array(idSchema),
+        z
+          .string()
+          .trim()
+          .min(1)
+          .transform((value) =>
+            value
+              .split(',')
+              .map((part) => part.trim())
+              .filter((part) => part.length > 0),
+          ),
+      ])
+      .pipe(z.array(idSchema).min(1).max(MAX_DISCOVERY_BATCH_SIZE))
+      .optional(),
+    cursor: nonEmptyString.optional(),
+    limit: z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_DISCOVERY_BATCH_SIZE)
+      .default(DEFAULT_DISCOVERY_BATCH_SIZE),
+  })
+  .strict();
+
+export type CampaignDiscoveryBatchInput = z.infer<
+  typeof campaignDiscoveryBatchQuerySchema
+>;
+
+/* -------------------------------------------------------------------------- */
+/* Campaign export jobs (issue #228)                                          */
+/* -------------------------------------------------------------------------- */
+
+export const exportFormatSchema = z.enum(['csv', 'json']);
+
+export type ExportFormat = z.infer<typeof exportFormatSchema>;
+
+export const exportJobStatusSchema = z.enum([
+  'queued',
+  'running',
+  'succeeded',
+  'failed',
+  'expired',
+]);
+
+export type ExportJobStatus = z.infer<typeof exportJobStatusSchema>;
+
+export const exportJobIdSchema = idSchema;
+
+export const createExportJobBodySchema = z
+  .object({
+    campaignId: campaignIdSchema,
+    format: exportFormatSchema.default('csv'),
+  })
+  .strict();
+
+export type CreateExportJobInput = z.infer<typeof createExportJobBodySchema>;
+
+export const exportJobIdParamsSchema = z
+  .object({
+    jobId: exportJobIdSchema,
+  })
+  .strict();
+
+export const exportJobStatusQuerySchema = z
+  .object({
+    // Optional long-poll hint (seconds) for clients waiting on completion.
+    waitSeconds: z.coerce.number().int().min(0).max(30).optional(),
+  })
+  .strict();
+
+export type ExportJobStatusQuery = z.infer<typeof exportJobStatusQuerySchema>;
+
+export const exportArtifactParamsSchema = z
+  .object({
+    jobId: exportJobIdSchema,
+    // Opaque, unguessable artifact token bound to the job.
+    artifactToken: nonEmptyString.max(256),
+  })
+  .strict();
+
+export type ExportArtifactParams = z.infer<typeof exportArtifactParamsSchema>;
+
+/* -------------------------------------------------------------------------- */
+/* Operator webhook redelivery (issue #230)                                   */
+/* -------------------------------------------------------------------------- */
+
+export const redeliverWebhookBodySchema = z
+  .object({
+    subscriptionId: subscriptionIdSchema,
+    eventId: nonEmptyString.max(256),
+    reason: nonEmptyString.max(500),
+  })
+  .strict();
+
+export type RedeliverWebhookInput = z.infer<typeof redeliverWebhookBodySchema>;
+
+/* -------------------------------------------------------------------------- */
 /* Webhook subscriptions                                                      */
 /* -------------------------------------------------------------------------- */
 
