@@ -47,6 +47,77 @@ export interface CampaignWebhookSubscription {
 }
 
 /**
+ * Persisted record of an authorized manual redelivery attempt.
+ *
+ * The original event payload and signature inputs (version/timestamp) are
+ * copied verbatim from the stored delivery so operators can prove that a
+ * redelivery did not mutate the signed content. One record is appended per
+ * attempt, including failed attempts, so the audit trail is complete.
+ */
+export interface OperatorRedeliveryAuditRecord {
+  subscriptionId: string;
+  eventId: string;
+  operatorId: string;
+  reason: string;
+  /** Outcome of the attempt: "delivered" or "failed". */
+  outcome: "delivered" | "failed";
+  /** Error message when outcome is "failed". */
+  error?: string;
+  /** Original signature version, preserved unchanged. */
+  signatureVersion: string;
+  /** Original signature timestamp, preserved unchanged. */
+  signatureTimestamp: string;
+  /** Original event payload, preserved unchanged. */
+  payload: Record<string, unknown>;
+  attemptedAt: string;
+}
+
+export interface OperatorRedeliveryRequest {
+  subscriptionId: string;
+  eventId: string;
+  operatorId: string;
+  reason: string;
+}
+
+/**
+ * Caller identity used to authorize operator actions at the service boundary.
+ * The owning API layer is responsible for authenticating the caller and
+ * passing the resolved role; the service re-checks it so a mis-wired route
+ * cannot bypass authorization.
+ */
+export interface OperatorContext {
+  operatorId: string;
+  role: string;
+}
+
+/** Stored delivery inputs needed to replay an event without mutating it. */
+export interface StoredDelivery {
+  subscriptionId: string;
+  eventId: string;
+  payload: Record<string, unknown>;
+  signatureVersion: string;
+  signatureTimestamp: string;
+}
+
+/**
+ * Durable store for original delivery inputs and the operator audit trail.
+ */
+export interface OperatorRedeliveryStore {
+  /** Loads the original delivery inputs, or null if unknown. */
+  loadDelivery(subscriptionId: string, eventId: string): Promise<StoredDelivery | null>;
+  /** Appends an audit record; MUST be durable before the call resolves. */
+  appendAuditRecord(record: OperatorRedeliveryAuditRecord): Promise<void>;
+}
+
+/** Health snapshot for a single destination's circuit breaker. */
+export interface DestinationBreakerHealth {
+  subscriptionId: string;
+  state: "closed" | "open" | "half_open";
+  consecutiveFailures: number;
+  openedAt?: string;
+}
+
+/**
  * Publishes the campaign lifecycle events consumed by external integrations.
  * The event identifiers are intentionally supplied by the caller so replayed
  * indexer notifications are deduplicated by WebhookService.
@@ -54,7 +125,8 @@ export interface CampaignWebhookSubscription {
 export class CampaignWebhookService {
   constructor(
     private readonly webhookService = new WebhookService(),
-    private readonly subscriptionStore?: CampaignWebhookSubscriptionStore
+    private readonly subscriptionStore?: CampaignWebhookSubscriptionStore,
+    private readonly redeliveryStore?: OperatorRedeliveryStore
   ) {}
 
   async treeVerified(event: TreeVerifiedEvent): Promise<void> {
@@ -185,6 +257,97 @@ export class CampaignWebhookService {
       throw new Error("subscriptionStore is required to recover subscriptions");
     }
     return this.subscriptionStore.loadSubscriptions();
+  }
+
+  /**
+   * Replays a previously dispatched event to a single destination on behalf
+   * of an authorized operator.
+   *
+   * Guarantees:
+   * - Authorization is enforced here, at the service boundary: only callers
+   *   with the "admin" role may redeliver.
+   * - The original event payload and signature version/timestamp are loaded
+   *   from the durable store and passed through unchanged; the method never
+   *   re-signs or mutates the payload.
+   * - Delivery reuses the isolated per-destination path in WebhookService so
+   *   a failing destination cannot starve healthy ones.
+   * - Exactly one audit record is appended per attempt, recording the outcome
+   *   (delivered or failed) so operators can see failure and recovery states.
+   */
+  async redeliverEvent(
+    request: OperatorRedeliveryRequest,
+    operator: OperatorContext
+  ): Promise<OperatorRedeliveryAuditRecord> {
+    this.assertRequired(request.subscriptionId, "subscriptionId");
+    this.assertRequired(request.eventId, "eventId");
+    this.assertRequired(request.operatorId, "operatorId");
+    this.assertRequired(request.reason, "reason");
+
+    if (!operator || operator.role !== "admin") {
+      throw new Error("redeliverEvent requires an admin operator");
+    }
+    if (operator.operatorId !== request.operatorId) {
+      throw new Error("operatorId does not match authenticated operator");
+    }
+    if (!this.redeliveryStore) {
+      throw new Error("redeliveryStore is required to redeliver events");
+    }
+
+    const delivery = await this.redeliveryStore.loadDelivery(
+      request.subscriptionId,
+      request.eventId
+    );
+    if (!delivery) {
+      throw new Error(
+        `no stored delivery for subscription ${request.subscriptionId} event ${request.eventId}`
+      );
+    }
+
+    // Preserve the original signed inputs verbatim.
+    const payload = delivery.payload;
+    const signatureVersion = delivery.signatureVersion;
+    const signatureTimestamp = delivery.signatureTimestamp;
+
+    let outcome: "delivered" | "failed" = "delivered";
+    let errorMessage: string | undefined;
+    try {
+      await this.webhookService.dispatchEventToDestination(
+        request.subscriptionId,
+        request.eventId,
+        payload,
+        { signatureVersion, signatureTimestamp }
+      );
+    } catch (error) {
+      outcome = "failed";
+      errorMessage = error instanceof Error ? error.message : String(error);
+    }
+
+    const record: OperatorRedeliveryAuditRecord = {
+      subscriptionId: request.subscriptionId,
+      eventId: request.eventId,
+      operatorId: request.operatorId,
+      reason: request.reason,
+      outcome,
+      ...(errorMessage ? { error: errorMessage } : {}),
+      signatureVersion,
+      signatureTimestamp,
+      payload,
+      attemptedAt: new Date().toISOString(),
+    };
+    await this.redeliveryStore.appendAuditRecord(record);
+
+    if (outcome === "failed") {
+      throw new Error(`redelivery failed: ${errorMessage}`);
+    }
+    return record;
+  }
+
+  /**
+   * Returns the circuit breaker health for each campaign destination so
+   * operators can see which subscribers are failing and which have recovered.
+   */
+  getDestinationHealth(): DestinationBreakerHealth[] {
+    return this.webhookService.getDestinationHealth();
   }
 
   private assertRequired(value: string, field: string): void {

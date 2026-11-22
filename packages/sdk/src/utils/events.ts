@@ -53,6 +53,40 @@ export type PaymentStreamContractEvent =
   | PaymentStreamContractEventBase<DelegationGrantedEvent>
   | PaymentStreamContractEventBase<DelegationRevokedEvent>;
 
+/**
+ * Canonical schema version for the payment-stream contract event payloads
+ * understood by this SDK. Events carrying a different version are retained
+ * verbatim (see {@link UnknownContractEventProjection}) instead of being
+ * dropped, so consumers can replay or forward them later.
+ */
+export const PAYMENT_STREAM_EVENT_SCHEMA_VERSION = 1 as const;
+
+export type PaymentStreamEventSchemaVersion =
+  typeof PAYMENT_STREAM_EVENT_SCHEMA_VERSION;
+
+/**
+ * Projection of a contract event whose schema version is not supported by
+ * this SDK. The raw event is preserved so it can be retained, replayed or
+ * upgraded once a parser for that version is available.
+ */
+export interface UnknownContractEventProjection {
+  type: "Unknown";
+  contractId: string;
+  topic: string[];
+  /** Schema version reported by the event, or `null` when absent/unparseable. */
+  schemaVersion: number | null;
+  /** The original, unmodified event payload. */
+  raw: ContractEventRaw;
+}
+
+/**
+ * Result of projecting a raw contract event onto the canonical domain model.
+ * Either a supported event was parsed, or the event was retained as unknown.
+ */
+export type ContractEventProjection =
+  | { kind: "supported"; event: PaymentStreamContractEvent }
+  | { kind: "unknown"; event: UnknownContractEventProjection };
+
 function isString(value: unknown): value is string {
   return typeof value === "string";
 }
@@ -243,28 +277,100 @@ export function parsePaymentStreamContractEvents(
 }
 
 /**
- * Wrap a raw contract event into the minimal, integrity-checkable audit
- * envelope. The envelope stores only the fields required to reconstruct the
- * event for audit queries plus a payload hash, retention class and privacy
- * flags. Throws when the raw event is malformed or required options are
- * missing so callers can surface an explicit failure state.
+ * Identifies the ingestion partition an event belongs to.
+ *
+ * Ingestion is partitioned by `(network, deploymentId)` so that cursors,
+ * backfills and health tracking for one deployment cannot block or corrupt
+ * another. Events that cannot be attributed to a partition are rejected
+ * rather than silently merged into a shared bucket.
  */
-export function toRawEventEnvelope(
-  raw: ContractEventRaw,
-  options: RawEventEnvelopeOptions,
-): RawEventEnvelope {
-  return buildRawEventEnvelope(raw, options);
+export interface EventPartitionKey {
+  network: string;
+  deploymentId: string;
+}
+
+export interface PartitionedEventInput extends ContractEventRaw {
+  /** Network the event was observed on (e.g. "testnet", "mainnet"). */
+  network: string;
+  /** Deployment / contract instance identifier within the network. */
+  deploymentId: string;
+}
+
+export interface EventPartition {
+  key: EventPartitionKey;
+  /** Stable string form of the key, suitable for use as a map/cursor key. */
+  partitionId: string;
+  events: PaymentStreamContractEvent[];
+  /** Raw events that failed parsing, isolated to this partition only. */
+  malformed: ContractEventRaw[];
+}
+
+export interface PartitionedEventParseResult {
+  partitions: EventPartition[];
+  /** Events rejected because they could not be attributed to a partition. */
+  unattributed: ContractEventRaw[];
+}
+
+export function eventPartitionId(key: EventPartitionKey): string {
+  return `${key.network}::${key.deploymentId}`;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function resolvePartitionKey(
+  event: PartitionedEventInput,
+): EventPartitionKey | null {
+  if (typeof event !== "object" || event === null) {
+    return null;
+  }
+  const { network, deploymentId } = event;
+  if (!isNonEmptyString(network) || !isNonEmptyString(deploymentId)) {
+    return null;
+  }
+  return { network, deploymentId };
 }
 
 /**
- * Rebuild the raw contract event shape from a stored audit envelope.
+ * Parses a batch of events and groups them by `(network, deploymentId)`.
  *
- * Returns `null` when the envelope is malformed or its payload hash does not
- * match the stored payload, so audit queries can distinguish a corrupt or
- * tampered record from a valid one instead of silently returning bad data.
+ * Malformed events are collected per partition so a bad event in one
+ * deployment never drops or blocks events in another. Events missing a
+ * network or deployment identifier are returned in `unattributed` and are
+ * never merged into any partition.
  */
-export function reconstructEventFromEnvelope(
-  envelope: RawEventEnvelope,
-): ContractEventRaw | null {
-  return reconstructRawEvent(envelope);
+export function parsePaymentStreamContractEventsByPartition(
+  events: readonly PartitionedEventInput[] | undefined,
+): PartitionedEventParseResult {
+  const partitions = new Map<string, EventPartition>();
+  const unattributed: ContractEventRaw[] = [];
+
+  if (!Array.isArray(events)) {
+    return { partitions: [], unattributed };
+  }
+
+  for (const event of events) {
+    const key = resolvePartitionKey(event);
+    if (!key) {
+      unattributed.push(event);
+      continue;
+    }
+
+    const partitionId = eventPartitionId(key);
+    let partition = partitions.get(partitionId);
+    if (!partition) {
+      partition = { key, partitionId, events: [], malformed: [] };
+      partitions.set(partitionId, partition);
+    }
+
+    const parsed = parsePaymentStreamContractEvent(event);
+    if (parsed) {
+      partition.events.push(parsed);
+    } else {
+      partition.malformed.push(event);
+    }
+  }
+
+  return { partitions: [...partitions.values()], unattributed };
 }

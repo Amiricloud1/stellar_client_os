@@ -22,109 +22,344 @@ import { AuditLogger } from "./audit.js";
 
 export type PersonalDataCategory = "tax" | "verification" | "upload_metadata";
 
-/**
- * Retention class of a raw event envelope — issues #223 / #224.
- *
- * Envelopes are the integrity-checkable source of derived records. They are
- * retained only as long as needed for auditability, then compacted/archived.
- */
-export type EnvelopeRetentionClass =
-  | "ephemeral"
-  | "operational"
-  | "audit"
-  | "legal";
+// ---------------------------------------------------------------------------
+// Replay projections across event-schema versions — issue #220
+// ---------------------------------------------------------------------------
 
 /**
- * Minimal raw event envelope retained for auditability (issue #223).
- *
- * The envelope carries only what is needed to integrity-check derived records
- * (a content hash and the source reference) plus a small, redactable payload.
- * It never stores secrets; personal fields are redacted before archival.
+ * A retained raw event, as originally ingested. Raw events are immutable and
+ * are the authoritative source for replay. `schemaVersion` identifies the
+ * event-schema version the payload was written with.
  */
-export interface RawEventEnvelope {
+export interface RawEvent {
   id: string;
-  /** Retention class driving how long the envelope is kept. */
-  retentionClass: EnvelopeRetentionClass;
-  /** Public subject identifier (e.g. wallet address). Never a secret. */
-  subjectId: string;
-  /** Reference to the source event (e.g. chain tx / log id). */
-  sourceRef: string;
-  /** Integrity hash of the original event payload (hex). */
-  contentHash: string;
-  createdAt: string; // ISO 8601 UTC
-  updatedAt: string; // ISO 8601 UTC
+  /** Monotonic sequence number; replay is ordered by this value. */
+  sequence: number;
+  /** Event-schema version the payload was written with. */
+  schemaVersion: number;
+  /** Event type, e.g. "record.created". */
+  type: string;
+  /** Opaque raw payload. Never contains secrets. */
+  payload: Readonly<Record<string, unknown>>;
+  /** ISO 8601 UTC ingestion timestamp. */
+  recordedAt: string;
+}
+
+/** A projection of state derived from raw events. */
+export interface Projection {
+  /** Projection key (e.g. record id). */
+  key: string;
+  /** Projected value; JSON-serialisable. */
+  value: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * Canonical mapping for a single event-schema version. Implementations must be
+ * pure: the same raw event and target version must always yield the same
+ * projection mutations.
+ */
+export interface SchemaMapping {
+  /** Source schema version this mapping handles. */
+  fromVersion: number;
+  /** Target schema version this mapping produces. */
+  toVersion: number;
+  /** Applies the event to the projection map, returning a new map. */
+  apply(
+    projections: ReadonlyMap<string, Projection>,
+    event: RawEvent
+  ): Map<string, Projection>;
+}
+
+/** Explicit replay lifecycle states, surfaced to operators. */
+export type ReplayStatus =
+  | "pending"
+  | "running"
+  | "failed"
+  | "mismatched"
+  | "matched";
+
+/** A single projection difference between replay and current output. */
+export interface ProjectionDiff {
+  key: string;
+  /** "missing" = present in replay only; "extra" = current only. */
+  kind: "changed" | "missing" | "extra";
+  replayed?: Readonly<Record<string, unknown>>;
+  current?: Readonly<Record<string, unknown>>;
+}
+
+/** Result of a replay run. */
+export interface ReplayResult {
+  status: ReplayStatus;
+  targetVersion: number;
+  /** Number of raw events applied. */
+  eventsApplied: number;
+  /** Deterministic digest of the replayed projections. */
+  digest: string;
+  diffs: ProjectionDiff[];
+  /** Populated when status is "failed". */
+  error?: string;
+  /** Number of attempts made (retries increment this). */
+  attempts: number;
+}
+
+/** Error raised by the replay subsystem. */
+export class ReplayError extends Error {
+  public readonly code: string;
+
+  constructor(message: string, code: string) {
+    super(message);
+    this.name = "ReplayError";
+    this.code = code;
+    Object.setPrototypeOf(this, ReplayError.prototype);
+  }
+}
+
+/** Stable, order-independent digest of a projection map. */
+export function digestProjections(
+  projections: ReadonlyMap<string, Projection>
+): string {
+  const keys = [...projections.keys()].sort();
+  const canonical = keys.map((k) => {
+    const value = projections.get(k)!.value;
+    return [k, canonicalise(value)];
+  });
+  return JSON.stringify(canonical);
+}
+
+function canonicalise(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalise);
+  }
+  if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(obj).sort()) {
+      out[key] = canonicalise(obj[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Deterministic replay engine. Reads retained raw events, applies the canonical
+ * mapping chain for a target schema version, and produces projections that can
+ * be diffed against current outputs before cutover.
+ *
+ * Failure and recovery are explicit: a replay that throws mid-way leaves the
+ * engine in status "failed" with the partial attempt recorded, and `replay()`
+ * may be retried; each retry starts from a clean projection map so partial
+ * state never leaks into a subsequent attempt.
+ */
+export class ReplayEngine {
+  private mappings: Map<number, SchemaMapping>;
+  private status: ReplayStatus = "pending";
+  private lastResult?: ReplayResult;
+  private attempts = 0;
+
+  constructor(mappings: SchemaMapping[] = []) {
+    this.mappings = new Map();
+    for (const mapping of mappings) {
+      this.mappings.set(mapping.fromVersion, mapping);
+    }
+  }
+
+  /** Register or replace the mapping for a source schema version. */
+  registerMapping(mapping: SchemaMapping): void {
+    this.mappings.set(mapping.fromVersion, mapping);
+  }
+
+  /** Current replay status, surfaced to operators. */
+  getStatus(): ReplayStatus {
+    return this.status;
+  }
+
+  /** Result of the most recent replay attempt, if any. */
+  getLastResult(): ReplayResult | undefined {
+    return this.lastResult ? { ...this.lastResult } : undefined;
+  }
+
   /**
-   * Derived record ids that were produced from this envelope. An envelope may
-   * only be purged once every derived record has been archived.
+   * Replays `events` into projections for `targetVersion`. Events are applied
+   * in ascending `sequence` order. Throws ReplayError when no mapping chain
+   * exists for an event's schema version.
    */
-  derivedRecordIds: string[];
+  replay(
+    events: readonly RawEvent[],
+    targetVersion: number
+  ): ReplayResult {
+    this.attempts += 1;
+    this.status = "running";
+    try {
+      const ordered = [...events].sort((a, b) => a.sequence - b.sequence);
+      let projections = new Map<string, Projection>();
+      let applied = 0;
+      for (const event of ordered) {
+        projections = this.applyEvent(projections, event, targetVersion);
+        applied += 1;
+      }
+      const result: ReplayResult = {
+        status: "matched",
+        targetVersion,
+        eventsApplied: applied,
+        digest: digestProjections(projections),
+        diffs: [],
+        attempts: this.attempts,
+      };
+      this.lastResult = result;
+      this.status = "matched";
+      return { ...result };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const result: ReplayResult = {
+        status: "failed",
+        targetVersion,
+        eventsApplied: 0,
+        digest: "",
+        diffs: [],
+        error: message,
+        attempts: this.attempts,
+      };
+      this.lastResult = result;
+      this.status = "failed";
+      throw err;
+    }
+  }
+
+  private applyEvent(
+    projections: Map<string, Projection>,
+    event: RawEvent,
+    targetVersion: number
+  ): Map<string, Projection> {
+    let current = projections;
+    let version = event.schemaVersion;
+    const visited = new Set<number>();
+    while (version !== targetVersion) {
+      if (visited.has(version)) {
+        throw new ReplayError(
+          `Mapping cycle detected at schema version ${version}`,
+          "MAPPING_CYCLE"
+        );
+      }
+      visited.add(version);
+      const mapping = this.mappings.get(version);
+      if (!mapping) {
+        throw new ReplayError(
+          `No schema mapping from version ${version} ` +
+            `(event "${event.id}", target ${targetVersion})`,
+          "NO_MAPPING"
+        );
+      }
+      current = mapping.apply(current, event);
+      version = mapping.toVersion;
+    }
+    return current;
+  }
+
   /**
-   * Personal fields captured from the event. These are redacted (dropped)
-   * before archival when the retention class requires it.
+   * Diffs replayed projections against current outputs. Sets status to
+   * "matched" when identical, "mismatched" otherwise.
    */
-  personalFields?: Record<string, string>;
+  diff(
+    replayed: ReadonlyMap<string, Projection>,
+    current: ReadonlyMap<string, Projection>
+  ): ProjectionDiff[] {
+    const diffs: ProjectionDiff[] = [];
+    const keys = new Set<string>([...replayed.keys(), ...current.keys()]);
+    for (const key of [...keys].sort()) {
+      const r = replayed.get(key);
+      const c = current.get(key);
+      if (r && !c) {
+        diffs.push({ key, kind: "missing", replayed: r.value });
+      } else if (!r && c) {
+        diffs.push({ key, kind: "extra", current: c.value });
+      } else if (r && c) {
+        if (canonicalise(r.value) !== canonicalise(c.value)) {
+          diffs.push({
+            key,
+            kind: "changed",
+            replayed: r.value,
+            current: c.value,
+          });
+        }
+      }
+    }
+    this.status = diffs.length === 0 ? "matched" : "mismatched";
+    if (this.lastResult) {
+      this.lastResult = { ...this.lastResult, status: this.status, diffs };
+    }
+    return diffs;
+  }
 }
 
-/** Retention rule for a raw event envelope class. */
-export interface EnvelopeRetentionRule {
-  retentionClass: EnvelopeRetentionClass;
-  /** Retention period in days. */
-  retentionDays: number;
-  /** When true, personal fields are redacted before archival. */
-  redactPersonalFields: boolean;
-  description: string;
+/** Authorisation context for cutover. */
+export interface CutoverAuthorization {
+  actor: string;
+  actorRole: string;
+  requestId: string;
 }
 
-/** Default retention periods per envelope class. */
-export const DEFAULT_ENVELOPE_RETENTION_RULES: EnvelopeRetentionRule[] = [
-  {
-    retentionClass: "ephemeral",
-    retentionDays: 7,
-    redactPersonalFields: true,
-    description:
-      "High-volume events kept briefly for troubleshooting, then dropped.",
-  },
-  {
-    retentionClass: "operational",
-    retentionDays: 30,
-    redactPersonalFields: true,
-    description:
-      "Operational events retained for incident review with personal fields redacted.",
-  },
-  {
-    retentionClass: "audit",
-    retentionDays: 365,
-    redactPersonalFields: true,
-    description:
-      "Audit-relevant events retained for a year with personal fields redacted.",
-  },
-  {
-    retentionClass: "legal",
-    retentionDays: 2555, // 7 years
-    redactPersonalFields: false,
-    description:
-      "Legal-hold events retained for the statutory window, unredacted.",
-  },
-];
+/** Roles permitted to authorise a cutover. */
+const CUTOVER_ROLES = new Set(["admin", "operator"]);
 
-/** Result of a single envelope purge attempt. */
-export interface EnvelopePurgeResult {
-  /** Envelopes removed (or already absent) in this call. */
-  purged: string[];
-  /** Envelopes skipped because derived records are not yet archived. */
-  blocked: string[];
-  /** Envelopes skipped because they are not yet past retention. */
-  retained: string[];
-  /** True when the call was a no-op retry (nothing left to purge). */
-  idempotent: boolean;
-}
+/**
+ * Guards cutover behind a successful, matching replay. Cutover is blocked when
+ * the replay failed, mismatched, or was never run, and when the actor is not
+ * authorised. Every decision is audited.
+ */
+export class CutoverGuard {
+  private engine: ReplayEngine;
+  private logger: AuditLogger;
 
-/** Error raised when an actor is not authorized to purge envelopes. */
-export class EnvelopeAuthorizationError extends RetentionError {
-  constructor(message: string) {
-    super(message, "UNAUTHORIZED");
-    this.name = "EnvelopeAuthorizationError";
-    Object.setPrototypeOf(this, EnvelopeAuthorizationError.prototype);
+  constructor(engine: ReplayEngine, logger: AuditLogger = new AuditLogger()) {
+    this.engine = engine;
+    this.logger = logger;
+  }
+
+  /**
+   * Returns true when cutover may proceed. Throws ReplayError when blocked so
+   * the failure state is explicit to the caller.
+   */
+  assertCutoverAllowed(auth: CutoverAuthorization): void {
+    if (!CUTOVER_ROLES.has(auth.actorRole)) {
+      this.logger.record({
+        actor: auth.actor,
+        actorRole: auth.actorRole,
+        action: "replay.cutover.denied",
+        target: "replay:cutover",
+        requestId: auth.requestId,
+        reason: "unauthorized",
+      });
+      throw new ReplayError(
+        `Actor "${auth.actor}" (${auth.actorRole}) is not authorised to ` +
+          `authorise cutover`,
+        "UNAUTHORIZED"
+      );
+    }
+
+    const status = this.engine.getStatus();
+    if (status !== "matched") {
+      this.logger.record({
+        actor: auth.actor,
+        actorRole: auth.actorRole,
+        action: "replay.cutover.blocked",
+        target: "replay:cutover",
+        requestId: auth.requestId,
+        reason: status,
+      });
+      throw new ReplayError(
+        `Cutover blocked: replay status is "${status}"`,
+        "CUTOVER_BLOCKED"
+      );
+    }
+
+    this.logger.record({
+      actor: auth.actor,
+      actorRole: auth.actorRole,
+      action: "replay.cutover.allowed",
+      target: "replay:cutover",
+      requestId: auth.requestId,
+    });
   }
 }
 

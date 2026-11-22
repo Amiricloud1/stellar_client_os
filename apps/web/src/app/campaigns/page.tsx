@@ -1,5 +1,7 @@
 import { Metadata } from "next";
 import { CampaignSearch } from "@/components/modules/campaigns/CampaignSearch";
+import { SponsorPortfolioPanel } from "@/components/modules/campaigns/SponsorPortfolioPanel";
+import { TransactionTimelineEntry } from "@/components/modules/campaigns/TransactionTimelineEntry";
 
 export const metadata: Metadata = {
   title: "Explore Campaigns | Fundable Protocol",
@@ -26,6 +28,22 @@ export default function CampaignsPage() {
         >
           Find and back environmental campaigns with full-text search by tree species, geographic location, and verified creator.
         </p>
+      </div>
+
+      <div
+        className="mb-8"
+        data-testid="campaigns-sponsor-portfolio-region"
+        data-e2e-region="sponsor-portfolio"
+      >
+        <SponsorPortfolioPanel />
+      </div>
+
+      <div
+        className="mb-8"
+        data-testid="campaigns-transaction-timeline-region"
+        data-e2e-region="transaction-timeline"
+      >
+        <TransactionTimelineEntry />
       </div>
 
       <div data-testid="campaigns-search-region" data-e2e-region="campaign-discovery">

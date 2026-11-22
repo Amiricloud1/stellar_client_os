@@ -13,15 +13,128 @@ import {
   RecordMilestoneInput,
 } from '@/types/onchain-tracking';
 
+/**
+ * Identifies an isolated ingestion partition. Each (network, deploymentId) pair
+ * owns its own cursors, backfill state and health so a stalled source cannot
+ * block other deployments.
+ */
+export interface TrackingPartition {
+  network: string;
+  deploymentId: string;
+}
+
+export type PartitionHealthStatus = 'healthy' | 'degraded' | 'stalled';
+
+export interface PartitionHealth {
+  partition: TrackingPartition;
+  status: PartitionHealthStatus;
+  lastSuccessAt: string | null;
+  lastErrorAt: string | null;
+  lastError: string | null;
+  consecutiveFailures: number;
+  cursor: string | null;
+  backfillComplete: boolean;
+}
+
+interface PartitionState {
+  milestones: Map<string, OnChainMilestone[]>;
+  certificates: Map<string, NFTCertificate>;
+  health: PartitionHealth;
+}
+
+const DEFAULT_PARTITION: TrackingPartition = { network: 'stellar', deploymentId: 'default' };
+const STALLED_FAILURE_THRESHOLD = 3;
+
+function partitionKey(partition: TrackingPartition): string {
+  return `${partition.network}::${partition.deploymentId}`;
+}
+
+function normalizePartition(partition?: Partial<TrackingPartition> | null): TrackingPartition {
+  return {
+    network: partition?.network?.trim() || DEFAULT_PARTITION.network,
+    deploymentId: partition?.deploymentId?.trim() || DEFAULT_PARTITION.deploymentId,
+  };
+}
+
 export class OnChainCampaignTrackingService {
-  private milestones: Map<string, OnChainMilestone[]> = new Map();
-  private certificates: Map<string, NFTCertificate> = new Map();
+  private partitions: Map<string, PartitionState> = new Map();
+
+  private getPartition(partition?: Partial<TrackingPartition> | null): PartitionState {
+    const normalized = normalizePartition(partition);
+    const key = partitionKey(normalized);
+    let state = this.partitions.get(key);
+    if (!state) {
+      state = {
+        milestones: new Map(),
+        certificates: new Map(),
+        health: {
+          partition: normalized,
+          status: 'healthy',
+          lastSuccessAt: null,
+          lastErrorAt: null,
+          lastError: null,
+          consecutiveFailures: 0,
+          cursor: null,
+          backfillComplete: false,
+        },
+      };
+      this.partitions.set(key, state);
+    }
+    return state;
+  }
+
+  private recordSuccess(state: PartitionState, cursor?: string): void {
+    state.health.lastSuccessAt = new Date().toISOString();
+    state.health.consecutiveFailures = 0;
+    state.health.status = 'healthy';
+    if (cursor !== undefined) {
+      state.health.cursor = cursor;
+    }
+  }
+
+  private recordFailure(state: PartitionState, error: unknown): void {
+    state.health.lastErrorAt = new Date().toISOString();
+    state.health.lastError = error instanceof Error ? error.message : String(error);
+    state.health.consecutiveFailures += 1;
+    state.health.status =
+      state.health.consecutiveFailures >= STALLED_FAILURE_THRESHOLD ? 'stalled' : 'degraded';
+  }
+
+  /**
+   * Report health for a single partition. Operators can poll this to detect a
+   * stalled source without inspecting other deployments.
+   */
+  public getPartitionHealth(partition?: Partial<TrackingPartition> | null): PartitionHealth {
+    return { ...this.getPartition(partition).health, partition: { ...this.getPartition(partition).health.partition } };
+  }
+
+  /**
+   * Report health for every known partition, keyed by `network::deploymentId`.
+   */
+  public getAllPartitionHealth(): Record<string, PartitionHealth> {
+    const result: Record<string, PartitionHealth> = {};
+    for (const [key, state] of this.partitions.entries()) {
+      result[key] = { ...state.health, partition: { ...state.health.partition } };
+    }
+    return result;
+  }
+
+  /**
+   * Mark a partition's backfill as complete so it stops being treated as
+   * pending work.
+   */
+  public markBackfillComplete(partition?: Partial<TrackingPartition> | null): void {
+    const state = this.getPartition(partition);
+    state.health.backfillComplete = true;
+    this.recordSuccess(state);
+  }
 
   /**
    * Record a milestone on the Stellar blockchain.
    */
   public async recordOnChainMilestone(input: RecordMilestoneInput): Promise<OnChainMilestone> {
-    const existing = this.milestones.get(input.campaignId) || [];
+    const state = this.getPartition(input.partition);
+    const existing = state.milestones.get(input.campaignId) || [];
 
     const duplicate = existing.find((m) => m.milestonePercentage === input.milestonePercentage);
     if (duplicate) {
@@ -44,22 +157,139 @@ export class OnChainCampaignTrackingService {
     };
 
     existing.push(milestone);
-    this.milestones.set(input.campaignId, existing);
+    state.milestones.set(input.campaignId, existing);
+    this.recordSuccess(state, milestone.txHash);
+
+    // Emit the authoritative lifecycle events for the milestone transaction.
+    // Submission is recorded first, then ledger confirmation and settlement.
+    this.recordTransactionEvent({
+      txHash: milestone.txHash,
+      campaignId: milestone.campaignId,
+      kind: 'milestone',
+      status: 'submitted',
+      source: { referenceId: milestone.id },
+    });
+    this.recordTransactionEvent({
+      txHash: milestone.txHash,
+      campaignId: milestone.campaignId,
+      kind: 'milestone',
+      status: 'ledger_confirmed',
+      ledger: milestone.blockTimestamp,
+      source: { referenceId: milestone.id },
+    });
+    this.recordTransactionEvent({
+      txHash: milestone.txHash,
+      campaignId: milestone.campaignId,
+      kind: 'milestone',
+      status: 'settled',
+      ledger: milestone.blockTimestamp,
+      source: { referenceId: milestone.id },
+    });
 
     return milestone;
   }
 
   /**
+   * Persist a lifecycle event for an on-chain transaction.
+   *
+   * Events are idempotent per (txHash, status): re-recording the same status
+   * for the same transaction returns the existing event instead of appending a
+   * duplicate. This makes retries safe for callers that may re-submit after a
+   * reload or a transient failure.
+   */
+  public recordTransactionEvent(input: RecordTransactionEventInput): OnChainTransactionEvent {
+    const existingForTx = this.transactionEventsByTxHash.get(input.txHash) ?? [];
+    const duplicate = existingForTx.find((e) => e.status === input.status);
+    if (duplicate) {
+      return duplicate;
+    }
+
+    const event: OnChainTransactionEvent = {
+      eventId: `evt-${input.txHash}-${input.status}`,
+      txHash: input.txHash,
+      campaignId: input.campaignId,
+      kind: input.kind,
+      status: input.status,
+      ledger: input.ledger ?? null,
+      observedAt: new Date().toISOString(),
+      retryable: input.status === 'failed' ? Boolean(input.retryable) : false,
+      failureReason: input.status === 'failed' ? input.failureReason : undefined,
+      source: {
+        referenceId: input.source.referenceId,
+        network: input.source.network ?? this.defaultNetwork,
+        contractId: input.source.contractId ?? this.defaultContractId,
+      },
+    };
+
+    existingForTx.push(event);
+    this.transactionEventsByTxHash.set(input.txHash, existingForTx);
+
+    const existingForCampaign = this.transactionEvents.get(input.campaignId) ?? [];
+    existingForCampaign.push(event);
+    this.transactionEvents.set(input.campaignId, existingForCampaign);
+
+    return event;
+  }
+
+  /**
+   * Record a failure for an on-chain transaction so operators and the timeline
+   * can surface an explicit recovery state.
+   */
+  public recordTransactionFailure(
+    input: Omit<RecordTransactionEventInput, 'status'> & {
+      retryable?: boolean;
+      failureReason: string;
+    },
+  ): OnChainTransactionEvent {
+    return this.recordTransactionEvent({
+      ...input,
+      status: 'failed',
+      retryable: input.retryable ?? true,
+    });
+  }
+
+  /**
+   * Get the ordered lifecycle events for a single transaction. Used by the
+   * transaction confirmation timeline to recover state after a reload.
+   */
+  public getTransactionEvents(txHash: string): OnChainTransactionEvent[] {
+    return [...(this.transactionEventsByTxHash.get(txHash) ?? [])];
+  }
+
+  /**
+   * Get all lifecycle events for a campaign, ordered by observation time.
+   */
+  public getCampaignTransactionEvents(campaignId: string): OnChainTransactionEvent[] {
+    return [...(this.transactionEvents.get(campaignId) ?? [])];
+  }
+
+  /**
+   * Resolve the latest authoritative status for a transaction, or `null` when
+   * the transaction is unknown.
+   */
+  public getTransactionStatus(txHash: string): OnChainTransactionStatus | null {
+    const events = this.transactionEventsByTxHash.get(txHash);
+    if (!events || events.length === 0) {
+      return null;
+    }
+    return events[events.length - 1].status;
+  }
+
+  /**
    * Get all on-chain recorded milestones for a campaign.
    */
-  public async getOnChainMilestones(campaignId: string): Promise<OnChainMilestone[]> {
-    return this.milestones.get(campaignId) || [];
+  public async getOnChainMilestones(
+    campaignId: string,
+    partition?: Partial<TrackingPartition> | null,
+  ): Promise<OnChainMilestone[]> {
+    return this.getPartition(partition).milestones.get(campaignId) || [];
   }
 
   /**
    * Issue an NFT certificate on Stellar when funding goal is met.
    */
   public async issueNFTCertificate(input: MintCertificateInput): Promise<NFTCertificate> {
+    const state = this.getPartition(input.partition);
     const certId = `NFT-CERT-${input.campaignId}-${Date.now()}`;
     const dummyTxHash = `tx-nft-${Math.random().toString(36).substring(2, 15)}${Math.random().toString(36).substring(2, 15)}`;
     const metadataUri = `https://ipfs.io/ipfs/QmFNDL${certId.toLowerCase()}`;
@@ -81,7 +311,30 @@ export class OnChainCampaignTrackingService {
       impact: input.impact,
     };
 
-    this.certificates.set(certId, certificate);
+    state.certificates.set(certId, certificate);
+    this.recordSuccess(state, certificate.txHash);
+
+    this.recordTransactionEvent({
+      txHash: certificate.txHash,
+      campaignId: certificate.campaignId,
+      kind: 'certificate',
+      status: 'submitted',
+      source: { referenceId: certificate.certificateId },
+    });
+    this.recordTransactionEvent({
+      txHash: certificate.txHash,
+      campaignId: certificate.campaignId,
+      kind: 'certificate',
+      status: 'ledger_confirmed',
+      source: { referenceId: certificate.certificateId },
+    });
+    this.recordTransactionEvent({
+      txHash: certificate.txHash,
+      campaignId: certificate.campaignId,
+      kind: 'certificate',
+      status: 'settled',
+      source: { referenceId: certificate.certificateId },
+    });
 
     // Auto-record 100% milestone on-chain as well
     await this.recordOnChainMilestone({
@@ -91,6 +344,7 @@ export class OnChainCampaignTrackingService {
       description: `Campaign "${input.campaignTitle}" reached its total funding target of ${input.fundingGoal}.`,
       achievedAmount: input.totalRaised,
       targetAmount: input.fundingGoal,
+      partition: input.partition,
     });
 
     return certificate;
@@ -98,8 +352,11 @@ export class OnChainCampaignTrackingService {
 
   /** Mint the completion certificate once and one personal impact NFT per sponsor. */
   public async mintEnvironmentalImpactNFTs(input: MintCertificateInput & { sponsorAddresses: string[] }): Promise<NFTCertificate[]> {
+    const state = this.getPartition(input.partition);
     if (Number(input.totalRaised) < Number(input.fundingGoal)) {
-      throw new Error("Environmental impact NFTs can only be minted for completed campaigns");
+      const error = new Error("Environmental impact NFTs can only be minted for completed campaigns");
+      this.recordFailure(state, error);
+      throw error;
     }
     const recipients = [input.recipientAddress ?? input.creatorAddress, ...input.sponsorAddresses];
     const certificates: NFTCertificate[] = [];
@@ -112,22 +369,188 @@ export class OnChainCampaignTrackingService {
   /**
    * Get issued NFT certificate by ID.
    */
-  public async getCertificate(certificateId: string): Promise<NFTCertificate | null> {
-    return this.certificates.get(certificateId) || null;
+  public async getCertificate(
+    certificateId: string,
+    partition?: Partial<TrackingPartition> | null,
+  ): Promise<NFTCertificate | null> {
+    return this.getPartition(partition).certificates.get(certificateId) || null;
   }
 
   /**
    * Get all NFT certificates issued for a campaign.
    */
-  public async getCertificatesForCampaign(campaignId: string): Promise<NFTCertificate[]> {
-    return Array.from(this.certificates.values()).filter((c) => c.campaignId === campaignId);
+  public async getCertificatesForCampaign(
+    campaignId: string,
+    partition?: Partial<TrackingPartition> | null,
+  ): Promise<NFTCertificate[]> {
+    return Array.from(this.getPartition(partition).certificates.values()).filter(
+      (c) => c.campaignId === campaignId,
+    );
+  }
+
+  /**
+   * Replay retained raw events into fresh projections and compare them against
+   * the current projections. Cutover is only allowed when the replay is
+   * deterministic and produces no mismatches.
+   */
+  public async replayProjections(): Promise<ReplayReport> {
+    const startedAt = new Date().toISOString();
+    const report: ReplayReport = {
+      status: 'running',
+      startedAt,
+      finishedAt: null,
+      eventsReplayed: 0,
+      mismatches: [],
+      error: null,
+      cutoverAllowed: false,
+    };
+    this.lastReplayReport = report;
+
+    try {
+      const replayedMilestones = new Map<string, OnChainMilestone[]>();
+      const replayedCertificates = new Map<string, NFTCertificate>();
+
+      for (const event of [...this.events].sort((a, b) => a.sequence - b.sequence)) {
+        if (event.type === 'milestone.recorded') {
+          const input = event.payload as RecordMilestoneInput;
+          const list = replayedMilestones.get(input.campaignId) || [];
+          if (!list.find((m) => m.milestonePercentage === input.milestonePercentage)) {
+            list.push(this.buildMilestone(input));
+            replayedMilestones.set(input.campaignId, list);
+          }
+        } else {
+          const input = event.payload as MintCertificateInput;
+          const cert = this.buildCertificate(input);
+          replayedCertificates.set(cert.certificateId, cert);
+        }
+        report.eventsReplayed++;
+      }
+
+      report.mismatches = [
+        ...this.compareMilestones(replayedMilestones),
+        ...this.compareCertificates(replayedCertificates),
+      ];
+
+      report.status = report.mismatches.length === 0 ? 'succeeded' : 'blocked';
+      report.cutoverAllowed = report.mismatches.length === 0;
+    } catch (err) {
+      report.status = 'failed';
+      report.error = err instanceof Error ? err.message : String(err);
+      report.cutoverAllowed = false;
+    } finally {
+      report.finishedAt = new Date().toISOString();
+    }
+
+    return report;
+  }
+
+  private buildMilestone(input: RecordMilestoneInput): OnChainMilestone {
+    return {
+      id: `ms-${input.campaignId}-${input.milestonePercentage}`,
+      campaignId: input.campaignId,
+      milestonePercentage: input.milestonePercentage,
+      title: input.title,
+      description: input.description,
+      targetAmount: input.targetAmount,
+      achievedAmount: input.achievedAmount,
+      txHash: '',
+      blockTimestamp: 0,
+      verifiedOnChain: true,
+    };
+  }
+
+  private buildCertificate(input: MintCertificateInput): NFTCertificate {
+    const certId = `NFT-CERT-${input.campaignId}-${Date.now()}`;
+    return {
+      certificateId: certId,
+      campaignId: input.campaignId,
+      campaignTitle: input.campaignTitle,
+      creatorAddress: input.creatorAddress,
+      recipientAddress: input.recipientAddress || input.creatorAddress,
+      fundingGoal: input.fundingGoal,
+      totalRaised: input.totalRaised,
+      issuedAt: new Date().toISOString(),
+      txHash: '',
+      metadataUri: `https://ipfs.io/ipfs/QmFNDL${certId.toLowerCase()}`,
+      assetCode: `FUND${input.campaignId.substring(0, 4).toUpperCase()}`,
+      verified: true,
+      impact: input.impact,
+    };
+  }
+
+  private compareMilestones(replayed: Map<string, OnChainMilestone[]>): ReplayMismatch[] {
+    const mismatches: ReplayMismatch[] = [];
+    const campaignIds = new Set([...this.milestones.keys(), ...replayed.keys()]);
+    for (const campaignId of campaignIds) {
+      const projected = this.milestones.get(campaignId) || [];
+      const rebuilt = replayed.get(campaignId) || [];
+      if (projected.length !== rebuilt.length) {
+        mismatches.push({
+          kind: 'milestone',
+          key: campaignId,
+          field: 'count',
+          projected: projected.length,
+          replayed: rebuilt.length,
+        });
+        continue;
+      }
+      for (let i = 0; i < projected.length; i++) {
+        for (const field of ['milestonePercentage', 'title', 'targetAmount', 'achievedAmount'] as const) {
+          if (projected[i][field] !== rebuilt[i][field]) {
+            mismatches.push({
+              kind: 'milestone',
+              key: projected[i].id,
+              field,
+              projected: projected[i][field],
+              replayed: rebuilt[i][field],
+            });
+          }
+        }
+      }
+    }
+    return mismatches;
+  }
+
+  private compareCertificates(replayed: Map<string, NFTCertificate>): ReplayMismatch[] {
+    const mismatches: ReplayMismatch[] = [];
+    if (this.certificates.size !== replayed.size) {
+      mismatches.push({
+        kind: 'certificate',
+        key: '*',
+        field: 'count',
+        projected: this.certificates.size,
+        replayed: replayed.size,
+      });
+    }
+    for (const [id, projected] of this.certificates) {
+      const rebuilt = replayed.get(id);
+      if (!rebuilt) {
+        mismatches.push({ kind: 'certificate', key: id, field: 'missing', projected: true, replayed: false });
+        continue;
+      }
+      for (const field of ['campaignId', 'recipientAddress', 'totalRaised'] as const) {
+        if (projected[field] !== rebuilt[field]) {
+          mismatches.push({
+            kind: 'certificate',
+            key: id,
+            field,
+            projected: projected[field],
+            replayed: rebuilt[field],
+          });
+        }
+      }
+    }
+    return mismatches;
   }
 
   /**
    * Verify an NFT achievement certificate on-chain.
    */
-  public async verifyNFTCertificate(certificateId: string): Promise<CertificateVerification> {
-    const cert = this.certificates.get(certificateId);
+  public async verifyNFTCertificate(
+    certificateId: string,
+    partition?: Partial<TrackingPartition> | null,
+  ): Promise<CertificateVerification> {
+    const cert = this.getPartition(partition).certificates.get(certificateId);
     if (!cert) {
       return {
         certificateId,

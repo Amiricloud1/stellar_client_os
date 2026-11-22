@@ -51,3 +51,65 @@ export const isStorageAvailable = (): boolean => {
     return false;
   }
 };
+
+/**
+ * Account-Scoped Storage Isolation & Wallet Disconnect Purge (Issues #164, #165, #171, #241)
+ *
+ * Prevents a subsequent connected account from rendering another account's cached state,
+ * credentials, or draft data, while safely preserving public campaign and platform caches.
+ */
+export const PUBLIC_CACHE_PREFIXES = [
+  'stellar_public_',
+  'stellar_campaign_list',
+  'stellar_metadata_',
+  'stellar_global_stats'
+];
+
+export const ACCOUNT_SCOPED_PREFIX = 'stellar_account:';
+
+export function getAccountScopedKey(accountAddress: string, key: string): string {
+  const normalized = accountAddress.trim().toUpperCase();
+  return `${ACCOUNT_SCOPED_PREFIX}${normalized}:${key}`;
+}
+
+export function isPublicCacheKey(key: string): boolean {
+  return PUBLIC_CACHE_PREFIXES.some(prefix => key.startsWith(prefix));
+}
+
+/**
+ * Purges account-scoped cache, tokens, and draft data upon wallet disconnect or account switch.
+ * If accountAddress is specified, only that account's scoped items are removed.
+ * If omitted, all private/user-scoped items are cleared while preserving public cache entries.
+ */
+export function purgeAccountScopedStorage(accountAddress?: string): void {
+  if (typeof window === 'undefined') return;
+
+  const targetPrefix = accountAddress
+    ? `${ACCOUNT_SCOPED_PREFIX}${accountAddress.trim().toUpperCase()}:`
+    : ACCOUNT_SCOPED_PREFIX;
+
+  const cleanStorage = (storage: Storage) => {
+    try {
+      const keysToRemove: string[] = [];
+      for (let i = 0; i < storage.length; i++) {
+        const key = storage.key(i);
+        if (!key) continue;
+
+        // Never wipe public caches
+        if (isPublicCacheKey(key)) continue;
+
+        if (key.startsWith(targetPrefix) || key.startsWith('stellar_wallet_') || key.startsWith('stellar_draft_')) {
+          keysToRemove.push(key);
+        }
+      }
+
+      keysToRemove.forEach(k => storage.removeItem(k));
+    } catch (err) {
+      console.warn('[SafeStorage] Error purging account storage:', err);
+    }
+  };
+
+  cleanStorage(window.localStorage);
+  cleanStorage(window.sessionStorage);
+}
+

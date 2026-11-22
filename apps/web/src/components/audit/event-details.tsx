@@ -1,106 +1,41 @@
 import type { AuditEvent } from "./event-timeline";
 
-export type EnvelopeRetentionClass = "full" | "compact" | "purged";
+export type TransactionLifecycleStage =
+  | "wallet_approval"
+  | "submitted"
+  | "ledger_confirmation"
+  | "settlement";
 
-export interface AuditEnvelopeLinkage {
-  envelopeId: string;
-  payloadHash: string;
-  retentionClass: EnvelopeRetentionClass;
-  privacyFlags: string[];
-  archivedSummaryUrl?: string;
+export interface TransactionLifecycleMetadata {
+  stage: TransactionLifecycleStage;
+  status: "pending" | "succeeded" | "failed";
+  source?: string;
+  retryable?: boolean;
+  failureReason?: string;
 }
-
-export type AuditEventWithEnvelope = AuditEvent & {
-  envelope?: AuditEnvelopeLinkage | null;
-};
 
 interface EventDetailsProps {
   event: AuditEventWithEnvelope;
   onClose: () => void;
+  lifecycle?: TransactionLifecycleMetadata;
+  onRetry?: (event: AuditEvent) => void;
+  onRecover?: (event: AuditEvent) => void;
 }
 
-function EnvelopeSection({ envelope }: { envelope?: AuditEnvelopeLinkage | null }) {
-  if (!envelope) {
-    return (
-      <div className="rounded-xl border border-amber-400/30 bg-amber-500/10 p-3">
-        <p className="text-xs uppercase tracking-wide text-amber-300">Raw envelope</p>
-        <p className="mt-1 text-amber-200">
-          Envelope unavailable. No raw envelope is linked to this event, so its integrity cannot be
-          verified from source.
-        </p>
-      </div>
-    );
-  }
+const STAGE_LABELS: Record<TransactionLifecycleStage, string> = {
+  wallet_approval: "Wallet approval",
+  submitted: "Submitted",
+  ledger_confirmation: "Ledger confirmation",
+  settlement: "Settlement",
+};
 
-  const isUnavailable = envelope.retentionClass === "purged";
-
-  return (
-    <div className="space-y-3 rounded-xl border border-white/10 bg-slate-900/60 p-3">
-      <div>
-        <p className="text-xs uppercase tracking-wide text-slate-400">Envelope id</p>
-        <p className="mt-1 break-all text-white">{envelope.envelopeId}</p>
-      </div>
-      <div>
-        <p className="text-xs uppercase tracking-wide text-slate-400">Payload hash</p>
-        <p className="mt-1 break-all font-mono text-xs text-white">{envelope.payloadHash}</p>
-      </div>
-      <div>
-        <p className="text-xs uppercase tracking-wide text-slate-400">Retention class</p>
-        <p className="mt-1 text-white">{envelope.retentionClass}</p>
-      </div>
-      <div>
-        <p className="text-xs uppercase tracking-wide text-slate-400">Privacy flags</p>
-        {envelope.privacyFlags.length > 0 ? (
-          <ul className="mt-1 flex flex-wrap gap-1">
-            {envelope.privacyFlags.map((flag) => (
-              <li
-                key={flag}
-                className="rounded-full border border-white/10 bg-slate-800 px-2 py-0.5 text-xs text-slate-200"
-              >
-                {flag}
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="mt-1 text-slate-400">None</p>
-        )}
-      </div>
-
-      {isUnavailable ? (
-        <div className="rounded-lg border border-amber-400/30 bg-amber-500/10 p-2">
-          <p className="text-xs font-semibold uppercase tracking-wide text-amber-300">
-            Envelope unavailable / expired
-          </p>
-          <p className="mt-1 text-amber-200">
-            The raw envelope has been purged or compacted under the retention policy. Integrity can
-            only be checked against the archived summary.
-          </p>
-          {envelope.archivedSummaryUrl ? (
-            <a
-              href={envelope.archivedSummaryUrl}
-              className="mt-2 inline-block text-xs text-sky-300 underline hover:text-sky-200"
-            >
-              View archived summary
-            </a>
-          ) : (
-            <p className="mt-2 text-xs text-amber-300">
-              No archived summary is available for this envelope.
-            </p>
-          )}
-        </div>
-      ) : envelope.retentionClass === "compact" && envelope.archivedSummaryUrl ? (
-        <a
-          href={envelope.archivedSummaryUrl}
-          className="inline-block text-xs text-sky-300 underline hover:text-sky-200"
-        >
-          View archived summary
-        </a>
-      ) : null}
-    </div>
-  );
-}
-
-export function EventDetails({ event, onClose }: EventDetailsProps) {
+export function EventDetails({
+  event,
+  onClose,
+  lifecycle,
+  onRetry,
+  onRecover,
+}: EventDetailsProps) {
   return (
     <aside className="rounded-2xl border border-white/10 bg-[#111827] p-4 text-sm text-slate-200">
       <div className="mb-4 flex items-center justify-between">
@@ -145,10 +80,62 @@ export function EventDetails({ event, onClose }: EventDetailsProps) {
             <p className="mt-1 break-all text-white">{event.txHash}</p>
           </div>
         ) : null}
-        <div>
-          <p className="mb-2 text-xs uppercase tracking-wide text-slate-400">Source envelope</p>
-          <EnvelopeSection envelope={event.envelope} />
-        </div>
+        {lifecycle ? (
+          <>
+            <div>
+              <p className="text-xs uppercase tracking-wide text-slate-400">Lifecycle stage</p>
+              <p className="mt-1 text-white">{STAGE_LABELS[lifecycle.stage]}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-wide text-slate-400">Status</p>
+              <p
+                className={
+                  lifecycle.status === "failed"
+                    ? "mt-1 text-rose-300"
+                    : lifecycle.status === "succeeded"
+                      ? "mt-1 text-emerald-300"
+                      : "mt-1 text-amber-300"
+                }
+              >
+                {lifecycle.status}
+              </p>
+            </div>
+            {lifecycle.source ? (
+              <div>
+                <p className="text-xs uppercase tracking-wide text-slate-400">Source</p>
+                <p className="mt-1 break-all text-white">{lifecycle.source}</p>
+              </div>
+            ) : null}
+            {lifecycle.failureReason ? (
+              <div>
+                <p className="text-xs uppercase tracking-wide text-slate-400">Failure reason</p>
+                <p className="mt-1 text-rose-300">{lifecycle.failureReason}</p>
+              </div>
+            ) : null}
+            {lifecycle.status === "failed" ? (
+              <div className="flex gap-2 pt-2">
+                {lifecycle.retryable && onRetry ? (
+                  <button
+                    type="button"
+                    onClick={() => onRetry(event)}
+                    className="rounded-lg border border-white/10 bg-slate-900 px-2 py-1 text-xs text-slate-200 hover:bg-slate-800"
+                  >
+                    Retry
+                  </button>
+                ) : null}
+                {onRecover ? (
+                  <button
+                    type="button"
+                    onClick={() => onRecover(event)}
+                    className="rounded-lg border border-white/10 bg-slate-900 px-2 py-1 text-xs text-slate-200 hover:bg-slate-800"
+                  >
+                    Recover
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
+          </>
+        ) : null}
       </div>
     </aside>
   );

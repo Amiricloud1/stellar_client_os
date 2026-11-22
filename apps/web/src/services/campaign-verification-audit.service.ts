@@ -13,14 +13,108 @@ export interface VerificationAuditServiceOptions {
   pushService?: CampaignPushNotificationService;
 }
 
+export type ReviewerCommentResolutionStatus = 'open' | 'resolved';
+
+export interface ReviewerComment {
+  id: string;
+  campaignId: string;
+  evidenceId: string;
+  /** Immutable snapshot of the evidence version the comment was written against. */
+  evidenceVersion: number;
+  author: string;
+  body: string;
+  createdAt: string;
+  updatedAt: string;
+  resolutionStatus: ReviewerCommentResolutionStatus;
+  resolvedBy?: string;
+  resolvedAt?: string;
+  resolutionNote?: string;
+  /** Client-supplied idempotency key, unique per campaign. */
+  idempotencyKey?: string;
+}
+
+export interface ReviewerCommentActor {
+  id: string;
+  role: 'reviewer' | 'admin' | 'submitter' | 'viewer';
+}
+
+export interface EvidenceVersionSnapshot {
+  evidenceId: string;
+  campaignId: string;
+  version: number;
+  /** Reviewers explicitly assigned to this evidence version. */
+  assignedReviewerIds: string[];
+}
+
+export interface CreateReviewerCommentInput {
+  campaignId: string;
+  evidenceId: string;
+  /** Version the reviewer observed; must match the current evidence version. */
+  evidenceVersion: number;
+  body: string;
+  actor: ReviewerCommentActor;
+  idempotencyKey?: string;
+}
+
+export interface ResolveReviewerCommentInput {
+  campaignId: string;
+  commentId: string;
+  actor: ReviewerCommentActor;
+  resolutionNote?: string;
+  idempotencyKey?: string;
+}
+
+export class ReviewerCommentAuthorizationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ReviewerCommentAuthorizationError';
+  }
+}
+
+export class ReviewerCommentConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ReviewerCommentConflictError';
+  }
+}
+
+export class ReviewerCommentValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ReviewerCommentValidationError';
+  }
+}
+
+export class ReviewerCommentNotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ReviewerCommentNotFoundError';
+  }
+}
+
+export interface ReviewerCommentServiceOptions extends VerificationAuditServiceOptions {
+  /**
+   * Resolves the current evidence version snapshot. In production this is
+   * backed by the evidence store; tests can inject a deterministic resolver.
+   */
+  resolveEvidence?: (
+    campaignId: string,
+    evidenceId: string
+  ) => Promise<EvidenceVersionSnapshot | null>;
+}
+
 export class CampaignVerificationAuditService {
   private readonly auditPath: string;
+  private readonly commentsPath: string;
   private readonly pushService?: CampaignPushNotificationService;
+  private readonly resolveEvidence?: ReviewerCommentServiceOptions['resolveEvidence'];
 
-  constructor(options: VerificationAuditServiceOptions = {}) {
+  constructor(options: ReviewerCommentServiceOptions = {}) {
     const dataDir = options.dataDir ?? path.join(process.cwd(), 'data');
     this.auditPath = path.join(dataDir, 'campaign_verification_audit.json');
+    this.commentsPath = path.join(dataDir, 'campaign_reviewer_comments.json');
     this.pushService = options.pushService;
+    this.resolveEvidence = options.resolveEvidence;
   }
 
   private async writeJsonAtomic(filePath: string, data: unknown): Promise<void> {
@@ -206,6 +300,161 @@ export class CampaignVerificationAuditService {
       details: reason,
       txHash,
     });
+  }
+
+  private async getAllReviewerComments(): Promise<Record<string, ReviewerComment[]>> {
+    try {
+      const data = await fs.readFile(this.commentsPath, 'utf-8');
+      return JSON.parse(data) as Record<string, ReviewerComment[]>;
+    } catch (err: unknown) {
+      if ((err as { code?: string }).code === 'ENOENT') return {};
+      throw err;
+    }
+  }
+
+  private async loadEvidenceSnapshot(
+    campaignId: string,
+    evidenceId: string
+  ): Promise<EvidenceVersionSnapshot | null> {
+    if (!this.resolveEvidence) {
+      throw new ReviewerCommentValidationError(
+        'Evidence resolver is not configured; cannot validate evidence version'
+      );
+    }
+    return this.resolveEvidence(campaignId, evidenceId);
+  }
+
+  private assertCanComment(
+    snapshot: EvidenceVersionSnapshot,
+    actor: ReviewerCommentActor
+  ): void {
+    if (actor.role === 'admin') return;
+    if (actor.role !== 'reviewer') {
+      throw new ReviewerCommentAuthorizationError(
+        'Only assigned reviewers or admins may comment on evidence'
+      );
+    }
+    if (!snapshot.assignedReviewerIds.includes(actor.id)) {
+      throw new ReviewerCommentAuthorizationError(
+        'Reviewer is not assigned to this evidence version'
+      );
+    }
+  }
+
+  async listReviewerComments(
+    campaignId: string,
+    evidenceId?: string
+  ): Promise<ReviewerComment[]> {
+    const all = await this.getAllReviewerComments();
+    const comments = all[campaignId] ?? [];
+    return evidenceId ? comments.filter((c) => c.evidenceId === evidenceId) : comments;
+  }
+
+  /**
+   * Creates a reviewer comment pinned to an immutable evidence version.
+   *
+   * Authorization: only reviewers assigned to the evidence version or admins.
+   * Correctness: the supplied `evidenceVersion` must match the current evidence
+   * version, otherwise a `ReviewerCommentConflictError` is raised so the
+   * reviewer can refresh before commenting.
+   * Idempotency: when `idempotencyKey` is supplied, retries return the
+   * previously created comment instead of duplicating it.
+   */
+  async createReviewerComment(input: CreateReviewerCommentInput): Promise<ReviewerComment> {
+    const { campaignId, evidenceId, evidenceVersion, body, actor, idempotencyKey } = input;
+    if (!campaignId || !evidenceId || !actor?.id) {
+      throw new ReviewerCommentValidationError(
+        'campaignId, evidenceId, and actor are required'
+      );
+    }
+    if (!body || !body.trim()) {
+      throw new ReviewerCommentValidationError('Comment body must not be empty');
+    }
+    if (!Number.isInteger(evidenceVersion) || evidenceVersion < 1) {
+      throw new ReviewerCommentValidationError('evidenceVersion must be a positive integer');
+    }
+
+    const snapshot = await this.loadEvidenceSnapshot(campaignId, evidenceId);
+    if (!snapshot || snapshot.campaignId !== campaignId) {
+      throw new ReviewerCommentNotFoundError('Evidence not found for this campaign');
+    }
+
+    this.assertCanComment(snapshot, actor);
+
+    if (snapshot.version !== evidenceVersion) {
+      throw new ReviewerCommentConflictError(
+        `Stale evidence version: expected ${snapshot.version}, received ${evidenceVersion}`
+      );
+    }
+
+    const all = await this.getAllReviewerComments();
+    const existing = all[campaignId] ?? [];
+
+    if (idempotencyKey) {
+      const replay = existing.find((c) => c.idempotencyKey === idempotencyKey);
+      if (replay) return replay;
+    }
+
+    const now = new Date().toISOString();
+    const comment: ReviewerComment = {
+      id: randomUUID(),
+      campaignId,
+      evidenceId,
+      evidenceVersion,
+      author: actor.id,
+      body: body.trim(),
+      createdAt: now,
+      updatedAt: now,
+      resolutionStatus: 'open',
+      idempotencyKey,
+    };
+
+    existing.push(comment);
+    all[campaignId] = existing;
+    await this.writeJsonAtomic(this.commentsPath, all);
+
+    return comment;
+  }
+
+  /**
+   * Marks a reviewer comment as resolved. Only the original author or an admin
+   * may resolve. Idempotent: resolving an already-resolved comment returns the
+   * existing record unchanged.
+   */
+  async resolveReviewerComment(input: ResolveReviewerCommentInput): Promise<ReviewerComment> {
+    const { campaignId, commentId, actor, resolutionNote } = input;
+    if (!campaignId || !commentId || !actor?.id) {
+      throw new ReviewerCommentValidationError(
+        'campaignId, commentId, and actor are required'
+      );
+    }
+
+    const all = await this.getAllReviewerComments();
+    const comments = all[campaignId] ?? [];
+    const comment = comments.find((c) => c.id === commentId);
+    if (!comment) {
+      throw new ReviewerCommentNotFoundError('Reviewer comment not found');
+    }
+
+    if (actor.role !== 'admin' && actor.id !== comment.author) {
+      throw new ReviewerCommentAuthorizationError(
+        'Only the comment author or an admin may resolve this comment'
+      );
+    }
+
+    if (comment.resolutionStatus === 'resolved') {
+      return comment;
+    }
+
+    const now = new Date().toISOString();
+    comment.resolutionStatus = 'resolved';
+    comment.resolvedBy = actor.id;
+    comment.resolvedAt = now;
+    comment.resolutionNote = resolutionNote;
+    comment.updatedAt = now;
+
+    await this.writeJsonAtomic(this.commentsPath, all);
+    return comment;
   }
 }
 ﻿import { createHash } from "node:crypto";

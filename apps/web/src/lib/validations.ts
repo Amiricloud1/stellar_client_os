@@ -10,7 +10,25 @@ import {
   streamIdSchema,
   paginationQuerySchema,
   streamStatusSchema,
+  sponsorPortfolioQuerySchema,
+  transactionTimelineQuerySchema,
+  transactionTimelineStageSchema,
+  transactionTimelineStatusSchema,
+  transactionTimelineEventSchema,
+  transactionTimelineSchema,
 } from './api-schemas'
+import {
+  requestBudgetSchema,
+  collectionBudgetSchema,
+  filterBudgetSchema,
+  requestBodyBudgetSchema,
+  REQUEST_BUDGET_LIMITS,
+  RequestBudgetError,
+  assertRequestBudget,
+  assertCollectionBudget,
+  assertFilterBudget,
+  assertRequestBodyBudget,
+} from './api-policy'
 
 // Re-export the shared API schemas so form and API validation share a single
 // source of truth (issue #55). Consumers should prefer importing from here.
@@ -22,11 +40,47 @@ export {
   streamIdSchema,
   paginationQuerySchema,
   streamStatusSchema,
+  sponsorPortfolioQuerySchema,
+  transactionTimelineQuerySchema,
+  transactionTimelineStageSchema,
+  transactionTimelineStatusSchema,
+  transactionTimelineEventSchema,
+  transactionTimelineSchema,
 }
 export type {
   PaginationQuery,
   StreamStatus,
+  SponsorPortfolioQuery,
+  TransactionTimelineQuery,
+  TransactionTimelineStage,
+  TransactionTimelineStatus,
+  TransactionTimelineEvent,
+  TransactionTimeline,
 } from './api-schemas'
+
+// Re-export the request/collection/filter budget schemas and helpers so that
+// client and form validation apply exactly the same limits as the API. The
+// authoritative enforcement (rejecting oversized bodies, nested lists, and
+// filters before any application or database work) lives in `api-policy.ts`;
+// import from there for server-side guards.
+export {
+  requestBudgetSchema,
+  collectionBudgetSchema,
+  filterBudgetSchema,
+  requestBodyBudgetSchema,
+  REQUEST_BUDGET_LIMITS,
+  RequestBudgetError,
+  assertRequestBudget,
+  assertCollectionBudget,
+  assertFilterBudget,
+  assertRequestBodyBudget,
+}
+export type {
+  RequestBudget,
+  CollectionBudget,
+  FilterBudget,
+  RequestBodyBudget,
+} from './api-policy'
 
 // Stream record type for display
 export interface StreamRecord {
@@ -88,6 +142,32 @@ export const cloneCampaignSchema = paymentStreamSchema.extend({
 }).strict()
 
 export type CloneCampaignFormData = z.infer<typeof cloneCampaignSchema>
+
+/**
+ * Pre-launch readiness checklist tests (issue #179).
+ *
+ * These are colocated with the schema so the launch form and the deploy API
+ * exercise the exact same rules.
+ */
+export const campaignReadinessTestFixtures = {
+  valid: {
+    name: "Reforest the Delta",
+    description: "Planting native mangroves across the river delta.",
+    network: "testnet" as const,
+    token: "native",
+    goalAmount: "1000",
+    milestones: [
+      { order: 1, title: "Site survey", amount: "400" },
+      { order: 2, title: "Planting", amount: "600" },
+    ],
+    payoutTerms: {
+      schedule: "milestone" as const,
+      recipientAddress: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+      feeBps: 100,
+      accepted: true as const,
+    },
+  },
+}
 
 export const insuranceClaimSchema = z.object({
   changedBy: z.string().min(1, "changedBy is required"),
@@ -175,6 +255,201 @@ export const updateCampaignSchema = z.object({
 }).strict()
 
 export type UpdateCampaignFormData = z.infer<typeof updateCampaignSchema>
+
+/**
+ * Pre-launch readiness checklist (issue #179).
+ *
+ * Before a campaign is deployed the creator must supply complete metadata, a
+ * supported network, an asset the escrow can actually hold, an ordered set of
+ * milestones that sum to the goal, and explicit payout terms. The schema below
+ * is the single source of truth shared by the launch form and the deploy API
+ * so an incomplete campaign can never reach the contract.
+ */
+
+/** Networks the app can deploy campaigns to. */
+export const SUPPORTED_NETWORKS = ["testnet", "mainnet", "futurenet"] as const
+
+export type SupportedNetwork = (typeof SUPPORTED_NETWORKS)[number]
+
+/** Payout schedules the escrow contract understands. */
+export const PAYOUT_SCHEDULES = ["immediate", "milestone", "linear"] as const
+
+export type PayoutSchedule = (typeof PAYOUT_SCHEDULES)[number]
+
+/** Minimum number of milestones a campaign must declare. */
+export const MIN_CAMPAIGN_MILESTONES = 1
+
+/** Maximum number of milestones a campaign may declare. */
+export const MAX_CAMPAIGN_MILESTONES = 50
+
+/** Minimum length for the campaign title. */
+export const CAMPAIGN_NAME_MIN_LENGTH = 3
+
+/** Maximum length for the campaign title. */
+export const CAMPAIGN_NAME_MAX_LENGTH = 120
+
+/** Maximum length for the campaign description. */
+export const CAMPAIGN_DESCRIPTION_MAX_LENGTH = 5000
+
+/** Maximum length for a single milestone title. */
+export const MILESTONE_TITLE_MAX_LENGTH = 120
+
+/** Maximum length for a single milestone description. */
+export const MILESTONE_DESCRIPTION_MAX_LENGTH = 2000
+
+/**
+ * A milestone as declared at launch. `order` is 1-based and must be strictly
+ * increasing across the list so the contract can release funds in sequence.
+ */
+export const campaignMilestoneSchema = z
+  .object({
+    order: z
+      .number({ invalid_type_error: "Milestone order must be a number" })
+      .int("Milestone order must be an integer")
+      .min(1, "Milestone order starts at 1")
+      .max(MAX_CAMPAIGN_MILESTONES, `Milestone order cannot exceed ${MAX_CAMPAIGN_MILESTONES}`),
+    title: z
+      .string()
+      .trim()
+      .min(1, "Milestone title is required")
+      .max(MILESTONE_TITLE_MAX_LENGTH, `Milestone title cannot exceed ${MILESTONE_TITLE_MAX_LENGTH} characters`),
+    description: z
+      .string()
+      .trim()
+      .max(
+        MILESTONE_DESCRIPTION_MAX_LENGTH,
+        `Milestone description cannot exceed ${MILESTONE_DESCRIPTION_MAX_LENGTH} characters`,
+      )
+      .optional(),
+    amount: tokenAmountSchema,
+  })
+  .strict()
+
+export type CampaignMilestoneInput = z.infer<typeof campaignMilestoneSchema>
+
+/** Payout terms the creator must accept before deployment. */
+export const campaignPayoutTermsSchema = z
+  .object({
+    schedule: z.enum(PAYOUT_SCHEDULES, {
+      errorMap: () => ({ message: "Unsupported payout schedule" }),
+    }),
+    recipientAddress: stellarAddressSchema,
+    /** Platform fee in basis points (0–1000 = 0%–10%). */
+    feeBps: z
+      .number({ invalid_type_error: "Fee must be a number" })
+      .int("Fee must be an integer number of basis points")
+      .min(0, "Fee cannot be negative")
+      .max(1000, "Fee cannot exceed 1000 basis points"),
+    /** Creator must explicitly accept the terms before launch. */
+    accepted: z.literal(true, {
+      errorMap: () => ({ message: "Payout terms must be accepted before launch" }),
+    }),
+  })
+  .strict()
+
+export type CampaignPayoutTerms = z.infer<typeof campaignPayoutTermsSchema>
+
+/**
+ * Full readiness payload. Every field is required: a campaign that omits any
+ * of them is not launchable and the API must reject it with field-level errors.
+ */
+export const campaignReadinessSchema = z
+  .object({
+    name: z
+      .string()
+      .trim()
+      .min(CAMPAIGN_NAME_MIN_LENGTH, `Campaign name must be at least ${CAMPAIGN_NAME_MIN_LENGTH} characters`)
+      .max(CAMPAIGN_NAME_MAX_LENGTH, `Campaign name cannot exceed ${CAMPAIGN_NAME_MAX_LENGTH} characters`),
+    description: z
+      .string()
+      .trim()
+      .min(1, "Description is required")
+      .max(
+        CAMPAIGN_DESCRIPTION_MAX_LENGTH,
+        `Description cannot exceed ${CAMPAIGN_DESCRIPTION_MAX_LENGTH} characters`,
+      ),
+    network: z.enum(SUPPORTED_NETWORKS, {
+      errorMap: () => ({ message: "Unsupported network" }),
+    }),
+    token: z
+      .string()
+      .min(1, "Token selection is required")
+      .refine(
+        (val) => val === "native" || validateContractId(val),
+        "Invalid token: must be 'native' or a valid Stellar contract ID",
+      )
+      .refine(
+        (val) =>
+          CONFIGURED_ESCROW_TOKENS.some(
+            (configured) => configured.value === val || configured.address === val,
+          ),
+        "Token is not supported by the escrow contract",
+      ),
+    goalAmount: tokenAmountSchema,
+    milestones: z
+      .array(campaignMilestoneSchema)
+      .min(MIN_CAMPAIGN_MILESTONES, `At least ${MIN_CAMPAIGN_MILESTONES} milestone is required`)
+      .max(MAX_CAMPAIGN_MILESTONES, `Cannot declare more than ${MAX_CAMPAIGN_MILESTONES} milestones`),
+    payoutTerms: campaignPayoutTermsSchema,
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    // Milestone ordering: `order` must be 1..n with no gaps or duplicates.
+    value.milestones.forEach((milestone, index) => {
+      if (milestone.order !== index + 1) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["milestones", index, "order"],
+          message: `Milestone order must be ${index + 1} (sequential, no gaps or duplicates)`,
+        })
+      }
+    })
+
+    // Milestone amounts must sum exactly to the campaign goal.
+    const sum = value.milestones.reduce((acc, milestone) => {
+      const parsed = Number(milestone.amount)
+      return Number.isFinite(parsed) ? acc + parsed : acc
+    }, 0)
+    const goal = Number(value.goalAmount)
+    if (Number.isFinite(goal) && Math.abs(sum - goal) > 1e-7) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["milestones"],
+        message: "Milestone amounts must sum to the campaign goal",
+      })
+    }
+  })
+
+export type CampaignReadinessInput = z.infer<typeof campaignReadinessSchema>
+
+/** A single readiness failure surfaced to the creator/operator. */
+export interface CampaignReadinessIssue {
+  path: string
+  message: string
+}
+
+/** Result of evaluating a campaign against the readiness checklist. */
+export interface CampaignReadinessResult {
+  ready: boolean
+  issues: CampaignReadinessIssue[]
+}
+
+/**
+ * Evaluate a campaign payload against the readiness checklist without throwing.
+ * Returns every failure so the UI can render a complete checklist rather than
+ * stopping at the first error.
+ */
+export function checkCampaignReadiness(input: unknown): CampaignReadinessResult {
+  const parsed = campaignReadinessSchema.safeParse(input)
+  if (parsed.success) return { ready: true, issues: [] }
+  return {
+    ready: false,
+    issues: parsed.error.issues.map((issue) => ({
+      path: issue.path.join("."),
+      message: issue.message,
+    })),
+  }
+}
 
 /**
  * Upload presign validation (issue #62).
@@ -286,4 +561,77 @@ export function buildUploadObjectKey(
   parts.push(input.fileName)
   return parts.join("/")
 }
+
+/**
+ * Shared Campaign Form & Cross-Field Validation Schema (Issues #163, #240, #242, #253)
+ * Keeps immediate client feedback synchronized with authoritative server-side rules.
+ */
+export const campaignFormValidationSchema = z
+  .object({
+    title: z.string().trim().min(3, "Title must be at least 3 characters").max(100, "Title cannot exceed 100 characters"),
+    description: z.string().trim().min(10, "Description must be at least 10 characters").max(2000, "Description cannot exceed 2000 characters"),
+    targetAmount: tokenAmountSchema,
+    minTarget: tokenAmountSchema,
+    costPerTree: z.number().positive("Cost per tree must be greater than zero"),
+    targetTrees: z.number().int().positive("Target trees count must be positive"),
+    startTime: z.number().int().positive("Start time must be a valid timestamp"),
+    deadline: z.number().int().positive("Deadline must be a valid timestamp"),
+    treeType: z.string().min(1, "Tree type is required"),
+    region: z.string().min(1, "Region is required"),
+  })
+  .refine(
+    (data) => {
+      const target = parseFloat(data.targetAmount);
+      const min = parseFloat(data.minTarget);
+      return !isNaN(target) && !isNaN(min) && min <= target;
+    },
+    {
+      message: "Minimum target cannot exceed total campaign target amount",
+      path: ["minTarget"],
+    }
+  )
+  .refine(
+    (data) => data.deadline > data.startTime,
+    {
+      message: "Campaign deadline must be later than start time",
+      path: ["deadline"],
+    }
+  )
+  .refine(
+    (data) => {
+      const target = parseFloat(data.targetAmount);
+      return !isNaN(target) && (data.costPerTree * data.targetTrees) <= target;
+    },
+    {
+      message: "Target trees multiplied by cost per tree cannot exceed total target amount",
+      path: ["targetTrees"],
+    }
+  );
+
+export type CampaignFormValues = z.infer<typeof campaignFormValidationSchema>;
+
+/**
+ * Validates campaign form fields for real-time client feedback using the identical
+ * authoritative server-side cross-field validation rules.
+ */
+export function validateCampaignFormRealtime(values: unknown): {
+  valid: boolean;
+  errors: Record<string, string>;
+} {
+  const result = campaignFormValidationSchema.safeParse(values);
+  if (result.success) {
+    return { valid: true, errors: {} };
+  }
+
+  const errors: Record<string, string> = {};
+  for (const issue of result.error.issues) {
+    const key = issue.path[0] ? String(issue.path[0]) : "form";
+    if (!errors[key]) {
+      errors[key] = issue.message;
+    }
+  }
+
+  return { valid: false, errors };
+}
+
 

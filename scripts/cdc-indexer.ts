@@ -11,29 +11,23 @@
  * This is a Change Data Capture (CDC) pattern:
  *   1. Poll the Stellar Soroban RPC `getEvents` endpoint on each tick.
  *   2. Parse raw XDR event data into typed `StreamEvent` records.
- *   3. Persist a minimal, integrity-checkable raw envelope per source event
- *      (`raw_event_envelopes`) and link derived rows to it via `envelope_id`.
- *   4. Write new events to `stream_events` table via an UPSERT
+ *   3. Write new events to `stream_events` table via an UPSERT
  *      (idempotent on `event_id`).
- *   5. Persist the latest processed ledger sequence in `cdc_cursors`
+ *   4. Persist the latest processed ledger sequence in `cdc_cursors`
  *      so restarts resume from the correct position without gaps or
  *      duplicate processing.
  *
- * # Auditability & retention (issues #223 / #224)
+ * # Partitioning (issue #217)
  *
- *   - `raw_event_envelopes` retains a *minimal* raw envelope per event:
- *     the event id, contract, ledger, tx hash, topic XDR, value XDR and a
- *     SHA-256 digest over the canonical envelope payload. The digest lets
- *     auditors verify that a derived `stream_events` row was produced from
- *     an unmodified source event.
- *   - `archived_event_summaries` compacts high-volume raw events older than
- *     the retention window into per-(contract, time-range) summaries while
- *     preserving the agreed history queries. Compaction is idempotent and
- *     safe to retry.
- *   - `queryEventHistory` routes reads to the archive when raw rows have
- *     been compacted, so audit queries keep working.
- *   - `reconstructEventDetail` rebuilds full detail from archives plus
- *     retained envelopes (the tested reconstruction path).
+ * Ingestion is partitioned by `(network, deploymentId)`. Each partition has
+ * its own cursor, backfill job state, and health record, and runs in its own
+ * independent loop. A stalled or failing partition therefore cannot block
+ * ingestion for any other deployment: errors are isolated per partition and
+ * surfaced explicitly as `healthy` / `degraded` / `stalled` states.
+ *
+ * Partition identity is `"<network>:<deploymentId>"`. The legacy single
+ * `INDEXER_ID` cursor is migrated into the partition for the configured
+ * network + deployment on first start (see `migrateLegacyCursor`).
  *
  * # Table schemas
  *
@@ -41,7 +35,6 @@
  * CREATE TABLE IF NOT EXISTS stream_events (
  *   id              BIGSERIAL PRIMARY KEY,
  *   event_id        TEXT        NOT NULL UNIQUE,   -- <ledger>-<tx_index>-<event_index>
- *   envelope_id     TEXT,                          -- FK -> raw_event_envelopes.event_id
  *   contract_id     TEXT        NOT NULL,
  *   event_type      TEXT        NOT NULL,          -- stream_created|updated|cancelled|completed
  *   ledger_sequence BIGINT      NOT NULL,
@@ -56,37 +49,33 @@
  *   indexed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
  * );
  *
- * CREATE TABLE IF NOT EXISTS raw_event_envelopes (
- *   event_id         TEXT        PRIMARY KEY,
- *   contract_id      TEXT        NOT NULL,
- *   ledger_sequence  BIGINT      NOT NULL,
- *   ledger_timestamp TIMESTAMPTZ NOT NULL,
- *   tx_hash          TEXT        NOT NULL,
- *   topic_xdr        JSONB       NOT NULL DEFAULT '[]'::jsonb,
- *   value_xdr        TEXT        NOT NULL,
- *   digest           TEXT        NOT NULL,          -- sha256 of canonical payload
- *   compacted        BOOLEAN     NOT NULL DEFAULT FALSE,
- *   archived_at      TIMESTAMPTZ,
- *   created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
- * );
- *
- * CREATE TABLE IF NOT EXISTS archived_event_summaries (
- *   id              BIGSERIAL PRIMARY KEY,
- *   contract_id     TEXT        NOT NULL,
- *   range_start     TIMESTAMPTZ NOT NULL,
- *   range_end       TIMESTAMPTZ NOT NULL,
- *   event_count     BIGINT      NOT NULL,
- *   event_type_counts JSONB     NOT NULL,
- *   first_ledger    BIGINT      NOT NULL,
- *   last_ledger     BIGINT      NOT NULL,
- *   digest          TEXT        NOT NULL,           -- sha256 over member digests
- *   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
- *   UNIQUE (contract_id, range_start, range_end)
- * );
- *
  * CREATE TABLE IF NOT EXISTS cdc_cursors (
- *   indexer_id      TEXT        PRIMARY KEY,
+ *   indexer_id      TEXT        PRIMARY KEY,       -- "<network>:<deploymentId>"
  *   last_ledger     BIGINT      NOT NULL,
+ *   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ * );
+ *
+ * CREATE TABLE IF NOT EXISTS cdc_backfill_jobs (
+ *   partition_id    TEXT        NOT NULL,
+ *   job_id          TEXT        NOT NULL,
+ *   from_ledger     BIGINT      NOT NULL,
+ *   to_ledger       BIGINT      NOT NULL,
+ *   next_ledger     BIGINT      NOT NULL,
+ *   status          TEXT        NOT NULL,          -- pending|running|completed|failed
+ *   attempts        INTEGER     NOT NULL DEFAULT 0,
+ *   last_error      TEXT,
+ *   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ *   PRIMARY KEY (partition_id, job_id)
+ * );
+ *
+ * CREATE TABLE IF NOT EXISTS cdc_partition_health (
+ *   partition_id    TEXT        PRIMARY KEY,
+ *   network         TEXT        NOT NULL,
+ *   deployment_id   TEXT        NOT NULL,
+ *   state           TEXT        NOT NULL,          -- healthy|degraded|stalled
+ *   last_success_at TIMESTAMPTZ,
+ *   last_error      TEXT,
+ *   consecutive_failures INTEGER NOT NULL DEFAULT 0,
  *   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
  * );
  * ```
@@ -99,14 +88,14 @@
  * | CONTRACT_IDS          | ✓        | —                                        | Comma-separated Soroban contract IDs |
  * | STELLAR_RPC_URL       | ✗        | https://soroban-testnet.stellar.org      | Soroban RPC endpoint |
  * | NETWORK_PASSPHRASE    | ✗        | Test SDF Network ; September 2015        | Stellar network passphrase |
+ * | NETWORK               | ✗        | derived from passphrase                  | Network label used for partitioning |
+ * | DEPLOYMENT_ID         | ✗        | default                                  | Deployment identifier used for partitioning |
  * | POLL_INTERVAL_SECONDS | ✗        | 5                                        | Seconds between event polls |
  * | LEDGER_LOOKBACK       | ✗        | 1000                                     | Ledgers to look back on first start |
  * | MAX_EVENTS_PER_POLL   | ✗        | 200                                      | Max events fetched per poll cycle |
- * | INDEXER_ID            | ✗        | fundable_stream_indexer                  | Unique ID for the cursor row |
+ * | INDEXER_ID            | ✗        | fundable_stream_indexer                  | Legacy cursor ID (migrated into partition) |
  * | DRY_RUN               | ✗        | false                                    | Parse events but skip DB writes |
- * | RETENTION_DAYS        | ✗        | 30                                       | Raw events older than this are compacted |
- * | COMPACTION_RANGE_HOURS| ✗        | 24                                       | Width of each archived summary bucket |
- * | COMPACTION_INTERVAL_SECONDS | ✗  | 3600                                     | Seconds between compaction runs |
+ * | STALL_THRESHOLD_SECONDS | ✗      | 120                                      | Age of last success before a partition is `stalled` |
  *
  * # Running
  *
@@ -114,7 +103,6 @@
  */
 
 import { Pool, type PoolClient } from "pg";
-import { createHash } from "crypto";
 import {
   Networks,
   xdr,
@@ -154,39 +142,6 @@ export interface StreamEvent {
   streamId: string | null;
   /** Raw XDR of the event value */
   rawXdr: string;
-  /** Envelope id linking this derived row to its source envelope */
-  envelopeId: string | null;
-}
-
-/**
- * Minimal, integrity-checkable raw envelope retained for auditability.
- * Only the fields required to verify and reconstruct a derived event are kept.
- */
-export interface RawEventEnvelope {
-  eventId: string;
-  contractId: string;
-  ledgerSequence: number;
-  /** ISO 8601 timestamp */
-  ledgerTimestamp: string;
-  txHash: string;
-  /** Base64 XDR of each topic ScVal */
-  topicXdr: string[];
-  /** Base64 XDR of the event value ScVal */
-  valueXdr: string;
-  /** SHA-256 digest over the canonical envelope payload */
-  digest: string;
-}
-
-export interface ArchivedEventSummary {
-  id: number;
-  contractId: string;
-  rangeStart: string;
-  rangeEnd: string;
-  eventCount: number;
-  eventTypeCounts: Record<string, number>;
-  firstLedger: number;
-  lastLedger: number;
-  digest: string;
 }
 
 export interface CdcCursor {
@@ -195,22 +150,60 @@ export interface CdcCursor {
   updatedAt: string;
 }
 
+/**
+ * A partition of the indexer: one network + one deployment. Each partition
+ * owns its cursor, backfill jobs, and health record.
+ */
+export interface Partition {
+  /** Stable partition key: "<network>:<deploymentId>" */
+  id: string;
+  network: string;
+  deploymentId: string;
+  contractIds: string[];
+  rpcUrl: string;
+  networkPassphrase: string;
+}
+
+export type PartitionState = "healthy" | "degraded" | "stalled";
+
+export interface PartitionHealth {
+  partitionId: string;
+  network: string;
+  deploymentId: string;
+  state: PartitionState;
+  lastSuccessAt: string | null;
+  lastError: string | null;
+  consecutiveFailures: number;
+  updatedAt: string;
+}
+
+export type BackfillStatus = "pending" | "running" | "completed" | "failed";
+
+export interface BackfillJob {
+  partitionId: string;
+  jobId: string;
+  fromLedger: number;
+  toLedger: number;
+  nextLedger: number;
+  status: BackfillStatus;
+  attempts: number;
+  lastError: string | null;
+  updatedAt: string;
+}
+
 export interface IndexerConfig {
   databaseUrl: string;
   contractIds: string[];
   rpcUrl: string;
   networkPassphrase: string;
+  network: string;
+  deploymentId: string;
   pollIntervalSeconds: number;
   ledgerLookback: number;
   maxEventsPerPoll: number;
   indexerId: string;
   dryRun: boolean;
-  /** Raw events older than this many days are eligible for compaction. */
-  retentionDays: number;
-  /** Width in hours of each archived summary bucket. */
-  compactionRangeHours: number;
-  /** Seconds between compaction runs. */
-  compactionIntervalSeconds: number;
+  stallThresholdSeconds: number;
 }
 
 export type LogLevel = "info" | "warn" | "error" | "debug";
@@ -230,9 +223,8 @@ export class IndexerError extends Error {
       | "DB_ERROR"
       | "RPC_ERROR"
       | "PARSE_ERROR"
-      | "AUTH_ERROR"
-      | "COMPACTION_ERROR"
-      | "RECONSTRUCTION_ERROR"
+      | "UNKNOWN_DEPLOYMENT"
+      | "UNAUTHORIZED"
   ) {
     super(message);
     this.name = "IndexerError";
@@ -256,6 +248,22 @@ export function log(
   };
   const out = level === "error" || level === "warn" ? process.stderr : process.stdout;
   out.write(JSON.stringify(entry) + "\n");
+}
+
+// ── Partition helpers ─────────────────────────────────────────────────────────
+
+/** Build the stable partition key for a network + deployment pair. */
+export function partitionId(network: string, deploymentId: string): string {
+  return `${network}:${deploymentId}`;
+}
+
+/** Derive a human-readable network label from a passphrase. */
+export function deriveNetworkLabel(passphrase: string): string {
+  if (passphrase === Networks.PUBLIC) return "public";
+  if (passphrase === Networks.TESTNET) return "testnet";
+  if (passphrase === Networks.FUTURENET) return "futurenet";
+  if (passphrase === Networks.SANDBOX) return "sandbox";
+  return "custom";
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -292,19 +300,42 @@ export function loadConfig(): IndexerConfig {
     }
   }
 
+  const networkPassphrase = process.env.NETWORK_PASSPHRASE ?? Networks.TESTNET;
+  const network = process.env.NETWORK ?? deriveNetworkLabel(networkPassphrase);
+  const deploymentId = process.env.DEPLOYMENT_ID ?? "default";
+
+  if (!network.trim()) {
+    throw new IndexerError("NETWORK must not be empty", "CONFIG_ERROR");
+  }
+  if (!deploymentId.trim()) {
+    throw new IndexerError("DEPLOYMENT_ID must not be empty", "CONFIG_ERROR");
+  }
+
   return {
     databaseUrl,
     contractIds,
     rpcUrl: process.env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org",
-    networkPassphrase: process.env.NETWORK_PASSPHRASE ?? Networks.TESTNET,
+    networkPassphrase,
+    network,
+    deploymentId,
     pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 5),
     ledgerLookback: Number(process.env.LEDGER_LOOKBACK ?? 1_000),
     maxEventsPerPoll: Number(process.env.MAX_EVENTS_PER_POLL ?? 200),
     indexerId: process.env.INDEXER_ID ?? "fundable_stream_indexer",
     dryRun: process.env.DRY_RUN === "true",
-    retentionDays: Number(process.env.RETENTION_DAYS ?? 30),
-    compactionRangeHours: Number(process.env.COMPACTION_RANGE_HOURS ?? 24),
-    compactionIntervalSeconds: Number(process.env.COMPACTION_INTERVAL_SECONDS ?? 3_600),
+    stallThresholdSeconds: Number(process.env.STALL_THRESHOLD_SECONDS ?? 120),
+  };
+}
+
+/** Build the partition descriptor for the configured network + deployment. */
+export function buildPartition(config: IndexerConfig): Partition {
+  return {
+    id: partitionId(config.network, config.deploymentId),
+    network: config.network,
+    deploymentId: config.deploymentId,
+    contractIds: config.contractIds,
+    rpcUrl: config.rpcUrl,
+    networkPassphrase: config.networkPassphrase,
   };
 }
 
@@ -318,7 +349,6 @@ export async function ensureSchema(db: DbClient): Promise<void> {
     CREATE TABLE IF NOT EXISTS stream_events (
       id               BIGSERIAL    PRIMARY KEY,
       event_id         TEXT         NOT NULL UNIQUE,
-      envelope_id      TEXT,
       contract_id      TEXT         NOT NULL,
       event_type       TEXT         NOT NULL,
       ledger_sequence  BIGINT       NOT NULL,
@@ -332,12 +362,6 @@ export async function ensureSchema(db: DbClient): Promise<void> {
       raw_xdr          TEXT         NOT NULL,
       indexed_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
     )
-  `);
-
-  // Migration for pre-existing deployments: add envelope_id if missing.
-  await db.query(`
-    ALTER TABLE stream_events
-      ADD COLUMN IF NOT EXISTS envelope_id TEXT
   `);
 
   await db.query(`
@@ -361,58 +385,6 @@ export async function ensureSchema(db: DbClient): Promise<void> {
   `);
 
   await db.query(`
-    CREATE INDEX IF NOT EXISTS idx_stream_events_envelope
-      ON stream_events (envelope_id) WHERE envelope_id IS NOT NULL
-  `);
-
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS raw_event_envelopes (
-      event_id         TEXT        PRIMARY KEY,
-      contract_id      TEXT        NOT NULL,
-      ledger_sequence  BIGINT      NOT NULL,
-      ledger_timestamp TIMESTAMPTZ NOT NULL,
-      tx_hash          TEXT        NOT NULL,
-      topic_xdr        JSONB       NOT NULL DEFAULT '[]'::jsonb,
-      value_xdr        TEXT        NOT NULL,
-      digest           TEXT        NOT NULL,
-      compacted        BOOLEAN     NOT NULL DEFAULT FALSE,
-      archived_at      TIMESTAMPTZ,
-      created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-
-  await db.query(`
-    CREATE INDEX IF NOT EXISTS idx_raw_event_envelopes_contract_ledger
-      ON raw_event_envelopes (contract_id, ledger_sequence)
-  `);
-
-  await db.query(`
-    CREATE INDEX IF NOT EXISTS idx_raw_event_envelopes_compaction
-      ON raw_event_envelopes (ledger_timestamp) WHERE compacted = FALSE
-  `);
-
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS archived_event_summaries (
-      id                BIGSERIAL   PRIMARY KEY,
-      contract_id       TEXT        NOT NULL,
-      range_start       TIMESTAMPTZ NOT NULL,
-      range_end         TIMESTAMPTZ NOT NULL,
-      event_count       BIGINT      NOT NULL,
-      event_type_counts JSONB       NOT NULL,
-      first_ledger      BIGINT      NOT NULL,
-      last_ledger       BIGINT      NOT NULL,
-      digest            TEXT        NOT NULL,
-      created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE (contract_id, range_start, range_end)
-    )
-  `);
-
-  await db.query(`
-    CREATE INDEX IF NOT EXISTS idx_archived_event_summaries_contract_range
-      ON archived_event_summaries (contract_id, range_start, range_end)
-  `);
-
-  await db.query(`
     CREATE TABLE IF NOT EXISTS cdc_cursors (
       indexer_id  TEXT        PRIMARY KEY,
       last_ledger BIGINT      NOT NULL,
@@ -421,33 +393,41 @@ export async function ensureSchema(db: DbClient): Promise<void> {
   `);
 
   await db.query(`
-    CREATE TABLE IF NOT EXISTS sponsor_signups (
-      sponsor_address TEXT PRIMARY KEY,
-      signup_date     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    CREATE TABLE IF NOT EXISTS cdc_backfill_jobs (
+      partition_id TEXT        NOT NULL,
+      job_id       TEXT        NOT NULL,
+      from_ledger  BIGINT      NOT NULL,
+      to_ledger    BIGINT      NOT NULL,
+      next_ledger  BIGINT      NOT NULL,
+      status       TEXT        NOT NULL,
+      attempts     INTEGER     NOT NULL DEFAULT 0,
+      last_error   TEXT,
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (partition_id, job_id)
     )
   `);
 
   await db.query(`
-    CREATE TABLE IF NOT EXISTS sponsorships (
-      id              BIGSERIAL PRIMARY KEY,
-      sponsor_address TEXT        NOT NULL REFERENCES sponsor_signups(sponsor_address),
-      stream_id       TEXT        NOT NULL,
-      amount          NUMERIC     NOT NULL,
-      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    CREATE INDEX IF NOT EXISTS idx_cdc_backfill_jobs_partition
+      ON cdc_backfill_jobs (partition_id, status)
+  `);
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS cdc_partition_health (
+      partition_id         TEXT        PRIMARY KEY,
+      network              TEXT        NOT NULL,
+      deployment_id        TEXT        NOT NULL,
+      state                TEXT        NOT NULL,
+      last_success_at      TIMESTAMPTZ,
+      last_error           TEXT,
+      consecutive_failures INTEGER     NOT NULL DEFAULT 0,
+      updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
-  `);
-
-  await db.query(`
-    CREATE INDEX IF NOT EXISTS idx_sponsorships_sponsor_address ON sponsorships(sponsor_address)
-  `);
-
-  await db.query(`
-    CREATE INDEX IF NOT EXISTS idx_sponsorships_created_at ON sponsorships(created_at)
   `);
 }
 
 /**
- * Read the last processed ledger for this indexer instance.
+ * Read the last processed ledger for a partition.
  * Returns `null` if no cursor exists (first run).
  */
 export async function getCursor(
@@ -463,7 +443,7 @@ export async function getCursor(
 }
 
 /**
- * Persist the latest processed ledger sequence.
+ * Persist the latest processed ledger sequence for a partition.
  */
 export async function setCursor(
   db: DbClient,
@@ -479,88 +459,41 @@ export async function setCursor(
   );
 }
 
-// ── Raw envelope helpers ──────────────────────────────────────────────────────
-
 /**
- * Compute the canonical SHA-256 digest for an envelope. The digest covers
- * the fields that determine the derived event, so an auditor can re-derive
- * it from the retained envelope and compare against the stored value.
+ * Migrate a legacy single-indexer cursor into the partition cursor.
+ *
+ * Older deployments stored a cursor under `INDEXER_ID` (e.g.
+ * `fundable_stream_indexer`). On first start of a partitioned deployment we
+ * copy that value into the partition cursor if — and only if — the partition
+ * cursor does not yet exist. This preserves resume position across the
+ * upgrade without duplicating or skipping ledgers.
+ *
+ * Returns `true` if a migration occurred.
  */
-export function computeEnvelopeDigest(
-  envelope: Omit<RawEventEnvelope, "digest">
-): string {
-  const canonical = JSON.stringify({
-    eventId: envelope.eventId,
-    contractId: envelope.contractId,
-    ledgerSequence: envelope.ledgerSequence,
-    ledgerTimestamp: envelope.ledgerTimestamp,
-    txHash: envelope.txHash,
-    topicXdr: envelope.topicXdr,
-    valueXdr: envelope.valueXdr,
-  });
-  return createHash("sha256").update(canonical).digest("hex");
-}
-
-/**
- * Build a minimal raw envelope from a raw Soroban event.
- */
-export function buildEnvelope(
-  rawEvent: SorobanEvent,
-  ledgerSequence: number,
-  ledgerTimestamp: number
-): RawEventEnvelope {
-  const eventId = `${ledgerSequence}-${rawEvent.id ?? "0"}`;
-  const topicXdr = (rawEvent.topic ?? []).map((t) => String(t));
-  const valueXdr = rawEvent.value?.xdr ?? "";
-  const base = {
-    eventId,
-    contractId: rawEvent.contractId ?? "",
-    ledgerSequence,
-    ledgerTimestamp: new Date(ledgerTimestamp * 1_000).toISOString(),
-    txHash: rawEvent.txHash ?? "",
-    topicXdr,
-    valueXdr,
-  };
-  return { ...base, digest: computeEnvelopeDigest(base) };
-}
-
-/**
- * Upsert a batch of raw envelopes. Idempotent on `event_id`.
- * Returns the number of newly inserted envelopes.
- */
-export async function insertEnvelopes(
+export async function migrateLegacyCursor(
   db: DbClient,
-  envelopes: RawEventEnvelope[]
-): Promise<number> {
-  if (envelopes.length === 0) return 0;
+  legacyIndexerId: string,
+  partition: Partition
+): Promise<boolean> {
+  if (legacyIndexerId === partition.id) return false;
 
-  let inserted = 0;
-  for (const env of envelopes) {
-    const result = await db.query(
-      `INSERT INTO raw_event_envelopes (
-         event_id, contract_id, ledger_sequence, ledger_timestamp, tx_hash,
-         topic_xdr, value_xdr, digest
-       ) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8)
-       ON CONFLICT (event_id) DO NOTHING`,
-      [
-        env.eventId,
-        env.contractId,
-        env.ledgerSequence,
-        env.ledgerTimestamp,
-        env.txHash,
-        JSON.stringify(env.topicXdr),
-        env.valueXdr,
-        env.digest,
-      ]
-    );
-    if ((result as unknown as { rowCount: number }).rowCount > 0) inserted++;
-  }
-  return inserted;
+  const existing = await getCursor(db, partition.id);
+  if (existing !== null) return false;
+
+  const legacy = await getCursor(db, legacyIndexerId);
+  if (legacy === null) return false;
+
+  await setCursor(db, partition.id, legacy);
+  log("info", "Migrated legacy cursor into partition", {
+    partitionId: partition.id,
+    legacyIndexerId,
+    lastLedger: legacy,
+  });
+  return true;
 }
 
 /**
  * Upsert a batch of stream events. Idempotent on `event_id`.
- * Each derived row is linked to its source envelope via `envelope_id`.
  */
 export async function insertEvents(
   db: DbClient,
@@ -572,14 +505,12 @@ export async function insertEvents(
   for (const ev of events) {
     const result = await db.query(
       `INSERT INTO stream_events (
-         event_id, envelope_id, contract_id, event_type, ledger_sequence,
-         ledger_timestamp, tx_hash, sender, recipient, asset, amount,
-         stream_id, raw_xdr
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         event_id, contract_id, event_type, ledger_sequence, ledger_timestamp,
+         tx_hash, sender, recipient, asset, amount, stream_id, raw_xdr
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
        ON CONFLICT (event_id) DO NOTHING`,
       [
         ev.eventId,
-        ev.envelopeId,
         ev.contractId,
         ev.eventType,
         ev.ledgerSequence,
@@ -593,30 +524,294 @@ export async function insertEvents(
         ev.rawXdr,
       ]
     );
-
-    if ((result as unknown as { rowCount: number }).rowCount > 0) {
-      inserted++;
-
-      // If it's a stream creation, track the sponsor
-      if (ev.eventType === "stream_created" && ev.sender) {
-        // Upsert sponsor signup
-        await db.query(
-          `INSERT INTO sponsor_signups (sponsor_address)
-           VALUES ($1)
-           ON CONFLICT (sponsor_address) DO NOTHING`,
-          [ev.sender]
-        );
-
-        // Record the sponsorship
-        await db.query(
-          `INSERT INTO sponsorships (sponsor_address, stream_id, amount)
-           VALUES ($1, $2, $3)`,
-          [ev.sender, ev.streamId, ev.amount]
-        );
-      }
-    }
+    // pg returns rowCount for INSERT
+    if ((result as unknown as { rowCount: number }).rowCount > 0) inserted++;
   }
   return inserted;
+}
+
+// ── Partition health ──────────────────────────────────────────────────────────
+
+/**
+ * Compute the explicit health state for a partition from its persisted
+ * record. A partition with no recorded success and no failures is `healthy`
+ * (it has simply not run yet). A partition whose last success is older than
+ * the stall threshold is `stalled` regardless of failure count.
+ */
+export function computePartitionState(
+  health: Pick<PartitionHealth, "lastSuccessAt" | "consecutiveFailures">,
+  stallThresholdSeconds: number,
+  now: number = Date.now()
+): PartitionState {
+  if (health.lastSuccessAt) {
+    const ageSeconds = (now - new Date(health.lastSuccessAt).getTime()) / 1_000;
+    if (ageSeconds > stallThresholdSeconds) return "stalled";
+  }
+  if (health.consecutiveFailures > 0) return "degraded";
+  return "healthy";
+}
+
+/** Read the persisted health record for a partition, if any. */
+export async function getPartitionHealth(
+  db: DbClient,
+  partitionIdValue: string
+): Promise<PartitionHealth | null> {
+  const result = await db.query<{
+    partition_id: string;
+    network: string;
+    deployment_id: string;
+    state: PartitionState;
+    last_success_at: string | null;
+    last_error: string | null;
+    consecutive_failures: number;
+    updated_at: string;
+  }>(
+    `SELECT partition_id, network, deployment_id, state, last_success_at,
+            last_error, consecutive_failures, updated_at
+       FROM cdc_partition_health
+      WHERE partition_id = $1`,
+    [partitionIdValue]
+  );
+  if (result.rows.length === 0) return null;
+  const row = result.rows[0];
+  return {
+    partitionId: row.partition_id,
+    network: row.network,
+    deploymentId: row.deployment_id,
+    state: row.state,
+    lastSuccessAt: row.last_success_at
+      ? new Date(row.last_success_at).toISOString()
+      : null,
+    lastError: row.last_error,
+    consecutiveFailures: Number(row.consecutive_failures),
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+/**
+ * Record a successful poll cycle for a partition. Resets the failure counter
+ * and marks the partition `healthy`.
+ */
+export async function recordPartitionSuccess(
+  db: DbClient,
+  partition: Partition
+): Promise<void> {
+  await db.query(
+    `INSERT INTO cdc_partition_health (
+       partition_id, network, deployment_id, state, last_success_at,
+       last_error, consecutive_failures, updated_at
+     ) VALUES ($1, $2, $3, 'healthy', NOW(), NULL, 0, NOW())
+     ON CONFLICT (partition_id) DO UPDATE SET
+       state = 'healthy',
+       last_success_at = NOW(),
+       last_error = NULL,
+       consecutive_failures = 0,
+       updated_at = NOW()`,
+    [partition.id, partition.network, partition.deploymentId]
+  );
+}
+
+/**
+ * Record a failed poll cycle for a partition. Increments the failure counter,
+ * stores the error, and derives the explicit state (`degraded` or `stalled`).
+ * Returns the resulting state so callers can surface it.
+ */
+export async function recordPartitionFailure(
+  db: DbClient,
+  partition: Partition,
+  error: string,
+  stallThresholdSeconds: number
+): Promise<PartitionState> {
+  const existing = await getPartitionHealth(db, partition.id);
+  const consecutiveFailures = (existing?.consecutiveFailures ?? 0) + 1;
+  const lastSuccessAt = existing?.lastSuccessAt ?? null;
+  const state = computePartitionState(
+    { lastSuccessAt, consecutiveFailures },
+    stallThresholdSeconds
+  );
+
+  await db.query(
+    `INSERT INTO cdc_partition_health (
+       partition_id, network, deployment_id, state, last_success_at,
+       last_error, consecutive_failures, updated_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+     ON CONFLICT (partition_id) DO UPDATE SET
+       state = EXCLUDED.state,
+       last_error = EXCLUDED.last_error,
+       consecutive_failures = EXCLUDED.consecutive_failures,
+       updated_at = NOW()`,
+    [
+      partition.id,
+      partition.network,
+      partition.deploymentId,
+      state,
+      lastSuccessAt,
+      error,
+      consecutiveFailures,
+    ]
+  );
+
+  return state;
+}
+
+// ── Backfill jobs ─────────────────────────────────────────────────────────────
+
+/** Enqueue a backfill job scoped to a partition. */
+export async function enqueueBackfill(
+  db: DbClient,
+  partition: Partition,
+  jobId: string,
+  fromLedger: number,
+  toLedger: number
+): Promise<void> {
+  if (fromLedger > toLedger) {
+    throw new IndexerError(
+      `Invalid backfill range: fromLedger ${fromLedger} > toLedger ${toLedger}`,
+      "CONFIG_ERROR"
+    );
+  }
+  await db.query(
+    `INSERT INTO cdc_backfill_jobs (
+       partition_id, job_id, from_ledger, to_ledger, next_ledger, status,
+       attempts, last_error, updated_at
+     ) VALUES ($1, $2, $3, $4, $3, 'pending', 0, NULL, NOW())
+     ON CONFLICT (partition_id, job_id) DO NOTHING`,
+    [partition.id, jobId, fromLedger, toLedger]
+  );
+}
+
+/** List backfill jobs for a partition (optionally filtered by status). */
+export async function listBackfills(
+  db: DbClient,
+  partitionIdValue: string,
+  status?: BackfillStatus
+): Promise<BackfillJob[]> {
+  const params: unknown[] = [partitionIdValue];
+  let sql = `SELECT partition_id, job_id, from_ledger, to_ledger, next_ledger,
+                    status, attempts, last_error, updated_at
+               FROM cdc_backfill_jobs
+              WHERE partition_id = $1`;
+  if (status) {
+    params.push(status);
+    sql += ` AND status = $2`;
+  }
+  sql += ` ORDER BY job_id`;
+
+  const result = await db.query<{
+    partition_id: string;
+    job_id: string;
+    from_ledger: string;
+    to_ledger: string;
+    next_ledger: string;
+    status: BackfillStatus;
+    attempts: number;
+    last_error: string | null;
+    updated_at: string;
+  }>(sql, params);
+
+  return result.rows.map((row) => ({
+    partitionId: row.partition_id,
+    jobId: row.job_id,
+    fromLedger: Number(row.from_ledger),
+    toLedger: Number(row.to_ledger),
+    nextLedger: Number(row.next_ledger),
+    status: row.status,
+    attempts: Number(row.attempts),
+    lastError: row.last_error,
+    updatedAt: new Date(row.updated_at).toISOString(),
+  }));
+}
+
+/**
+ * Advance a backfill job's progress. Marks the job `completed` when the
+ * cursor reaches `to_ledger`.
+ */
+export async function advanceBackfill(
+  db: DbClient,
+  partitionIdValue: string,
+  jobId: string,
+  nextLedger: number
+): Promise<void> {
+  await db.query(
+    `UPDATE cdc_backfill_jobs
+        SET next_ledger = $3,
+            status = CASE WHEN $3 > to_ledger THEN 'completed' ELSE 'running' END,
+            updated_at = NOW()
+      WHERE partition_id = $1 AND job_id = $2`,
+    [partitionIdValue, jobId, nextLedger]
+  );
+}
+
+/**
+ * Record a failed backfill attempt. Increments `attempts` and stores the
+ * error. The job remains retryable (`failed`) unless it has exhausted its
+ * attempts budget, in which case it stays `failed` for operator inspection.
+ */
+export async function failBackfill(
+  db: DbClient,
+  partitionIdValue: string,
+  jobId: string,
+  error: string
+): Promise<void> {
+  await db.query(
+    `UPDATE cdc_backfill_jobs
+        SET status = 'failed',
+            attempts = attempts + 1,
+            last_error = $3,
+            updated_at = NOW()
+      WHERE partition_id = $1 AND job_id = $2`,
+    [partitionIdValue, jobId, error]
+  );
+}
+
+/**
+ * Reset a failed backfill job so it can be retried. Only jobs belonging to
+ * the given partition are affected — a partition cannot retry another
+ * partition's jobs.
+ */
+export async function retryBackfill(
+  db: DbClient,
+  partitionIdValue: string,
+  jobId: string
+): Promise<boolean> {
+  const result = await db.query(
+    `UPDATE cdc_backfill_jobs
+        SET status = 'pending',
+            last_error = NULL,
+            updated_at = NOW()
+      WHERE partition_id = $1 AND job_id = $2 AND status = 'failed'`,
+    [partitionIdValue, jobId]
+  );
+  return (result as unknown as { rowCount: number }).rowCount > 0;
+}
+
+// ── Operator authorization ────────────────────────────────────────────────────
+
+/**
+ * Authorize an operator action against a partition.
+ *
+ * Operators may only act on partitions they are explicitly scoped to. An
+ * operator with no scope (empty list) is treated as unauthorized for every
+ * partition — least privilege by default. Unknown deployments are rejected
+ * with `UNKNOWN_DEPLOYMENT` so callers can distinguish a typo from a
+ * permission problem.
+ */
+export function authorizeOperator(
+  operator: { id: string; allowedPartitions: string[] },
+  partition: Partition | null
+): void {
+  if (!partition) {
+    throw new IndexerError(
+      "Unknown deployment: partition does not exist",
+      "UNKNOWN_DEPLOYMENT"
+    );
+  }
+  if (!operator.allowedPartitions.includes(partition.id)) {
+    throw new IndexerError(
+      `Operator ${operator.id} is not authorized for partition ${partition.id}`,
+      "UNAUTHORIZED"
+    );
+  }
 }
 
 // ── Event parsing ─────────────────────────────────────────────────────────────
@@ -711,7 +906,6 @@ export function parseStreamEvent(
     amount,
     streamId,
     rawXdr,
-    envelopeId: eventId,
   };
 }
 
@@ -760,227 +954,63 @@ export async function getCurrentLedger(rpc: RpcServer): Promise<number> {
   }
 }
 
-// ── Compaction (issue #224) ───────────────────────────────────────────────────
-
-export interface CompactionOptions {
-  /** Raw events with ledger_timestamp older than this are eligible. */
-  retentionDays: number;
-  /** Width in hours of each archived summary bucket. */
-  rangeHours: number;
-  /** Optional contract filter; when omitted all contracts are compacted. */
-  contractId?: string;
-  /** Optional clock override for deterministic tests. */
-  now?: Date;
-}
-
-export interface CompactionResult {
-  summariesCreated: number;
-  envelopesCompacted: number;
-  /** Contracts / ranges that failed and can be retried. */
-  failures: Array<{ contractId: string; rangeStart: string; rangeEnd: string; error: string }>;
-}
-
-interface EnvelopeRow {
-  event_id: string;
-  contract_id: string;
-  ledger_sequence: string;
-  ledger_timestamp: string;
-  digest: string;
-}
+// ── Main poll cycle ───────────────────────────────────────────────────────────
 
 /**
- * Compact raw envelopes older than the retention window into
- * `archived_event_summaries`, keyed by (contract, time-range).
+ * Run one full poll cycle for a single partition:
+ *   1. Read the partition cursor from DB.
+ *   2. Fetch events since cursor (or lookback) from RPC.
+ *   3. Parse and upsert into stream_events.
+ *   4. Advance the partition cursor to latest ledger.
+ *   5. Record partition health (success or failure).
  *
- * Idempotent and safe to retry: summaries are UPSERTed on
- * (contract_id, range_start, range_end) and envelopes are only marked
- * `compacted` after their summary is durably written. A crash between the
- * two steps leaves envelopes un-compacted, so the next run re-derives the
- * same summary and completes the marking.
+ * Errors are isolated to this partition: they are recorded against the
+ * partition's health row and never thrown to the caller, so a stalled
+ * partition cannot block other partitions' loops.
+ *
+ * Returns the number of new events indexed.
  */
-export async function compactEvents(
+export async function runPollCycle(
   db: DbClient,
-  options: CompactionOptions
-): Promise<CompactionResult> {
-  const now = options.now ?? new Date();
-  const cutoff = new Date(now.getTime() - options.retentionDays * 24 * 60 * 60 * 1_000);
-  const rangeMs = options.rangeHours * 60 * 60 * 1_000;
-
-  const result: CompactionResult = {
-    summariesCreated: 0,
-    envelopesCompacted: 0,
-    failures: [],
-  };
-
-  const params: unknown[] = [cutoff.toISOString()];
-  let contractFilter = "";
-  if (options.contractId) {
-    params.push(options.contractId);
-    contractFilter = `AND contract_id = $${params.length}`;
-  }
-
-  const rows = await db.query<EnvelopeRow>(
-    `SELECT event_id, contract_id, ledger_sequence, ledger_timestamp, digest
-       FROM raw_event_envelopes
-      WHERE compacted = FALSE
-        AND ledger_timestamp < $1
-        ${contractFilter}
-      ORDER BY contract_id, ledger_timestamp`,
-    params
-  );
-
-  if (rows.rows.length === 0) {
-    log("info", "Compaction: no eligible envelopes", {
-      cutoff: cutoff.toISOString(),
+  rpc: RpcServer,
+  config: IndexerConfig,
+  partition: Partition = buildPartition(config)
+): Promise<number> {
+  try {
+    return await runPollCycleInner(db, rpc, config, partition);
+  } catch (err) {
+    const message = (err as Error).message;
+    log("error", "Poll cycle failed for partition — isolating", {
+      partitionId: partition.id,
+      error: message,
     });
-    return result;
-  }
-
-  // Group envelopes by (contract, bucket).
-  const buckets = new Map<
-    string,
-    { contractId: string; rangeStart: Date; rangeEnd: Date; rows: EnvelopeRow[] }
-  >();
-
-  for (const row of rows.rows) {
-    const ts = new Date(row.ledger_timestamp).getTime();
-    const bucketStart = Math.floor(ts / rangeMs) * rangeMs;
-    const rangeStart = new Date(bucketStart);
-    const rangeEnd = new Date(bucketStart + rangeMs);
-    const key = `${row.contract_id}|${rangeStart.toISOString()}`;
-    let bucket = buckets.get(key);
-    if (!bucket) {
-      bucket = { contractId: row.contract_id, rangeStart, rangeEnd, rows: [] };
-      buckets.set(key, bucket);
-    }
-    bucket.rows.push(row);
-  }
-
-  for (const bucket of buckets.values()) {
     try {
-      const eventTypeCounts: Record<string, number> = {};
-      let firstLedger = Number.MAX_SAFE_INTEGER;
-      let lastLedger = 0;
-      const digests: string[] = [];
-
-      for (const row of bucket.rows) {
-        const ledger = Number(row.ledger_sequence);
-        if (ledger < firstLedger) firstLedger = ledger;
-        if (ledger > lastLedger) lastLedger = ledger;
-        digests.push(row.digest);
-      }
-
-      // Derive per-type counts from the linked derived rows where available.
-      const eventIds = bucket.rows.map((r) => r.event_id);
-      const typeRows = await db.query<{ event_type: string; count: string }>(
-        `SELECT event_type, COUNT(*)::text AS count
-           FROM stream_events
-          WHERE event_id = ANY($1::text[])
-          GROUP BY event_type`,
-        [eventIds]
+      const state = await recordPartitionFailure(
+        db,
+        partition,
+        message,
+        config.stallThresholdSeconds
       );
-      for (const tr of typeRows.rows) {
-        eventTypeCounts[tr.event_type] = Number(tr.count);
-      }
-
-      const summaryDigest = createHash("sha256")
-        .update(digests.sort().join(":"))
-        .digest("hex");
-
-      // UPSERT summary — idempotent on (contract_id, range_start, range_end).
-      await db.query(
-        `INSERT INTO archived_event_summaries (
-           contract_id, range_start, range_end, event_count, event_type_counts,
-           first_ledger, last_ledger, digest
-         ) VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8)
-         ON CONFLICT (contract_id, range_start, range_end)
-         DO UPDATE SET
-           event_count = EXCLUDED.event_count,
-           event_type_counts = EXCLUDED.event_type_counts,
-           first_ledger = EXCLUDED.first_ledger,
-           last_ledger = EXCLUDED.last_ledger,
-           digest = EXCLUDED.digest`,
-        [
-          bucket.contractId,
-          bucket.rangeStart.toISOString(),
-          bucket.rangeEnd.toISOString(),
-          bucket.rows.length,
-          JSON.stringify(eventTypeCounts),
-          firstLedger === Number.MAX_SAFE_INTEGER ? 0 : firstLedger,
-          lastLedger,
-          summaryDigest,
-        ]
-      );
-      result.summariesCreated++;
-
-      // Mark envelopes compacted only after the summary is durable.
-      await db.query(
-        `UPDATE raw_event_envelopes
-            SET compacted = TRUE, archived_at = NOW()
-          WHERE event_id = ANY($1::text[])`,
-        [eventIds]
-      );
-      result.envelopesCompacted += bucket.rows.length;
-
-      log("info", "Compaction: archived bucket", {
-        contractId: bucket.contractId,
-        rangeStart: bucket.rangeStart.toISOString(),
-        rangeEnd: bucket.rangeEnd.toISOString(),
-        eventCount: bucket.rows.length,
+      log("warn", "Partition marked unhealthy", {
+        partitionId: partition.id,
+        state,
       });
-    } catch (err) {
-      const failure = {
-        contractId: bucket.contractId,
-        rangeStart: bucket.rangeStart.toISOString(),
-        rangeEnd: bucket.rangeEnd.toISOString(),
-        error: (err as Error).message,
-      };
-      result.failures.push(failure);
-      log("error", "Compaction: bucket failed — will retry next run", failure);
+    } catch (healthErr) {
+      log("error", "Failed to record partition failure", {
+        partitionId: partition.id,
+        error: (healthErr as Error).message,
+      });
     }
+    return 0;
   }
-
-  log("info", "Compaction complete", {
-    summariesCreated: result.summariesCreated,
-    envelopesCompacted: result.envelopesCompacted,
-    failures: result.failures.length,
-  });
-
-  return result;
 }
 
-// ── Audit queries & reconstruction (issues #223 / #224) ──────────────────────
-
-export interface EventHistoryQuery {
-  contractId: string;
-  /** ISO 8601 inclusive lower bound. */
-  from: string;
-  /** ISO 8601 exclusive upper bound. */
-  to: string;
-  /** Optional authorization scope; when set, must match contractId. */
-  authorizedContractId?: string;
-}
-
-export interface EventHistoryResult {
-  /** Derived events still retained as raw rows. */
-  events: StreamEvent[];
-  /** Archived summaries covering compacted ranges. */
-  archives: ArchivedEventSummary[];
-  /** True when some part of the range was served from the archive. */
-  servedFromArchive: boolean;
-}
-
-/**
- * Query event history for a contract over a time range.
- *
- * Reads are routed to the archive when raw rows have been compacted, so
- * agreed history queries keep working after compaction. Authorization is
- * enforced at this boundary: a caller scoped to a contract may not read
- * another contract's history.
- */
-export async function queryEventHistory(
+async function runPollCycleInner(
   db: DbClient,
-  query: EventHistoryQuery
-): Promise<EventHistoryResult> {
-  if (
-    query.authorizedContractId
+  rpc: RpcServer,
+  config: IndexerConfig,
+  partition: Partition
+): Promise<number> {
+  // Step 1: determine start ledger
+  const cursor = await getCursor(db, partition.id);
+  let currentLedger: number;
