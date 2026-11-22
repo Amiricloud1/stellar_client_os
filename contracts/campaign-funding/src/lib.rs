@@ -181,6 +181,126 @@ pub enum CampaignStatus {
     Paused,
 }
 
+// ---------------------------------------------------------------------------
+// PHASE 1: Objective 3 - Network Binding
+// ---------------------------------------------------------------------------
+
+/// Unique deployment identity capturing the network context and contract address.
+/// This struct is stored once at contract initialization and serves as proof
+/// of the specific Stellar network and deployment location.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeploymentIdentity {
+    /// Hash of the network identifier (e.g., Stellar testnet, public network).
+    /// Prevents cross-network attacks and fund mixing.
+    pub network_id: BytesN<32>,
+    /// The address of this contract instance on the network.
+    pub contract_address: Address,
+    /// Unix timestamp (seconds) when this contract was deployed.
+    /// Enables ordering and verification of deployment sequence.
+    pub deploy_timestamp: u64,
+}
+
+/// Asset-to-network binding for verification that assets belong to the intended network.
+/// Each asset can be bound to exactly one network, preventing cross-network asset swaps.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetNetworkBinding {
+    /// The token/asset contract address being bound.
+    pub asset: Address,
+    /// The network this asset is verified to belong to.
+    pub network_id: BytesN<32>,
+    /// Whether the binding has been cryptographically verified by validators.
+    pub verified: bool,
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 2: Objective 1 - Campaign Retirement
+// ---------------------------------------------------------------------------
+
+/// Campaign lifecycle state enum defining the extended state machine.
+/// Extends `CampaignStatus` to include retirement and read-only migration states.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CampaignLifecycle {
+    /// Campaign is in normal operation (corresponds to any CampaignStatus except Paused).
+    Active = 0,
+    /// Campaign has transitioned to read-only migration mode.
+    /// All write operations (deposits, payouts) are forbidden.
+    /// Existing data is preserved for auditing and historical reference.
+    ReadOnlyMigration = 1,
+    /// Campaign is fully retired and archived.
+    /// Contract storage is no longer actively managed; historical queries only.
+    RetiredReadOnly = 2,
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 3: Objective 2 - Granular Pause Controls
+// ---------------------------------------------------------------------------
+
+/// Fine-grained operation pause flags allowing independent control of operations.
+/// This enables targeted pausing of deposits, payouts, or claims without
+/// completely freezing the campaign (which CampaignStatus::Paused would do).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationPauseFlags {
+    /// If true, new deposits/contributions are prevented.
+    pub pause_deposits: bool,
+    /// If true, fund payouts and releases are prevented.
+    pub pause_payouts: bool,
+    /// If true, contributor refund claims are prevented.
+    pub pause_claims: bool,
+    /// If true, admin operations (like fee changes) are prevented.
+    pub pause_admin: bool,
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 4: Objective 4 - Asset Metadata & Risk
+// ---------------------------------------------------------------------------
+
+/// Asset metadata tracking issuer identity and verification status.
+/// Enables campaign creators to vet which tokens are acceptable.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetMetadata {
+    /// The token contract address.
+    pub token: Address,
+    /// The issuer/creator of this token.
+    pub issuer: Address,
+    /// Unix timestamp (seconds) when this asset was first verified.
+    pub verified_at: u64,
+    /// Unix timestamp (seconds) of the most recent review or update.
+    pub last_review: u64,
+}
+
+/// Asset review status tracking verification and flag state.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetReviewStatus {
+    /// Asset is awaiting initial review.
+    Pending = 0,
+    /// Asset has been reviewed and approved for use in campaigns.
+    Approved = 1,
+    /// Asset has been flagged for risk, scam, or other issues.
+    Flagged = 2,
+    /// Asset is permanently retired from use.
+    Retired = 3,
+}
+
+/// Risk flags aggregating multiple forms of asset risk assessment.
+/// Each flag represents a specific category of risk that may make an asset
+/// unsuitable for campaign funding.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetRiskFlags {
+    /// Issuer has poor reputation or history of scams/fraud.
+    pub reputation_risk: bool,
+    /// Asset has low liquidity or concentrated holders.
+    pub liquidity_risk: bool,
+    /// Asset is held by a small number of whales (concentration risk).
+    pub concentration_risk: bool,
+}
+
 /// Single entry in a campaign's status history.
 #[contracttype]
 #[derive(Clone)]
@@ -224,6 +344,23 @@ pub struct Campaign {
     pub created_at: u64,
     pub planter: OptionalAddress,
     pub co2_multiplier: u32,
+    
+    // PHASE 1: Objective 3 - Network Binding
+    /// SHA-256 hash of the deployment network identifier.
+    /// Ensures this campaign cannot be cross-chain attacked or replayed.
+    pub deployment_id: BytesN<32>,
+    /// SHA-256 hash of the network this campaign belongs to.
+    /// Used to verify all funding tokens are from the same network.
+    pub network_id: BytesN<32>,
+    
+    // PHASE 2: Objective 1 - Campaign Retirement
+    /// Extended lifecycle state including retirement tracking.
+    pub lifecycle_state: CampaignLifecycle,
+    
+    // PHASE 3: Objective 2 - Granular Pause Controls
+    /// Fine-grained pause flags for individual operations.
+    /// Allows selective freezing without full campaign pause.
+    pub pause_flags: OperationPauseFlags,
 }
 
 /// A single co-creator and their revenue share in basis points.
