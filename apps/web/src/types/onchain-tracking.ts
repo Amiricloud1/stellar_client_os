@@ -71,82 +71,76 @@ export interface CertificateVerification {
 }
 
 /**
- * Canonical contract-event domain mappings — Issue #219
+ * Partition ingestion by network and deployment — Issue #217
  *
- * Every supported contract event version is mapped to a canonical projection
- * (a normalized, version-independent shape consumed by the web tracking
- * services). Event versions that are not yet supported are NOT dropped: they
- * are retained verbatim as `RetainedUnknownEvent` records so operators can
- * inspect them and a later release can add a mapping without data loss.
- *
- * Compatibility guarantees:
- * - `CanonicalProjection.schemaVersion` is bumped only for breaking changes to
- *   the projection shape; additive fields do not bump it.
- * - `RetainedUnknownEvent.rawPayload` is stored unmodified and must round-trip
- *   byte-for-byte (JSON) so future mappings can replay it.
- * - Unknown events never fail the ingestion batch; they surface as an explicit
- *   `retained` state instead of being silently discarded.
+ * Each (network, deploymentId) pair is an independent ingestion partition with
+ * its own cursor, backfill state, and health. A stalled or failing partition
+ * must never block ingestion for other partitions.
  */
 
-/** Lifecycle state of a contract event after mapping. */
-export type EventMappingState = 'projected' | 'retained';
+export type IngestionNetwork = 'mainnet' | 'testnet' | 'futurenet' | 'local';
 
-/** Canonical, version-independent projection of a supported contract event. */
-export interface CanonicalProjection {
-  /** Canonical event name, e.g. `campaign.milestone.reached`. */
-  eventName: string;
-  /** Contract event version this projection was derived from. */
-  sourceVersion: string;
-  /** Version of the canonical projection schema itself. */
-  schemaVersion: number;
-  /** Chain the event was observed on. */
-  chainId: string;
-  /** Contract address that emitted the event. */
-  contractAddress: string;
-  /** Transaction hash of the emitting transaction. */
-  txHash: string;
-  /** Log index within the transaction, used for deterministic ordering. */
-  logIndex: number;
-  /** Block number the event was included in. */
-  blockNumber: number;
-  /** Normalized, version-independent payload. */
-  payload: Record<string, unknown>;
-  /** Mapping state; always `projected` for canonical projections. */
-  state: Extract<EventMappingState, 'projected'>;
+/** Lifecycle state of a single ingestion partition. */
+export type PartitionStatus =
+  | 'idle'
+  | 'syncing'
+  | 'backfilling'
+  | 'degraded'
+  | 'stalled'
+  | 'failed'
+  | 'paused';
+
+/** Health snapshot for a partition, surfaced to operators. */
+export interface PartitionHealth {
+  status: PartitionStatus;
+  /** Ledger sequence of the last successfully ingested ledger. */
+  lastIngestedLedger: number;
+  /** Latest ledger known to the network at the time of the snapshot. */
+  latestKnownLedger: number;
+  /** Ledgers behind the chain head; 0 when fully caught up. */
+  lagLedgers: number;
+  /** Consecutive ingestion failures since the last success. */
+  consecutiveFailures: number;
+  /** ISO timestamp of the last successful ingestion, if any. */
+  lastSuccessAt?: string;
+  /** ISO timestamp of the most recent failure, if any. */
+  lastFailureAt?: string;
+  /** Human-readable reason for the current degraded/stalled/failed state. */
+  reason?: string;
+  /** ISO timestamp when the health snapshot was computed. */
+  updatedAt: string;
 }
 
-/** An event whose version has no canonical mapping yet; retained, not dropped. */
-export interface RetainedUnknownEvent {
-  /** Identifier assigned at ingestion for later replay. */
-  retentionId: string;
-  /** Raw event name as emitted by the contract. */
-  eventName: string;
-  /** Raw event version as emitted by the contract. */
-  sourceVersion: string;
-  chainId: string;
-  contractAddress: string;
-  txHash: string;
-  logIndex: number;
-  blockNumber: number;
-  /** Unmodified raw payload; must round-trip exactly. */
-  rawPayload: Record<string, unknown>;
-  /** Reason the event could not be mapped (e.g. `unsupported_version`). */
-  reason: string;
-  /** ISO timestamp of when the event was retained. */
-  retainedAt: string;
-  /** Mapping state; always `retained` for unknown events. */
-  state: Extract<EventMappingState, 'retained'>;
+/** Durable ingestion cursor for a single partition. */
+export interface PartitionCursor {
+  network: IngestionNetwork;
+  deploymentId: string;
+  /** Next ledger sequence to ingest. */
+  nextLedger: number;
+  /** Last ledger sequence that was fully processed. */
+  lastProcessedLedger: number;
+  /** Cursor for an in-progress backfill, if one is running. */
+  backfill?: {
+    fromLedger: number;
+    toLedger: number;
+    nextLedger: number;
+    startedAt: string;
+  };
+  /** Optimistic-concurrency token; must match on write to avoid clobbering. */
+  version: number;
+  updatedAt: string;
 }
 
-/** Result of mapping a single contract event. */
-export type EventMappingResult =
-  | { state: 'projected'; projection: CanonicalProjection }
-  | { state: 'retained'; retained: RetainedUnknownEvent };
-
-/** Result of mapping a batch of contract events. */
-export interface EventMappingBatchResult {
-  projections: CanonicalProjection[];
-  retained: RetainedUnknownEvent[];
-  /** True when at least one event was retained for later replay. */
-  hasRetained: boolean;
+/** A single, isolated ingestion partition keyed by network + deployment. */
+export interface IngestionPartition {
+  network: IngestionNetwork;
+  deploymentId: string;
+  /** Stable identifier, e.g. `${network}:${deploymentId}`. */
+  partitionKey: string;
+  cursor: PartitionCursor;
+  health: PartitionHealth;
+  /** Whether this partition is enabled for ingestion. */
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
 }

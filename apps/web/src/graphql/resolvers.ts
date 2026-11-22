@@ -17,6 +17,16 @@ import { getCampaignSequelService } from "@/services/campaign-sequel.service";
 import { getCampaignAnalyticsDashboard } from "@/services/campaign-analytics-dashboard.service";
 import { getGrantProgramService } from "@/services/grant-program.service";
 import {
+  getCampaignTermsService,
+  TermsSnapshotMismatchError,
+} from "@/services/campaign-terms.service";
+import {
+  getCampaignVerificationAuditService,
+  StaleEvidenceVersionError,
+  ReviewerAuthorizationError,
+} from "@/services/campaign-verification-audit.service";
+import { getCampaignDonationService } from "@/services/campaign-donation.service";
+import {
   buildPageInfo,
   normalizePagination,
   paginateItems,
@@ -162,6 +172,63 @@ function toProgramPayload(program: import("@/services/grant-program.service").Gr
     ...program,
     createdAt: Math.floor(program.createdAt / 1000),
     updatedAt: Math.floor(program.updatedAt / 1000),
+  };
+}
+
+/**
+ * Require an authenticated account id, throwing a stable error otherwise.
+ */
+function requireAccountId(ctx: ResolverContext): string {
+  if (!ctx.accountId) {
+    throw new Error("UNAUTHENTICATED: an authenticated account is required");
+  }
+  return ctx.accountId;
+}
+
+/**
+ * Require the caller to hold a reviewer or admin role. The authoritative check
+ * also lives in the verification-audit service; this is a fast-fail guard that
+ * surfaces a stable error code to clients.
+ */
+function requireReviewer(ctx: ResolverContext): string {
+  const accountId = requireAccountId(ctx);
+  const roles = ctx.roles ?? [];
+  if (!roles.includes("reviewer") && !roles.includes("admin")) {
+    throw new Error("FORBIDDEN: reviewer or admin role required");
+  }
+  return accountId;
+}
+
+/**
+ * Map a terms snapshot to its public GraphQL shape (issue #176).
+ */
+function toTermsSnapshotPayload(snapshot: import("@/services/campaign-terms.service").CampaignTermsSnapshot) {
+  return {
+    id: snapshot.id,
+    campaignId: snapshot.campaignId,
+    version: snapshot.version,
+    contentHash: snapshot.contentHash,
+    terms: snapshot.terms,
+    createdAt: Math.floor(snapshot.createdAt / 1000),
+  };
+}
+
+/**
+ * Map a reviewer comment to its public GraphQL shape (issue #178).
+ */
+function toReviewerCommentPayload(comment: import("@/services/campaign-verification-audit.service").ReviewerComment) {
+  return {
+    id: comment.id,
+    evidenceId: comment.evidenceId,
+    evidenceVersion: comment.evidenceVersion,
+    authorId: comment.authorId,
+    body: comment.body,
+    references: comment.references,
+    resolved: comment.resolved,
+    resolvedAt: comment.resolvedAt ? Math.floor(comment.resolvedAt / 1000) : null,
+    resolvedBy: comment.resolvedBy ?? null,
+    createdAt: Math.floor(comment.createdAt / 1000),
+    updatedAt: Math.floor(comment.updatedAt / 1000),
   };
 }
 
@@ -504,90 +571,38 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
       },
 
       /**
-       * Validated contract deployment registry (issue #218).
-       *
-       * Returns every recorded deployment with its network, address,
-       * deployment ledger, spec version and lifecycle state. Operators can
-       * filter by network or lifecycle state.
+       * Return the current donor-facing terms snapshot for a campaign
+       * (issue #176). Clients must display this snapshot and pass its
+       * `contentHash` back on the donation mutation so the contribution is
+       * bound to the exact terms the donor saw.
        */
-      contractDeployments: async (
+      campaignTermsSnapshot: async (
         _: unknown,
-        rawArgs: {
-          filter?: { network?: Network; state?: string; specVersion?: string };
-          pagination?: PaginationInput;
-          sort?: SortInput;
-        },
+        rawArgs: { campaignId: string },
         ctx: ResolverContext,
       ) => {
-        requireOperator(ctx);
-        validateListArgs(rawArgs.pagination, rawArgs.sort);
-        const deployments = await getDeploymentRegistryService().listDeployments(rawArgs.filter);
-        return paginate(deployments.map(toDeploymentPayload), rawArgs.pagination, rawArgs.sort);
+        const args = guard<typeof rawArgs>("Query.campaignTermsSnapshot", ctx, rawArgs, "campaignId");
+        const snapshot = await getCampaignTermsService().getCurrentSnapshot(args.campaignId);
+        if (!snapshot) return null;
+        return toTermsSnapshotPayload(snapshot);
       },
 
       /**
-       * A single deployment record by network + address (issue #218).
-       * Returns null when the pair is not registered.
+       * List reviewer comments for a specific evidence version (issue #178).
+       * Requires reviewer or admin role.
        */
-      contractDeployment: async (
+      reviewerComments: async (
         _: unknown,
-        rawArgs: { network: Network; address: string },
+        rawArgs: { evidenceId: string; evidenceVersion: number; pagination?: PaginationInput },
         ctx: ResolverContext,
       ) => {
-        requireOperator(ctx);
-        const args = guard<typeof rawArgs>("Query.contractDeployment", ctx, rawArgs, "contractDeployment");
-        const deployment = await getDeploymentRegistryService().getDeployment(args.network, args.address);
-        return deployment ? toDeploymentPayload(deployment) : null;
-      },
-
-      /**
-       * Canonical contract-event domain mappings (issue #219).
-       *
-       * Supported event versions are mapped to their projection; unknown
-       * versions are reported as `UNKNOWN` with the raw payload retained so
-       * operators can inspect and backfill them.
-       */
-      contractEventMappings: async (
-        _: unknown,
-        rawArgs: {
-          filter?: { contract?: string; eventName?: string; version?: string };
-          pagination?: PaginationInput;
-          sort?: SortInput;
-        },
-        ctx: ResolverContext,
-      ) => {
-        requireOperator(ctx);
-        validateListArgs(rawArgs.pagination, rawArgs.sort);
-        const mappings = await getContractEventMappingService().listMappings(rawArgs.filter);
-        return paginate(mappings.map(toEventMappingPayload), rawArgs.pagination, rawArgs.sort);
-      },
-
-      /**
-       * Projection replay status across event-schema versions (issue #220).
-       * Returns the latest replay run, or null when none has been started.
-       */
-      projectionReplayStatus: async (
-        _: unknown,
-        rawArgs: { replayId: string },
-        ctx: ResolverContext,
-      ) => {
-        requireOperator(ctx);
-        const args = guard<typeof rawArgs>("Query.projectionReplayStatus", ctx, rawArgs, "replayId");
-        const status = await getProjectionReplayService().getReplayStatus(args.replayId);
-        return status ? toReplayStatusPayload(status) : null;
-      },
-
-      /**
-       * Bounded event-consumer queue and concurrency metrics (issue #222).
-       * Exposes queue depth, capacity, in-flight work and backpressure state.
-       */
-      eventConsumerMetrics: async (
-        _: unknown,
-        rawArgs: { consumer?: string },
-        ctx: ResolverContext,
-      ) => {
-        requireOperator(ctx);
-        return getEventConsumerMetricsService().getMetrics(rawArgs.consumer);
+        const args = guard<typeof rawArgs>("Query.reviewerComments", ctx, rawArgs, "evidenceId");
+        requireReviewer(ctx);
+        const comments = await getCampaignVerificationAuditService().listComments(
+          args.evidenceId,
+          args.evidenceVersion,
+        );
+        return paginate(comments.map(toReviewerCommentPayload), args.pagination);
       },
     },
     Mutation: {
@@ -681,65 +696,108 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
       },
 
       /**
-       * Register or update a contract deployment (issue #218).
-       *
-       * The registry validates the network/address pair and the deployment
-       * ledger before persisting. Duplicate registrations for the same
-       * network + address are rejected by the service.
+       * Record a contribution bound to the terms snapshot the donor saw
+       * (issue #176). The `termsSnapshotHash` must match the campaign's current
+       * snapshot; a mismatch surfaces a TERMS_SNAPSHOT_MISMATCH error so the
+       * client can re-fetch terms and ask the donor to re-confirm.
        */
-      registerContractDeployment: async (
+      donateToCampaign: async (
         _: unknown,
         rawArgs: {
-          input: {
-            network: Network;
-            address: string;
-            deploymentLedger: number;
-            specVersion: string;
-            state?: string;
-          };
+          campaignId: string;
+          amount: string;
+          termsSnapshotHash: string;
+          network?: Network;
         },
         ctx: ResolverContext,
       ) => {
-        requireOperator(ctx);
-        const args = guard<typeof rawArgs>("Mutation.registerContractDeployment", ctx, rawArgs, "registerContractDeployment");
-        const deployment = await getDeploymentRegistryService().registerDeployment(args.input);
-        return toDeploymentPayload(deployment);
+        const args = guard<typeof rawArgs>("Mutation.donateToCampaign", ctx, rawArgs, "campaignId");
+        const accountId = requireAccountId(ctx);
+        try {
+          const contribution = await getCampaignDonationService().recordContribution({
+            campaignId: args.campaignId,
+            amount: args.amount,
+            termsSnapshotHash: args.termsSnapshotHash,
+            donorId: accountId,
+            network: args.network ?? "testnet",
+          });
+          return {
+            id: contribution.id,
+            campaignId: contribution.campaignId,
+            amount: contribution.amount,
+            termsSnapshotHash: contribution.termsSnapshotHash,
+            termsSnapshotVersion: contribution.termsSnapshotVersion,
+            createdAt: Math.floor(contribution.createdAt / 1000),
+          };
+        } catch (error) {
+          if (error instanceof TermsSnapshotMismatchError) {
+            throw new Error(
+              `TERMS_SNAPSHOT_MISMATCH: terms changed since they were displayed; re-fetch campaignTermsSnapshot and re-confirm`,
+            );
+          }
+          throw error;
+        }
       },
 
       /**
-       * Transition a deployment's lifecycle state (issue #218).
-       * Invalid transitions surface as explicit errors from the service.
+       * Add a reviewer comment against a specific evidence version (issue #178).
+       * Requires reviewer or admin role. A stale `evidenceVersion` surfaces a
+       * STALE_EVIDENCE_VERSION error so the reviewer can reload the evidence.
        */
-      updateContractDeploymentState: async (
+      addReviewerComment: async (
         _: unknown,
-        rawArgs: { network: Network; address: string; state: string },
+        rawArgs: {
+          evidenceId: string;
+          evidenceVersion: number;
+          body: string;
+          references?: string[];
+        },
         ctx: ResolverContext,
       ) => {
-        requireOperator(ctx);
-        const args = guard<typeof rawArgs>("Mutation.updateContractDeploymentState", ctx, rawArgs, "updateContractDeploymentState");
-        const deployment = await getDeploymentRegistryService().updateDeploymentState(
-          args.network,
-          args.address,
-          args.state,
-        );
-        return toDeploymentPayload(deployment);
+        const args = guard<typeof rawArgs>("Mutation.addReviewerComment", ctx, rawArgs, "evidenceId");
+        const authorId = requireReviewer(ctx);
+        try {
+          const comment = await getCampaignVerificationAuditService().addComment({
+            evidenceId: args.evidenceId,
+            evidenceVersion: args.evidenceVersion,
+            authorId,
+            body: args.body,
+            references: args.references ?? [],
+          });
+          return toReviewerCommentPayload(comment);
+        } catch (error) {
+          if (error instanceof StaleEvidenceVersionError) {
+            throw new Error(
+              `STALE_EVIDENCE_VERSION: evidence has advanced to version ${error.currentVersion}; reload before commenting`,
+            );
+          }
+          if (error instanceof ReviewerAuthorizationError) {
+            throw new Error("FORBIDDEN: reviewer or admin role required");
+          }
+          throw error;
+        }
       },
 
       /**
-       * Start a deterministic projection replay across event-schema versions
-       * (issue #220). The service rebuilds state from retained raw events and
-       * compares outputs before cutover; the returned status can be polled via
-       * `projectionReplayStatus`.
+       * Mark a reviewer comment resolved (issue #178). Requires reviewer or
+       * admin role; attribution and timestamp are recorded by the service.
        */
-      startProjectionReplay: async (
+      resolveReviewerComment: async (
         _: unknown,
-        rawArgs: { input: { fromVersion: string; toVersion: string; dryRun?: boolean } },
+        rawArgs: { commentId: string },
         ctx: ResolverContext,
       ) => {
-        requireOperator(ctx);
-        const args = guard<typeof rawArgs>("Mutation.startProjectionReplay", ctx, rawArgs, "startProjectionReplay");
-        const status = await getProjectionReplayService().startReplay(args.input);
-        return toReplayStatusPayload(status);
+        const args = guard<typeof rawArgs>("Mutation.resolveReviewerComment", ctx, rawArgs, "commentId");
+        const resolvedBy = requireReviewer(ctx);
+        try {
+          const comment = await getCampaignVerificationAuditService().resolveComment(args.commentId, resolvedBy);
+          return toReviewerCommentPayload(comment);
+        } catch (error) {
+          if (error instanceof ReviewerAuthorizationError) {
+            throw new Error("FORBIDDEN: reviewer or admin role required");
+          }
+          throw error;
+        }
       },
     },
   };

@@ -17,29 +17,17 @@
  *      so restarts resume from the correct position without gaps or
  *      duplicate processing.
  *
- * # Replay across event-schema versions (issue #220)
+ * # Partitioning (issue #217)
  *
- * When the projection schema changes, the indexer can rebuild state
- * deterministically from retained raw events (`stream_events.raw_xdr`) and
- * compare the replayed projections against the current outputs before
- * cutover. The replay engine:
+ * Ingestion is partitioned by `(network, deploymentId)`. Each partition has
+ * its own cursor, backfill job state, and health record, and runs in its own
+ * independent loop. A stalled or failing partition therefore cannot block
+ * ingestion for any other deployment: errors are isolated per partition and
+ * surfaced explicitly as `healthy` / `degraded` / `stalled` states.
  *
- *   1. Reads retained raw events ordered by `(ledger_sequence, event_id)`.
- *   2. Replays them through the projection for a *target* schema version.
- *   3. Compares the replayed projection against the currently persisted one.
- *   4. Blocks cutover on any mismatch, surfacing an explicit failure state.
- *
- * Replay runs are tracked in `cdc_replay_runs` so operators can inspect
- * status (`pending|running|verified|mismatch|failed`), progress, and the
- * first divergence. Partial replays are resumable: the last successfully
- * replayed event id is persisted and a retry continues from there.
- *
- * # Bounded queues and concurrency (issue #222)
- *
- * Event consumers use a bounded queue with backpressure. When the queue is
- * full, producers await capacity instead of buffering unboundedly. This
- * bounds memory under RPC or consumer outages and lets the indexer recover
- * with a predictable throughput once the downstream recovers.
+ * Partition identity is `"<network>:<deploymentId>"`. The legacy single
+ * `INDEXER_ID` cursor is migrated into the partition for the configured
+ * network + deployment on first start (see `migrateLegacyCursor`).
  *
  * # Table schemas
  *
@@ -62,22 +50,32 @@
  * );
  *
  * CREATE TABLE IF NOT EXISTS cdc_cursors (
- *   indexer_id      TEXT        PRIMARY KEY,
+ *   indexer_id      TEXT        PRIMARY KEY,       -- "<network>:<deploymentId>"
  *   last_ledger     BIGINT      NOT NULL,
  *   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
  * );
  *
- * CREATE TABLE IF NOT EXISTS cdc_replay_runs (
- *   run_id          TEXT        PRIMARY KEY,
- *   indexer_id      TEXT        NOT NULL,
- *   target_version  INTEGER     NOT NULL,
- *   status          TEXT        NOT NULL,          -- pending|running|verified|mismatch|failed
- *   last_event_id   TEXT,
- *   replayed_count  BIGINT      NOT NULL DEFAULT 0,
- *   mismatch_count  BIGINT      NOT NULL DEFAULT 0,
- *   first_mismatch  JSONB,
- *   error           TEXT,
- *   started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ * CREATE TABLE IF NOT EXISTS cdc_backfill_jobs (
+ *   partition_id    TEXT        NOT NULL,
+ *   job_id          TEXT        NOT NULL,
+ *   from_ledger     BIGINT      NOT NULL,
+ *   to_ledger       BIGINT      NOT NULL,
+ *   next_ledger     BIGINT      NOT NULL,
+ *   status          TEXT        NOT NULL,          -- pending|running|completed|failed
+ *   attempts        INTEGER     NOT NULL DEFAULT 0,
+ *   last_error      TEXT,
+ *   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ *   PRIMARY KEY (partition_id, job_id)
+ * );
+ *
+ * CREATE TABLE IF NOT EXISTS cdc_partition_health (
+ *   partition_id    TEXT        PRIMARY KEY,
+ *   network         TEXT        NOT NULL,
+ *   deployment_id   TEXT        NOT NULL,
+ *   state           TEXT        NOT NULL,          -- healthy|degraded|stalled
+ *   last_success_at TIMESTAMPTZ,
+ *   last_error      TEXT,
+ *   consecutive_failures INTEGER NOT NULL DEFAULT 0,
  *   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
  * );
  * ```
@@ -90,15 +88,14 @@
  * | CONTRACT_IDS          | ✓        | —                                        | Comma-separated Soroban contract IDs |
  * | STELLAR_RPC_URL       | ✗        | https://soroban-testnet.stellar.org      | Soroban RPC endpoint |
  * | NETWORK_PASSPHRASE    | ✗        | Test SDF Network ; September 2015        | Stellar network passphrase |
+ * | NETWORK               | ✗        | derived from passphrase                  | Network label used for partitioning |
+ * | DEPLOYMENT_ID         | ✗        | default                                  | Deployment identifier used for partitioning |
  * | POLL_INTERVAL_SECONDS | ✗        | 5                                        | Seconds between event polls |
  * | LEDGER_LOOKBACK       | ✗        | 1000                                     | Ledgers to look back on first start |
  * | MAX_EVENTS_PER_POLL   | ✗        | 200                                      | Max events fetched per poll cycle |
- * | INDEXER_ID            | ✗        | fundable_stream_indexer                  | Unique ID for the cursor row |
+ * | INDEXER_ID            | ✗        | fundable_stream_indexer                  | Legacy cursor ID (migrated into partition) |
  * | DRY_RUN               | ✗        | false                                    | Parse events but skip DB writes |
- * | CONSUMER_QUEUE_SIZE   | ✗        | 1000                                     | Bounded queue capacity for consumers |
- * | CONSUMER_CONCURRENCY  | ✗        | 4                                        | Max in-flight consumer tasks |
- * | REPLAY_BATCH_SIZE     | ✗        | 500                                      | Events replayed per batch |
- * | REPLAY_TARGET_VERSION | ✗        | —                                        | Target schema version for replay |
+ * | STALL_THRESHOLD_SECONDS | ✗      | 120                                      | Age of last success before a partition is `stalled` |
  *
  * # Running
  *
@@ -153,24 +150,60 @@ export interface CdcCursor {
   updatedAt: string;
 }
 
+/**
+ * A partition of the indexer: one network + one deployment. Each partition
+ * owns its cursor, backfill jobs, and health record.
+ */
+export interface Partition {
+  /** Stable partition key: "<network>:<deploymentId>" */
+  id: string;
+  network: string;
+  deploymentId: string;
+  contractIds: string[];
+  rpcUrl: string;
+  networkPassphrase: string;
+}
+
+export type PartitionState = "healthy" | "degraded" | "stalled";
+
+export interface PartitionHealth {
+  partitionId: string;
+  network: string;
+  deploymentId: string;
+  state: PartitionState;
+  lastSuccessAt: string | null;
+  lastError: string | null;
+  consecutiveFailures: number;
+  updatedAt: string;
+}
+
+export type BackfillStatus = "pending" | "running" | "completed" | "failed";
+
+export interface BackfillJob {
+  partitionId: string;
+  jobId: string;
+  fromLedger: number;
+  toLedger: number;
+  nextLedger: number;
+  status: BackfillStatus;
+  attempts: number;
+  lastError: string | null;
+  updatedAt: string;
+}
+
 export interface IndexerConfig {
   databaseUrl: string;
   contractIds: string[];
   rpcUrl: string;
   networkPassphrase: string;
+  network: string;
+  deploymentId: string;
   pollIntervalSeconds: number;
   ledgerLookback: number;
   maxEventsPerPoll: number;
   indexerId: string;
   dryRun: boolean;
-  /** Bounded queue capacity for event consumers (issue #222). */
-  consumerQueueSize: number;
-  /** Max in-flight consumer tasks (issue #222). */
-  consumerConcurrency: number;
-  /** Events replayed per batch during schema replay (issue #220). */
-  replayBatchSize: number;
-  /** Target schema version for replay (issue #220). */
-  replayTargetVersion: number | null;
+  stallThresholdSeconds: number;
 }
 
 export type LogLevel = "info" | "warn" | "error" | "debug";
@@ -178,72 +211,6 @@ export type LogLevel = "info" | "warn" | "error" | "debug";
 /** Pluggable DB interface for testing. */
 export interface DbClient {
   query<T = unknown>(sql: string, params?: unknown[]): Promise<{ rows: T[] }>;
-}
-
-// ── Replay types (issue #220) ─────────────────────────────────────────────────
-
-export type ReplayStatus =
-  | "pending"
-  | "running"
-  | "verified"
-  | "mismatch"
-  | "failed";
-
-export interface ReplayMismatch {
-  eventId: string;
-  field: string;
-  expected: unknown;
-  actual: unknown;
-}
-
-export interface ReplayRun {
-  runId: string;
-  indexerId: string;
-  targetVersion: number;
-  status: ReplayStatus;
-  lastEventId: string | null;
-  replayedCount: number;
-  mismatchCount: number;
-  firstMismatch: ReplayMismatch | null;
-  error: string | null;
-  startedAt: string;
-  updatedAt: string;
-}
-
-/**
- * A projection maps a raw retained event to a deterministic output record.
- * Different schema versions provide different projections; replay compares
- * the target projection's output against the currently persisted output.
- */
-export interface Projection {
-  schemaVersion: number;
-  /** Deterministically project a single event into a comparable record. */
-  project(event: StreamEvent): Record<string, unknown>;
-}
-
-/** A persisted projection row used as the comparison baseline. */
-export interface PersistedProjection {
-  eventId: string;
-  output: Record<string, unknown>;
-}
-
-export interface ReplayOptions {
-  runId: string;
-  indexerId: string;
-  targetVersion: number;
-  batchSize: number;
-  /** Resume from this event id (exclusive) for partial-replay retries. */
-  resumeAfterEventId?: string | null;
-}
-
-export interface ReplayResult {
-  runId: string;
-  status: ReplayStatus;
-  replayedCount: number;
-  mismatchCount: number;
-  firstMismatch: ReplayMismatch | null;
-  lastEventId: string | null;
-  error: string | null;
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -256,9 +223,8 @@ export class IndexerError extends Error {
       | "DB_ERROR"
       | "RPC_ERROR"
       | "PARSE_ERROR"
-      | "REPLAY_MISMATCH"
-      | "REPLAY_FAILED"
-      | "QUEUE_CLOSED"
+      | "UNKNOWN_DEPLOYMENT"
+      | "UNAUTHORIZED"
   ) {
     super(message);
     this.name = "IndexerError";
@@ -284,19 +250,23 @@ export function log(
   out.write(JSON.stringify(entry) + "\n");
 }
 
-// ── Config ────────────────────────────────────────────────────────────────────
+// ── Partition helpers ─────────────────────────────────────────────────────────
 
-function positiveInt(value: string | undefined, fallback: number, name: string): number {
-  if (value === undefined || value === "") return fallback;
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
-    throw new IndexerError(
-      `${name} must be a positive integer (got ${value})`,
-      "CONFIG_ERROR"
-    );
-  }
-  return parsed;
+/** Build the stable partition key for a network + deployment pair. */
+export function partitionId(network: string, deploymentId: string): string {
+  return `${network}:${deploymentId}`;
 }
+
+/** Derive a human-readable network label from a passphrase. */
+export function deriveNetworkLabel(passphrase: string): string {
+  if (passphrase === Networks.PUBLIC) return "public";
+  if (passphrase === Networks.TESTNET) return "testnet";
+  if (passphrase === Networks.FUTURENET) return "futurenet";
+  if (passphrase === Networks.SANDBOX) return "sandbox";
+  return "custom";
+}
+
+// ── Config ────────────────────────────────────────────────────────────────────
 
 export function loadConfig(): IndexerConfig {
   const databaseUrl = process.env.DATABASE_URL;
@@ -330,26 +300,42 @@ export function loadConfig(): IndexerConfig {
     }
   }
 
-  const replayTargetRaw = process.env.REPLAY_TARGET_VERSION;
-  let replayTargetVersion: number | null = null;
-  if (replayTargetRaw !== undefined && replayTargetRaw !== "") {
-    replayTargetVersion = positiveInt(replayTargetRaw, 1, "REPLAY_TARGET_VERSION");
+  const networkPassphrase = process.env.NETWORK_PASSPHRASE ?? Networks.TESTNET;
+  const network = process.env.NETWORK ?? deriveNetworkLabel(networkPassphrase);
+  const deploymentId = process.env.DEPLOYMENT_ID ?? "default";
+
+  if (!network.trim()) {
+    throw new IndexerError("NETWORK must not be empty", "CONFIG_ERROR");
+  }
+  if (!deploymentId.trim()) {
+    throw new IndexerError("DEPLOYMENT_ID must not be empty", "CONFIG_ERROR");
   }
 
   return {
     databaseUrl,
     contractIds,
     rpcUrl: process.env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org",
-    networkPassphrase: process.env.NETWORK_PASSPHRASE ?? Networks.TESTNET,
+    networkPassphrase,
+    network,
+    deploymentId,
     pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 5),
     ledgerLookback: Number(process.env.LEDGER_LOOKBACK ?? 1_000),
     maxEventsPerPoll: Number(process.env.MAX_EVENTS_PER_POLL ?? 200),
     indexerId: process.env.INDEXER_ID ?? "fundable_stream_indexer",
     dryRun: process.env.DRY_RUN === "true",
-    consumerQueueSize: positiveInt(process.env.CONSUMER_QUEUE_SIZE, 1_000, "CONSUMER_QUEUE_SIZE"),
-    consumerConcurrency: positiveInt(process.env.CONSUMER_CONCURRENCY, 4, "CONSUMER_CONCURRENCY"),
-    replayBatchSize: positiveInt(process.env.REPLAY_BATCH_SIZE, 500, "REPLAY_BATCH_SIZE"),
-    replayTargetVersion,
+    stallThresholdSeconds: Number(process.env.STALL_THRESHOLD_SECONDS ?? 120),
+  };
+}
+
+/** Build the partition descriptor for the configured network + deployment. */
+export function buildPartition(config: IndexerConfig): Partition {
+  return {
+    id: partitionId(config.network, config.deploymentId),
+    network: config.network,
+    deploymentId: config.deploymentId,
+    contractIds: config.contractIds,
+    rpcUrl: config.rpcUrl,
+    networkPassphrase: config.networkPassphrase,
   };
 }
 
@@ -407,29 +393,41 @@ export async function ensureSchema(db: DbClient): Promise<void> {
   `);
 
   await db.query(`
-    CREATE TABLE IF NOT EXISTS cdc_replay_runs (
-      run_id          TEXT        PRIMARY KEY,
-      indexer_id      TEXT        NOT NULL,
-      target_version  INTEGER     NOT NULL,
-      status          TEXT        NOT NULL,
-      last_event_id   TEXT,
-      replayed_count  BIGINT      NOT NULL DEFAULT 0,
-      mismatch_count  BIGINT      NOT NULL DEFAULT 0,
-      first_mismatch  JSONB,
-      error           TEXT,
-      started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    CREATE TABLE IF NOT EXISTS cdc_backfill_jobs (
+      partition_id TEXT        NOT NULL,
+      job_id       TEXT        NOT NULL,
+      from_ledger  BIGINT      NOT NULL,
+      to_ledger    BIGINT      NOT NULL,
+      next_ledger  BIGINT      NOT NULL,
+      status       TEXT        NOT NULL,
+      attempts     INTEGER     NOT NULL DEFAULT 0,
+      last_error   TEXT,
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (partition_id, job_id)
     )
   `);
 
   await db.query(`
-    CREATE INDEX IF NOT EXISTS idx_cdc_replay_runs_indexer
-      ON cdc_replay_runs (indexer_id, started_at DESC)
+    CREATE INDEX IF NOT EXISTS idx_cdc_backfill_jobs_partition
+      ON cdc_backfill_jobs (partition_id, status)
+  `);
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS cdc_partition_health (
+      partition_id         TEXT        PRIMARY KEY,
+      network              TEXT        NOT NULL,
+      deployment_id        TEXT        NOT NULL,
+      state                TEXT        NOT NULL,
+      last_success_at      TIMESTAMPTZ,
+      last_error           TEXT,
+      consecutive_failures INTEGER     NOT NULL DEFAULT 0,
+      updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
   `);
 }
 
 /**
- * Read the last processed ledger for this indexer instance.
+ * Read the last processed ledger for a partition.
  * Returns `null` if no cursor exists (first run).
  */
 export async function getCursor(
@@ -445,7 +443,7 @@ export async function getCursor(
 }
 
 /**
- * Persist the latest processed ledger sequence.
+ * Persist the latest processed ledger sequence for a partition.
  */
 export async function setCursor(
   db: DbClient,
@@ -459,6 +457,39 @@ export async function setCursor(
      DO UPDATE SET last_ledger = EXCLUDED.last_ledger, updated_at = NOW()`,
     [indexerId, lastLedger]
   );
+}
+
+/**
+ * Migrate a legacy single-indexer cursor into the partition cursor.
+ *
+ * Older deployments stored a cursor under `INDEXER_ID` (e.g.
+ * `fundable_stream_indexer`). On first start of a partitioned deployment we
+ * copy that value into the partition cursor if — and only if — the partition
+ * cursor does not yet exist. This preserves resume position across the
+ * upgrade without duplicating or skipping ledgers.
+ *
+ * Returns `true` if a migration occurred.
+ */
+export async function migrateLegacyCursor(
+  db: DbClient,
+  legacyIndexerId: string,
+  partition: Partition
+): Promise<boolean> {
+  if (legacyIndexerId === partition.id) return false;
+
+  const existing = await getCursor(db, partition.id);
+  if (existing !== null) return false;
+
+  const legacy = await getCursor(db, legacyIndexerId);
+  if (legacy === null) return false;
+
+  await setCursor(db, partition.id, legacy);
+  log("info", "Migrated legacy cursor into partition", {
+    partitionId: partition.id,
+    legacyIndexerId,
+    lastLedger: legacy,
+  });
+  return true;
 }
 
 /**
@@ -497,6 +528,290 @@ export async function insertEvents(
     if ((result as unknown as { rowCount: number }).rowCount > 0) inserted++;
   }
   return inserted;
+}
+
+// ── Partition health ──────────────────────────────────────────────────────────
+
+/**
+ * Compute the explicit health state for a partition from its persisted
+ * record. A partition with no recorded success and no failures is `healthy`
+ * (it has simply not run yet). A partition whose last success is older than
+ * the stall threshold is `stalled` regardless of failure count.
+ */
+export function computePartitionState(
+  health: Pick<PartitionHealth, "lastSuccessAt" | "consecutiveFailures">,
+  stallThresholdSeconds: number,
+  now: number = Date.now()
+): PartitionState {
+  if (health.lastSuccessAt) {
+    const ageSeconds = (now - new Date(health.lastSuccessAt).getTime()) / 1_000;
+    if (ageSeconds > stallThresholdSeconds) return "stalled";
+  }
+  if (health.consecutiveFailures > 0) return "degraded";
+  return "healthy";
+}
+
+/** Read the persisted health record for a partition, if any. */
+export async function getPartitionHealth(
+  db: DbClient,
+  partitionIdValue: string
+): Promise<PartitionHealth | null> {
+  const result = await db.query<{
+    partition_id: string;
+    network: string;
+    deployment_id: string;
+    state: PartitionState;
+    last_success_at: string | null;
+    last_error: string | null;
+    consecutive_failures: number;
+    updated_at: string;
+  }>(
+    `SELECT partition_id, network, deployment_id, state, last_success_at,
+            last_error, consecutive_failures, updated_at
+       FROM cdc_partition_health
+      WHERE partition_id = $1`,
+    [partitionIdValue]
+  );
+  if (result.rows.length === 0) return null;
+  const row = result.rows[0];
+  return {
+    partitionId: row.partition_id,
+    network: row.network,
+    deploymentId: row.deployment_id,
+    state: row.state,
+    lastSuccessAt: row.last_success_at
+      ? new Date(row.last_success_at).toISOString()
+      : null,
+    lastError: row.last_error,
+    consecutiveFailures: Number(row.consecutive_failures),
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+/**
+ * Record a successful poll cycle for a partition. Resets the failure counter
+ * and marks the partition `healthy`.
+ */
+export async function recordPartitionSuccess(
+  db: DbClient,
+  partition: Partition
+): Promise<void> {
+  await db.query(
+    `INSERT INTO cdc_partition_health (
+       partition_id, network, deployment_id, state, last_success_at,
+       last_error, consecutive_failures, updated_at
+     ) VALUES ($1, $2, $3, 'healthy', NOW(), NULL, 0, NOW())
+     ON CONFLICT (partition_id) DO UPDATE SET
+       state = 'healthy',
+       last_success_at = NOW(),
+       last_error = NULL,
+       consecutive_failures = 0,
+       updated_at = NOW()`,
+    [partition.id, partition.network, partition.deploymentId]
+  );
+}
+
+/**
+ * Record a failed poll cycle for a partition. Increments the failure counter,
+ * stores the error, and derives the explicit state (`degraded` or `stalled`).
+ * Returns the resulting state so callers can surface it.
+ */
+export async function recordPartitionFailure(
+  db: DbClient,
+  partition: Partition,
+  error: string,
+  stallThresholdSeconds: number
+): Promise<PartitionState> {
+  const existing = await getPartitionHealth(db, partition.id);
+  const consecutiveFailures = (existing?.consecutiveFailures ?? 0) + 1;
+  const lastSuccessAt = existing?.lastSuccessAt ?? null;
+  const state = computePartitionState(
+    { lastSuccessAt, consecutiveFailures },
+    stallThresholdSeconds
+  );
+
+  await db.query(
+    `INSERT INTO cdc_partition_health (
+       partition_id, network, deployment_id, state, last_success_at,
+       last_error, consecutive_failures, updated_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+     ON CONFLICT (partition_id) DO UPDATE SET
+       state = EXCLUDED.state,
+       last_error = EXCLUDED.last_error,
+       consecutive_failures = EXCLUDED.consecutive_failures,
+       updated_at = NOW()`,
+    [
+      partition.id,
+      partition.network,
+      partition.deploymentId,
+      state,
+      lastSuccessAt,
+      error,
+      consecutiveFailures,
+    ]
+  );
+
+  return state;
+}
+
+// ── Backfill jobs ─────────────────────────────────────────────────────────────
+
+/** Enqueue a backfill job scoped to a partition. */
+export async function enqueueBackfill(
+  db: DbClient,
+  partition: Partition,
+  jobId: string,
+  fromLedger: number,
+  toLedger: number
+): Promise<void> {
+  if (fromLedger > toLedger) {
+    throw new IndexerError(
+      `Invalid backfill range: fromLedger ${fromLedger} > toLedger ${toLedger}`,
+      "CONFIG_ERROR"
+    );
+  }
+  await db.query(
+    `INSERT INTO cdc_backfill_jobs (
+       partition_id, job_id, from_ledger, to_ledger, next_ledger, status,
+       attempts, last_error, updated_at
+     ) VALUES ($1, $2, $3, $4, $3, 'pending', 0, NULL, NOW())
+     ON CONFLICT (partition_id, job_id) DO NOTHING`,
+    [partition.id, jobId, fromLedger, toLedger]
+  );
+}
+
+/** List backfill jobs for a partition (optionally filtered by status). */
+export async function listBackfills(
+  db: DbClient,
+  partitionIdValue: string,
+  status?: BackfillStatus
+): Promise<BackfillJob[]> {
+  const params: unknown[] = [partitionIdValue];
+  let sql = `SELECT partition_id, job_id, from_ledger, to_ledger, next_ledger,
+                    status, attempts, last_error, updated_at
+               FROM cdc_backfill_jobs
+              WHERE partition_id = $1`;
+  if (status) {
+    params.push(status);
+    sql += ` AND status = $2`;
+  }
+  sql += ` ORDER BY job_id`;
+
+  const result = await db.query<{
+    partition_id: string;
+    job_id: string;
+    from_ledger: string;
+    to_ledger: string;
+    next_ledger: string;
+    status: BackfillStatus;
+    attempts: number;
+    last_error: string | null;
+    updated_at: string;
+  }>(sql, params);
+
+  return result.rows.map((row) => ({
+    partitionId: row.partition_id,
+    jobId: row.job_id,
+    fromLedger: Number(row.from_ledger),
+    toLedger: Number(row.to_ledger),
+    nextLedger: Number(row.next_ledger),
+    status: row.status,
+    attempts: Number(row.attempts),
+    lastError: row.last_error,
+    updatedAt: new Date(row.updated_at).toISOString(),
+  }));
+}
+
+/**
+ * Advance a backfill job's progress. Marks the job `completed` when the
+ * cursor reaches `to_ledger`.
+ */
+export async function advanceBackfill(
+  db: DbClient,
+  partitionIdValue: string,
+  jobId: string,
+  nextLedger: number
+): Promise<void> {
+  await db.query(
+    `UPDATE cdc_backfill_jobs
+        SET next_ledger = $3,
+            status = CASE WHEN $3 > to_ledger THEN 'completed' ELSE 'running' END,
+            updated_at = NOW()
+      WHERE partition_id = $1 AND job_id = $2`,
+    [partitionIdValue, jobId, nextLedger]
+  );
+}
+
+/**
+ * Record a failed backfill attempt. Increments `attempts` and stores the
+ * error. The job remains retryable (`failed`) unless it has exhausted its
+ * attempts budget, in which case it stays `failed` for operator inspection.
+ */
+export async function failBackfill(
+  db: DbClient,
+  partitionIdValue: string,
+  jobId: string,
+  error: string
+): Promise<void> {
+  await db.query(
+    `UPDATE cdc_backfill_jobs
+        SET status = 'failed',
+            attempts = attempts + 1,
+            last_error = $3,
+            updated_at = NOW()
+      WHERE partition_id = $1 AND job_id = $2`,
+    [partitionIdValue, jobId, error]
+  );
+}
+
+/**
+ * Reset a failed backfill job so it can be retried. Only jobs belonging to
+ * the given partition are affected — a partition cannot retry another
+ * partition's jobs.
+ */
+export async function retryBackfill(
+  db: DbClient,
+  partitionIdValue: string,
+  jobId: string
+): Promise<boolean> {
+  const result = await db.query(
+    `UPDATE cdc_backfill_jobs
+        SET status = 'pending',
+            last_error = NULL,
+            updated_at = NOW()
+      WHERE partition_id = $1 AND job_id = $2 AND status = 'failed'`,
+    [partitionIdValue, jobId]
+  );
+  return (result as unknown as { rowCount: number }).rowCount > 0;
+}
+
+// ── Operator authorization ────────────────────────────────────────────────────
+
+/**
+ * Authorize an operator action against a partition.
+ *
+ * Operators may only act on partitions they are explicitly scoped to. An
+ * operator with no scope (empty list) is treated as unauthorized for every
+ * partition — least privilege by default. Unknown deployments are rejected
+ * with `UNKNOWN_DEPLOYMENT` so callers can distinguish a typo from a
+ * permission problem.
+ */
+export function authorizeOperator(
+  operator: { id: string; allowedPartitions: string[] },
+  partition: Partition | null
+): void {
+  if (!partition) {
+    throw new IndexerError(
+      "Unknown deployment: partition does not exist",
+      "UNKNOWN_DEPLOYMENT"
+    );
+  }
+  if (!operator.allowedPartitions.includes(partition.id)) {
+    throw new IndexerError(
+      `Operator ${operator.id} is not authorized for partition ${partition.id}`,
+      "UNAUTHORIZED"
+    );
+  }
 }
 
 // ── Event parsing ─────────────────────────────────────────────────────────────
@@ -639,355 +954,63 @@ export async function getCurrentLedger(rpc: RpcServer): Promise<number> {
   }
 }
 
-// ── Bounded queue (issue #222) ────────────────────────────────────────────────
+// ── Main poll cycle ───────────────────────────────────────────────────────────
 
 /**
- * A bounded async queue with backpressure.
+ * Run one full poll cycle for a single partition:
+ *   1. Read the partition cursor from DB.
+ *   2. Fetch events since cursor (or lookback) from RPC.
+ *   3. Parse and upsert into stream_events.
+ *   4. Advance the partition cursor to latest ledger.
+ *   5. Record partition health (success or failure).
  *
- * Producers `push` items; when the queue is at capacity, `push` awaits until
- * a consumer drains an item. This bounds memory under downstream outages.
- * Consumers `shift` items; when empty, `shift` awaits until an item arrives
- * or the queue is closed.
+ * Errors are isolated to this partition: they are recorded against the
+ * partition's health row and never thrown to the caller, so a stalled
+ * partition cannot block other partitions' loops.
  *
- * The queue exposes `size`, `capacity`, and `highWaterMark` so operators can
- * observe pressure. `close` unblocks all waiters with a `QUEUE_CLOSED` error.
+ * Returns the number of new events indexed.
  */
-export class BoundedQueue<T> {
-  private readonly items: T[] = [];
-  private readonly pushWaiters: Array<() => void> = [];
-  private readonly shiftWaiters: Array<(item: T | null) => void> = [];
-  private closed = false;
-  private _highWaterMark = 0;
-
-  constructor(public readonly capacity: number) {
-    if (!Number.isInteger(capacity) || capacity <= 0) {
-      throw new IndexerError(
-        `BoundedQueue capacity must be a positive integer (got ${capacity})`,
-        "CONFIG_ERROR"
-      );
-    }
-  }
-
-  get size(): number {
-    return this.items.length;
-  }
-
-  get highWaterMark(): number {
-    return this._highWaterMark;
-  }
-
-  get isClosed(): boolean {
-    return this.closed;
-  }
-
-  /**
-   * Enqueue an item. Resolves once the item is accepted; if the queue is at
-   * capacity, waits for a consumer to make room (backpressure).
-   */
-  async push(item: T): Promise<void> {
-    if (this.closed) {
-      throw new IndexerError("Cannot push to a closed queue", "QUEUE_CLOSED");
-    }
-    while (this.items.length >= this.capacity) {
-      if (this.closed) {
-        throw new IndexerError("Queue closed while waiting for capacity", "QUEUE_CLOSED");
-      }
-      await new Promise<void>((resolve) => this.pushWaiters.push(resolve));
-    }
-    if (this.closed) {
-      throw new IndexerError("Queue closed before item was accepted", "QUEUE_CLOSED");
-    }
-    this.items.push(item);
-    if (this.items.length > this._highWaterMark) {
-      this._highWaterMark = this.items.length;
-    }
-    const waiter = this.shiftWaiters.shift();
-    if (waiter) waiter(item);
-  }
-
-  /**
-   * Dequeue an item. Resolves with the next item, or waits until one is
-   * available. Resolves with `null` if the queue is closed and drained.
-   */
-  async shift(): Promise<T | null> {
-    if (this.items.length > 0) {
-      const item = this.items.shift() as T;
-      const waiter = this.pushWaiters.shift();
-      if (waiter) waiter();
-      return item;
-    }
-    if (this.closed) return null;
-    return new Promise<T | null>((resolve) => this.shiftWaiters.push(resolve));
-  }
-
-  /** Close the queue, unblocking all waiters. */
-  close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    for (const waiter of this.pushWaiters.splice(0)) waiter();
-    for (const waiter of this.shiftWaiters.splice(0)) waiter(null);
-  }
-}
-
-/**
- * Run a bounded-concurrency consumer over a queue.
- *
- * Spawns up to `concurrency` workers that pull from `queue` and invoke
- * `handler`. Returns a promise that resolves when the queue is closed and
- * drained. Errors from `handler` are surfaced via `onError` and do not stop
- * the workers (retry is the caller's responsibility).
- */
-export async function runConsumerPool<T>(
-  queue: BoundedQueue<T>,
-  concurrency: number,
-  handler: (item: T) => Promise<void>,
-  onError?: (err: Error, item: T) => void
-): Promise<void> {
-  if (!Number.isInteger(concurrency) || concurrency <= 0) {
-    throw new IndexerError(
-      `Consumer concurrency must be a positive integer (got ${concurrency})`,
-      "CONFIG_ERROR"
-    );
-  }
-
-  const workers: Array<Promise<void>> = [];
-  for (let i = 0; i < concurrency; i++) {
-    workers.push(
-      (async () => {
-        for (;;) {
-          const item = await queue.shift();
-          if (item === null) return;
-          try {
-            await handler(item);
-          } catch (err) {
-            if (onError) onError(err as Error, item);
-            else log("error", "Consumer handler failed", { error: (err as Error).message });
-          }
-        }
-      })()
-    );
-  }
-  await Promise.all(workers);
-}
-
-// ── Replay engine (issue #220) ────────────────────────────────────────────────
-
-/** Deterministic JSON serialization for projection comparison. */
-export function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((v) => stableStringify(v)).join(",")}]`;
-  }
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
-  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
-}
-
-/**
- * Compare a replayed projection against the persisted baseline.
- * Returns the first mismatch, or `null` if they match.
- */
-export function compareProjections(
-  eventId: string,
-  replayed: Record<string, unknown>,
-  persisted: Record<string, unknown> | undefined
-): ReplayMismatch | null {
-  if (persisted === undefined) {
-    return { eventId, field: "<row>", expected: "present", actual: "missing" };
-  }
-  const keys = new Set([...Object.keys(replayed), ...Object.keys(persisted)]);
-  for (const key of [...keys].sort()) {
-    const a = stableStringify(replayed[key]);
-    const b = stableStringify(persisted[key]);
-    if (a !== b) {
-      return { eventId, field: key, expected: persisted[key], actual: replayed[key] };
-    }
-  }
-  return null;
-}
-
-/**
- * Read retained raw events ordered deterministically, resuming after
- * `resumeAfterEventId` (exclusive) for partial-replay retries.
- */
-export async function readRetainedEvents(
+export async function runPollCycle(
   db: DbClient,
-  indexerId: string,
-  limit: number,
-  resumeAfterEventId?: string | null
-): Promise<StreamEvent[]> {
-  const params: unknown[] = [];
-  let where = "";
-  if (resumeAfterEventId) {
-    // Resume strictly after the last successfully replayed event, ordered by
-    // (ledger_sequence, event_id) to match the replay ordering.
-    params.push(resumeAfterEventId);
-    where = `WHERE (ledger_sequence, event_id) > (
-      SELECT ledger_sequence, event_id FROM stream_events WHERE event_id = $1
-    )`;
-  }
-  params.push(limit);
-
-  const result = await db.query<{
-    event_id: string;
-    contract_id: string;
-    event_type: string;
-    ledger_sequence: string;
-    ledger_timestamp: string;
-    tx_hash: string;
-    sender: string | null;
-    recipient: string | null;
-    asset: string | null;
-    amount: string | null;
-    stream_id: string | null;
-    raw_xdr: string;
-  }>(
-    `SELECT event_id, contract_id, event_type, ledger_sequence, ledger_timestamp,
-            tx_hash, sender, recipient, asset, amount, stream_id, raw_xdr
-       FROM stream_events
-       ${where}
-      ORDER BY ledger_sequence ASC, event_id ASC
-      LIMIT $${params.length}`,
-    params
-  );
-
-  return result.rows.map((row) => ({
-    eventId: row.event_id,
-    contractId: row.contract_id,
-    eventType: row.event_type as StreamEventType,
-    ledgerSequence: Number(row.ledger_sequence),
-    ledgerTimestamp:
-      row.ledger_timestamp instanceof Date
-        ? (row.ledger_timestamp as unknown as Date).toISOString()
-        : String(row.ledger_timestamp),
-    txHash: row.tx_hash,
-    sender: row.sender,
-    recipient: row.recipient,
-    asset: row.asset,
-    amount: row.amount,
-    streamId: row.stream_id,
-    rawXdr: row.raw_xdr,
-  }));
-}
-
-/**
- * Read the persisted projection baseline for the given event ids.
- */
-export async function readPersistedProjections(
-  db: DbClient,
-  eventIds: string[]
-): Promise<Map<string, Record<string, unknown>>> {
-  const map = new Map<string, Record<string, unknown>>();
-  if (eventIds.length === 0) return map;
-
-  const result = await db.query<{
-    event_id: string;
-    contract_id: string;
-    event_type: string;
-    ledger_sequence: string;
-    ledger_timestamp: string;
-    tx_hash: string;
-    sender: string | null;
-    recipient: string | null;
-    asset: string | null;
-    amount: string | null;
-    stream_id: string | null;
-  }>(
-    `SELECT event_id, contract_id, event_type, ledger_sequence, ledger_timestamp,
-            tx_hash, sender, recipient, asset, amount, stream_id
-       FROM stream_events
-      WHERE event_id = ANY($1::text[])`,
-    [eventIds]
-  );
-
-  for (const row of result.rows) {
-    map.set(row.event_id, {
-      eventId: row.event_id,
-      contractId: row.contract_id,
-      eventType: row.event_type,
-      ledgerSequence: Number(row.ledger_sequence),
-      ledgerTimestamp:
-        row.ledger_timestamp instanceof Date
-          ? (row.ledger_timestamp as unknown as Date).toISOString()
-          : String(row.ledger_timestamp),
-      txHash: row.tx_hash,
-      sender: row.sender,
-      recipient: row.recipient,
-      asset: row.asset,
-      amount: row.amount,
-      streamId: row.stream_id,
+  rpc: RpcServer,
+  config: IndexerConfig,
+  partition: Partition = buildPartition(config)
+): Promise<number> {
+  try {
+    return await runPollCycleInner(db, rpc, config, partition);
+  } catch (err) {
+    const message = (err as Error).message;
+    log("error", "Poll cycle failed for partition — isolating", {
+      partitionId: partition.id,
+      error: message,
     });
+    try {
+      const state = await recordPartitionFailure(
+        db,
+        partition,
+        message,
+        config.stallThresholdSeconds
+      );
+      log("warn", "Partition marked unhealthy", {
+        partitionId: partition.id,
+        state,
+      });
+    } catch (healthErr) {
+      log("error", "Failed to record partition failure", {
+        partitionId: partition.id,
+        error: (healthErr as Error).message,
+      });
+    }
+    return 0;
   }
-  return map;
 }
 
-/** Persist replay run status for operator visibility. */
-export async function upsertReplayRun(
+async function runPollCycleInner(
   db: DbClient,
-  run: ReplayRun
-): Promise<void> {
-  await db.query(
-    `INSERT INTO cdc_replay_runs (
-       run_id, indexer_id, target_version, status, last_event_id,
-       replayed_count, mismatch_count, first_mismatch, error, started_at, updated_at
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
-     ON CONFLICT (run_id) DO UPDATE SET
-       status = EXCLUDED.status,
-       last_event_id = EXCLUDED.last_event_id,
-       replayed_count = EXCLUDED.replayed_count,
-       mismatch_count = EXCLUDED.mismatch_count,
-       first_mismatch = EXCLUDED.first_mismatch,
-       error = EXCLUDED.error,
-       updated_at = NOW()`,
-    [
-      run.runId,
-      run.indexerId,
-      run.targetVersion,
-      run.status,
-      run.lastEventId,
-      run.replayedCount,
-      run.mismatchCount,
-      run.firstMismatch ? JSON.stringify(run.firstMismatch) : null,
-      run.error,
-      run.startedAt,
-    ]
-  );
-}
-
-/** Read a replay run by id, or `null` if it does not exist. */
-export async function getReplayRun(
-  db: DbClient,
-  runId: string
-): Promise<ReplayRun | null> {
-  const result = await db.query<{
-    run_id: string;
-    indexer_id: string;
-    target_version: number;
-    status: string;
-    last_event_id: string | null;
-    replayed_count: string;
-    mismatch_count: string;
-    first_mismatch: ReplayMismatch | null;
-    error: string | null;
-    started_at: string;
-    updated_at: string;
-  }>(
-    `SELECT run_id, indexer_id, target_version, status, last_event_id,
-            replayed_count, mismatch_count, first_mismatch, error,
-            started_at, updated_at
-       FROM cdc_replay_runs
-      WHERE run_id = $1`,
-    [runId]
-  );
-  if (result.rows.length === 0) return null;
-  const row = result.rows[0];
-  return {
-    runId: row.run_id,
-    indexerId: row.indexer_id,
-    targetVersion: Number(row.target_version),
-    status: row.status as ReplayStatus,
-    lastEventId: row.last_event_id,
-    replayedCount: Number(row.replayed_count),
-    mismatchCount: Number(row
+  rpc: RpcServer,
+  config: IndexerConfig,
+  partition: Partition
+): Promise<number> {
+  // Step 1: determine start ledger
+  const cursor = await getCursor(db, partition.id);
+  let currentLedger: number;

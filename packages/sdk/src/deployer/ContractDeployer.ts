@@ -26,14 +26,15 @@ import {
   ContractInstantiationError,
   FeeEstimationError,
   DeploymentTimeoutError,
+  ReadinessCheckError,
 } from './errors.js';
 import { resolveRpcServerOptions } from '../utils/rpcConnectionOptions.js';
 import { secureRandomBytes } from '../utils/secureRandom.js';
 import {
-  DeploymentRegistry,
-  type DeploymentRecord,
-  type DeploymentRegistryStore,
-} from './DeploymentRegistry.js';
+  validatePreLaunchReadiness,
+  type ReadinessChecklist,
+  type ReadinessReport,
+} from './readiness.js';
 
 const DEFAULT_BASE_FEE = '100';
 const DEFAULT_TIMEOUT = 60;
@@ -72,6 +73,8 @@ export class ContractDeployer {
   private readonly networkPassphrase: string | undefined;
   private readonly baseFee: string;
   private readonly timeoutSeconds: number;
+  /** Optional pre-launch readiness checklist enforced before any deployment. */
+  private readonly readinessChecklist: ReadinessChecklist | undefined;
   /** Cached promise so the RPC fetch happens at most once. */
   private passphrasePromise: Promise<string> | undefined;
   /** Optional validated deployment registry. */
@@ -97,14 +100,7 @@ export class ContractDeployer {
     this.networkPassphrase = config.networkPassphrase;
     this.baseFee = config.baseFee ?? DEFAULT_BASE_FEE;
     this.timeoutSeconds = config.timeoutSeconds ?? DEFAULT_TIMEOUT;
-    this.network = config.network;
-    this.specVersion = config.specVersion;
-    this.registry = config.registry
-      ? new DeploymentRegistry(config.registry, {
-          network: config.network,
-          specVersion: config.specVersion,
-        })
-      : undefined;
+    this.readinessChecklist = config.readinessChecklist;
   }
 
   // ─── Async factory ─────────────────────────────────────────────────────────
@@ -157,6 +153,34 @@ export class ContractDeployer {
    */
   async getNetworkPassphrase(): Promise<string> {
     return this.resolveNetworkPassphrase();
+  }
+
+  // ─── Pre-launch readiness ──────────────────────────────────────────────────
+
+  /**
+   * Runs the configured pre-launch readiness checklist without deploying
+   * anything. Returns the full report so operators can inspect every check.
+   *
+   * When no checklist is configured the report is trivially ready.
+   */
+  async checkReadiness(): Promise<ReadinessReport> {
+    if (!this.readinessChecklist) {
+      return { ready: true, checks: [] };
+    }
+    return validatePreLaunchReadiness(this.readinessChecklist);
+  }
+
+  /**
+   * Enforces the readiness checklist, throwing a {@link ReadinessCheckError}
+   * that lists every failed check when the deployment must be blocked.
+   *
+   * @throws {ReadinessCheckError} When one or more readiness checks fail.
+   */
+  async assertReady(): Promise<void> {
+    const report = await this.checkReadiness();
+    if (!report.ready) {
+      throw new ReadinessCheckError(report);
+    }
   }
 
   // ─── Fee / resource estimation ─────────────────────────────────────────────
@@ -217,6 +241,7 @@ export class ContractDeployer {
  */
 
   async uploadWasm(wasm: Buffer | Uint8Array, deployer: Deployer): Promise<WasmUploadResult> {
+    await this.assertReady();
     this.assertValidWasm(wasm);
 
     const deployerAddress = this.getDeployerAddress(deployer);
@@ -278,6 +303,7 @@ export class ContractDeployer {
     deployer: Deployer,
     salt?: Buffer,
   ): Promise<ContractDeployResult> {
+    await this.assertReady();
     const deployerAddress = this.getDeployerAddress(deployer);
     // Resolve the salt once so the same value is used in both the transaction
     // and the contract-ID derivation.
@@ -333,6 +359,10 @@ export class ContractDeployer {
     deployer: Deployer,
     salt?: Buffer,
   ): Promise<{ upload: WasmUploadResult; deploy: ContractDeployResult }> {
+    // Validate once up front so a failing checklist blocks before any network
+    // round-trip; the individual methods re-check to stay safe when called
+    // directly.
+    await this.assertReady();
     const upload = await this.uploadWasm(wasm, deployer);
     const deploy = await this.deployContract(upload.wasmHash, deployer, salt);
     return { upload, deploy };

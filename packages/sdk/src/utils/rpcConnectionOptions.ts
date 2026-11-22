@@ -7,132 +7,39 @@
 
 const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
 
-/** Hard upper bound on consumer queue capacity to keep memory bounded. */
-export const MAX_QUEUE_CAPACITY = 100_000;
-/** Hard upper bound on concurrent in-flight consumer requests. */
-export const MAX_CONCURRENCY = 256;
-/** Hard upper bound on retry attempts for a single consumer request. */
-export const MAX_RETRY_ATTEMPTS = 10;
-/** Hard upper bound on retry base delay (ms). */
-export const MAX_RETRY_BASE_DELAY_MS = 60_000;
-/** Hard upper bound on retry jitter ratio (fraction of the base delay). */
-export const MAX_RETRY_JITTER_RATIO = 1;
+export interface RpcTransportRequest {
+  url: string;
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  timeoutMs?: number;
+}
+
+export interface RpcTransportResponse<T = unknown> {
+  status: number;
+  data: T;
+  headers?: Record<string, string>;
+}
+
+export interface RpcTransportErrorDetails {
+  code: string;
+  message: string;
+  statusCode?: number;
+  retryable?: boolean;
+  context?: Record<string, unknown>;
+}
+
+export type CustomRpcTransport = (
+  req: RpcTransportRequest
+) => Promise<RpcTransportResponse>;
 
 export interface RpcConnectionOptions {
   /** Opt in to plain HTTP for local loopback RPC/Horizon URLs. Defaults to false. */
   allowHttp?: boolean;
-  /** Maximum number of queued events before backpressure is applied. */
-  queueCapacity?: number;
-  /** Maximum number of concurrent in-flight consumer requests. */
-  concurrency?: number;
-  /** Retry policy applied to failed consumer requests. */
-  retry?: RpcRetryOptions;
-}
-
-export interface RpcRetryOptions {
-  /** Maximum retry attempts (0 disables retries). Defaults to 3. */
-  maxAttempts?: number;
-  /** Base delay in milliseconds used for exponential backoff. Defaults to 250. */
-  baseDelayMs?: number;
-  /** Jitter ratio in [0, 1] applied to each backoff delay. Defaults to 0.2. */
-  jitterRatio?: number;
-}
-
-export interface ResolvedRpcConsumerOptions {
-  queueCapacity: number;
-  concurrency: number;
-  retry: Required<RpcRetryOptions>;
-}
-
-export const DEFAULT_QUEUE_CAPACITY = 1_000;
-export const DEFAULT_CONCURRENCY = 8;
-export const DEFAULT_RETRY_OPTIONS: Required<RpcRetryOptions> = {
-  maxAttempts: 3,
-  baseDelayMs: 250,
-  jitterRatio: 0.2,
-};
-
-function assertIntegerInRange(
-  name: string,
-  value: unknown,
-  min: number,
-  max: number
-): asserts value is number {
-  if (typeof value !== 'number' || !Number.isInteger(value)) {
-    throw new Error(`${name} must be an integer. Got: ${String(value)}`);
-  }
-  if (value < min || value > max) {
-    throw new Error(
-      `${name} must be between ${min} and ${max} (inclusive). Got: ${value}`
-    );
-  }
-}
-
-function assertNumberInRange(
-  name: string,
-  value: unknown,
-  min: number,
-  max: number
-): asserts value is number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw new Error(`${name} must be a finite number. Got: ${String(value)}`);
-  }
-  if (value < min || value > max) {
-    throw new Error(
-      `${name} must be between ${min} and ${max} (inclusive). Got: ${value}`
-    );
-  }
-}
-
-/**
- * Validates and normalizes bounded queue/concurrency/retry consumer options.
- *
- * Rejects non-integer or out-of-range values so operators cannot silently
- * configure unbounded queues or unbounded concurrency.
- */
-export function resolveRpcConsumerOptions(
-  options: RpcConnectionOptions = {}
-): ResolvedRpcConsumerOptions {
-  const queueCapacity = options.queueCapacity ?? DEFAULT_QUEUE_CAPACITY;
-  const concurrency = options.concurrency ?? DEFAULT_CONCURRENCY;
-  const retry = options.retry ?? {};
-
-  assertIntegerInRange('queueCapacity', queueCapacity, 1, MAX_QUEUE_CAPACITY);
-  assertIntegerInRange('concurrency', concurrency, 1, MAX_CONCURRENCY);
-
-  const maxAttempts = retry.maxAttempts ?? DEFAULT_RETRY_OPTIONS.maxAttempts;
-  const baseDelayMs = retry.baseDelayMs ?? DEFAULT_RETRY_OPTIONS.baseDelayMs;
-  const jitterRatio = retry.jitterRatio ?? DEFAULT_RETRY_OPTIONS.jitterRatio;
-
-  assertIntegerInRange('retry.maxAttempts', maxAttempts, 0, MAX_RETRY_ATTEMPTS);
-  assertIntegerInRange(
-    'retry.baseDelayMs',
-    baseDelayMs,
-    0,
-    MAX_RETRY_BASE_DELAY_MS
-  );
-  assertNumberInRange('retry.jitterRatio', jitterRatio, 0, MAX_RETRY_JITTER_RATIO);
-
-  return {
-    queueCapacity,
-    concurrency,
-    retry: { maxAttempts, baseDelayMs, jitterRatio },
-  };
-}
-
-/**
- * Computes the exponential backoff delay (with jitter) for a retry attempt.
- * `attempt` is 1-based; attempt 1 is the first retry after the initial failure.
- */
-export function computeRetryDelayMs(
-  attempt: number,
-  retry: Required<RpcRetryOptions>,
-  random: () => number = Math.random
-): number {
-  assertIntegerInRange('attempt', attempt, 1, MAX_RETRY_ATTEMPTS);
-  const exponential = retry.baseDelayMs * 2 ** (attempt - 1);
-  const jitter = exponential * retry.jitterRatio * random();
-  return Math.min(MAX_RETRY_BASE_DELAY_MS, Math.round(exponential + jitter));
+  /** Optional custom transport handler for isolated RPC requests. */
+  transport?: CustomRpcTransport;
+  /** Request timeout in milliseconds. Defaults to 30000. */
+  timeoutMs?: number;
 }
 
 /**
@@ -196,4 +103,72 @@ export function resolveRpcServerOptions(
   }
 
   return { allowHttp: false };
+}
+
+/**
+ * Creates an isolated RPC dispatcher that executes requests via the provided custom transport
+ * or standard fetch, ensuring typed responses, contextual errors, and compatible defaults.
+ */
+export function createIsolatedRpcDispatcher(options: RpcConnectionOptions = {}) {
+  const timeoutMs = options.timeoutMs ?? 30000;
+
+  return async function dispatchRpc<T = unknown>(
+    request: RpcTransportRequest
+  ): Promise<RpcTransportResponse<T>> {
+    assertSecureRpcUrl(request.url);
+
+    if (options.transport) {
+      try {
+        const res = await options.transport({
+          ...request,
+          timeoutMs: request.timeoutMs ?? timeoutMs
+        });
+        return res as RpcTransportResponse<T>;
+      } catch (err: unknown) {
+        const errorDetail: RpcTransportErrorDetails = {
+          code: 'CUSTOM_TRANSPORT_ERROR',
+          message: err instanceof Error ? err.message : String(err),
+          context: { url: request.url, method: request.method || 'POST' }
+        };
+        const error = new Error(`Custom RPC transport failed: ${errorDetail.message}`);
+        (error as unknown as { details: RpcTransportErrorDetails }).details = errorDetail;
+        throw error;
+      }
+    }
+
+    // Default standard fetch-based transport fallback
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(request.url, {
+        method: request.method || 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(request.headers || {})
+        },
+        body: request.body,
+        signal: controller.signal
+      });
+
+      const responseData = (await response.json()) as T;
+      return {
+        status: response.status,
+        data: responseData
+      };
+    } catch (err: unknown) {
+      const isAbort = (err as { name?: string })?.name === 'AbortError';
+      const errorDetail: RpcTransportErrorDetails = {
+        code: isAbort ? 'RPC_TIMEOUT' : 'RPC_NETWORK_ERROR',
+        message: err instanceof Error ? err.message : String(err),
+        retryable: true,
+        context: { url: request.url, timeoutMs }
+      };
+      const error = new Error(`RPC transport dispatch failed: ${errorDetail.message}`);
+      (error as unknown as { details: RpcTransportErrorDetails }).details = errorDetail;
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 }

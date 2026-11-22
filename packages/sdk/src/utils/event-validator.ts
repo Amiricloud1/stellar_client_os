@@ -30,31 +30,23 @@ export interface RawContractEvent {
   value: unknown;
 }
 
+/**
+ * Partition key used to isolate ingestion by network and deployment.
+ * Events must be validated against the partition they were ingested for so a
+ * stalled or misconfigured source cannot leak events into another deployment.
+ */
+export interface EventPartition {
+  network: string;
+  deploymentId: string;
+}
+
 export interface ValidationResult {
   valid: boolean;
   errors: string[];
   schema?: EventSchemaDefinition;
   parsedTopics?: Record<string, unknown>;
   parsedPayload?: Record<string, unknown>;
-  /**
-   * True when no schema is registered for the event's contract/name/version.
-   * Unknown versions are retained (never dropped) so operators can inspect
-   * and later backfill a schema.
-   */
-  unknownVersion?: boolean;
-  /** The version that was requested or inferred from the raw event, if any. */
-  resolvedVersion?: number;
-}
-
-export type SchemaResolutionStatus = 'exact' | 'latest' | 'unknown';
-
-export interface SchemaResolution {
-  status: SchemaResolutionStatus;
-  schema?: EventSchemaDefinition;
-  /** Version requested by the caller (may be undefined when not supplied). */
-  requestedVersion?: number;
-  /** Version of the schema that was actually resolved, if any. */
-  resolvedVersion?: number;
+  partition?: EventPartition;
 }
 
 export interface ValidatedContractEvent<TPayload = Record<string, unknown>> {
@@ -64,6 +56,53 @@ export interface ValidatedContractEvent<TPayload = Record<string, unknown>> {
   schemaVersion: number;
   topics: Record<string, unknown>;
   payload: TPayload;
+  partition?: EventPartition;
+}
+
+// ---------------------------------------------------------------------------
+// Deployment Registry (partitioning)
+// ---------------------------------------------------------------------------
+
+/**
+ * Registry of known deployments keyed by `${network}:${deploymentId}`.
+ * Only deployments registered here may produce validated events.
+ */
+const KNOWN_DEPLOYMENTS = new Set<string>();
+
+function deploymentKey(network: string, deploymentId: string): string {
+  return `${network}:${deploymentId}`;
+}
+
+/**
+ * Registers a deployment as a valid ingestion partition.
+ */
+export function registerDeployment(partition: EventPartition): void {
+  if (!partition || !partition.network || !partition.deploymentId) {
+    throw new Error('Deployment partition requires both network and deploymentId');
+  }
+  KNOWN_DEPLOYMENTS.add(deploymentKey(partition.network, partition.deploymentId));
+}
+
+/**
+ * Removes a deployment from the valid ingestion partitions.
+ */
+export function unregisterDeployment(partition: EventPartition): void {
+  KNOWN_DEPLOYMENTS.delete(deploymentKey(partition.network, partition.deploymentId));
+}
+
+/**
+ * Returns true when the given partition is a known deployment.
+ */
+export function isKnownDeployment(partition: EventPartition): boolean {
+  if (!partition || !partition.network || !partition.deploymentId) return false;
+  return KNOWN_DEPLOYMENTS.has(deploymentKey(partition.network, partition.deploymentId));
+}
+
+/**
+ * Clears all registered deployments (primarily for tests).
+ */
+export function clearDeployments(): void {
+  KNOWN_DEPLOYMENTS.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -231,19 +270,46 @@ export function resolveSchemaVersion(
 
 /**
  * Validates a contract event against a specific schema.
+ *
+ * When a `partition` is supplied, the event is rejected unless the partition
+ * refers to a registered deployment. This keeps cursors, backfills and health
+ * isolated per network/deployment: an event ingested for an unknown deployment
+ * is never accepted into another deployment's pipeline.
  */
 export function validateContractEvent(
   raw: RawContractEvent,
-  schema: EventSchemaDefinition
+  schema: EventSchemaDefinition,
+  partition?: EventPartition
 ): ValidationResult {
   const errors: string[] = [];
+
+  if (partition !== undefined) {
+    if (!partition.network || !partition.deploymentId) {
+      return {
+        valid: false,
+        errors: ['Partition requires both network and deploymentId'],
+        schema,
+        partition,
+      };
+    }
+    if (!isKnownDeployment(partition)) {
+      return {
+        valid: false,
+        errors: [
+          `Unknown deployment "${partition.deploymentId}" on network "${partition.network}"`,
+        ],
+        schema,
+        partition,
+      };
+    }
+  }
 
   if (!raw || !Array.isArray(raw.topic)) {
     return {
       valid: false,
       errors: ['Event must have a topic array'],
       schema,
-      resolvedVersion: schema.version,
+      partition,
     };
   }
 
@@ -307,7 +373,7 @@ export function validateContractEvent(
     schema,
     parsedTopics,
     parsedPayload,
-    resolvedVersion: schema.version,
+    partition,
   };
 }
 

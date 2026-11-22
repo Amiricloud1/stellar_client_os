@@ -83,6 +83,24 @@ export const subscriptionIdParamsSchema = z
   })
   .strict();
 
+/** Donation id (positive integer). */
+export const donationIdSchema = idSchema;
+
+export const donationIdParamsSchema = z
+  .object({
+    donationId: donationIdSchema,
+  })
+  .strict();
+
+/** Reviewer comment id (positive integer). */
+export const commentIdSchema = idSchema;
+
+export const commentIdParamsSchema = z
+  .object({
+    commentId: commentIdSchema,
+  })
+  .strict();
+
 /* -------------------------------------------------------------------------- */
 /* Query params                                                               */
 /* -------------------------------------------------------------------------- */
@@ -144,170 +162,151 @@ export type RevokeWebhookSubscriptionInput = z.infer<
 >;
 
 /* -------------------------------------------------------------------------- */
-/* Contract deployment registry (issue #218)                                  */
+/* Donations (issue #176)                                                     */
 /* -------------------------------------------------------------------------- */
 
-/** Supported networks for contract deployments. */
-export const deploymentNetworkSchema = z.enum([
-  'mainnet',
-  'testnet',
-  'futurenet',
-  'local',
-]);
-
-export type DeploymentNetwork = z.infer<typeof deploymentNetworkSchema>;
-
-/** Lifecycle state of a deployment record. */
-export const deploymentStatusSchema = z.enum([
-  'pending',
-  'active',
-  'paused',
-  'deprecated',
-  'failed',
-]);
-
-export type DeploymentStatus = z.infer<typeof deploymentStatusSchema>;
-
-/** Stellar contract address (C... strkey, 56 chars). */
-export const contractAddressSchema = z
+/** Lowercase or uppercase 64-character hex digest (sha256). */
+export const termsSnapshotHashSchema = z
   .string()
   .trim()
-  .regex(/^C[A-Z2-7]{55}$/, 'must be a valid Stellar contract address');
+  .regex(/^[0-9a-fA-F]{64}$/, 'must be a 64-character hex string');
 
-/** Ledger sequence number (non-negative integer). */
-export const ledgerSequenceSchema = z.coerce.number().int().min(0);
-
-/** Semantic spec version, e.g. "1.2.0". */
-export const specVersionSchema = z
-  .string()
-  .trim()
-  .regex(/^\d+\.\d+\.\d+$/, 'must be a semantic version (MAJOR.MINOR.PATCH)');
-
-export const deploymentRecordSchema = z
+/**
+ * A contribution MUST be bound to the exact terms the donor saw before
+ * signing. `termsSnapshotHash` is the content hash of those terms and
+ * `termsVersion` identifies the published version they came from.
+ */
+export const createDonationBodySchema = z
   .object({
-    network: deploymentNetworkSchema,
-    address: contractAddressSchema,
-    ledger: ledgerSequenceSchema,
-    specVersion: specVersionSchema,
-    status: deploymentStatusSchema,
-    failureReason: nonEmptyString.max(500).optional(),
+    streamId: streamIdSchema,
+    amount: z.coerce.number().positive(),
+    termsSnapshotHash: termsSnapshotHashSchema,
+    termsVersion: nonEmptyString.max(100),
   })
   .strict();
 
-export type DeploymentRecordInput = z.infer<typeof deploymentRecordSchema>;
-
-export const deploymentRecordParamsSchema = z
-  .object({
-    network: deploymentNetworkSchema,
-    address: contractAddressSchema,
-  })
-  .strict();
-
-export const listDeploymentsQuerySchema = z
-  .object({
-    network: deploymentNetworkSchema.optional(),
-    status: deploymentStatusSchema.optional(),
-  })
-  .strict();
-
-export type ListDeploymentsQuery = z.infer<typeof listDeploymentsQuerySchema>;
+export type CreateDonationInput = z.infer<typeof createDonationBodySchema>;
 
 /* -------------------------------------------------------------------------- */
-/* Canonical contract-event mappings (issue #219)                             */
+/* Reviewer comments (issue #178)                                             */
 /* -------------------------------------------------------------------------- */
 
-/** Event schema version, e.g. "v1" or "v2". */
-export const eventVersionSchema = z
-  .string()
-  .trim()
-  .regex(/^v\d+$/, 'must be a version like "v1"');
-
-export const eventMappingSchema = z
-  .object({
-    eventName: nonEmptyString.max(200),
-    version: eventVersionSchema,
-    projection: nonEmptyString.max(200),
-    /** Unknown versions retain their raw payload instead of dropping it. */
-    retainUnknownPayload: z.boolean().optional(),
-  })
-  .strict();
-
-export type EventMappingInput = z.infer<typeof eventMappingSchema>;
-
-export const eventMappingParamsSchema = z
-  .object({
-    eventName: nonEmptyString.max(200),
-    version: eventVersionSchema,
-  })
-  .strict();
-
-/* -------------------------------------------------------------------------- */
-/* Projection replay (issue #220)                                             */
-/* -------------------------------------------------------------------------- */
-
-export const replayStatusSchema = z.enum([
-  'queued',
-  'running',
-  'completed',
-  'failed',
-  'cancelled',
+export const commentResolutionStatusSchema = z.enum([
+  'open',
+  'resolved',
+  'dismissed',
 ]);
 
-export type ReplayStatus = z.infer<typeof replayStatusSchema>;
+export type CommentResolutionStatus = z.infer<
+  typeof commentResolutionStatusSchema
+>;
 
-export const startReplayBodySchema = z
+export const COMMENT_BODY_MAX_LENGTH = 5_000;
+
+/**
+ * A reviewer comment is anchored to a specific evidence version so that
+ * attribution and discussion remain reproducible.
+ */
+export const createReviewerCommentBodySchema = z
   .object({
-    fromVersion: eventVersionSchema,
-    toVersion: eventVersionSchema,
-    fromLedger: ledgerSequenceSchema.optional(),
-    toLedger: ledgerSequenceSchema.optional(),
-    /** When true, compare replayed output against live state before cutover. */
-    compareBeforeCutover: z.boolean().optional(),
-  })
-  .strict()
-  .refine(
-    (value) =>
-      value.fromLedger === undefined ||
-      value.toLedger === undefined ||
-      value.fromLedger <= value.toLedger,
-    { message: 'fromLedger must be <= toLedger', path: ['fromLedger'] },
-  );
-
-export type StartReplayInput = z.infer<typeof startReplayBodySchema>;
-
-export const replayIdParamsSchema = z
-  .object({
-    replayId: idSchema,
+    evidenceId: nonEmptyString.max(200),
+    evidenceVersion: z.coerce.number().int().positive(),
+    body: nonEmptyString.max(COMMENT_BODY_MAX_LENGTH),
   })
   .strict();
 
-/* -------------------------------------------------------------------------- */
-/* Bounded event-consumer queues (issue #222)                                 */
-/* -------------------------------------------------------------------------- */
+export type CreateReviewerCommentInput = z.infer<
+  typeof createReviewerCommentBodySchema
+>;
 
-export const MAX_QUEUE_CAPACITY = 100_000;
-export const MAX_QUEUE_CONCURRENCY = 64;
-
-export const queueConfigSchema = z
+export const resolveReviewerCommentBodySchema = z
   .object({
-    capacity: z.coerce
-      .number()
-      .int()
-      .min(1)
-      .max(MAX_QUEUE_CAPACITY)
-      .default(1_000),
-    concurrency: z.coerce
-      .number()
-      .int()
-      .min(1)
-      .max(MAX_QUEUE_CONCURRENCY)
-      .default(8),
-    /** Milliseconds to wait before retrying after an outage. */
-    retryBackoffMs: z.coerce.number().int().min(0).max(300_000).default(1_000),
+    resolutionStatus: commentResolutionStatusSchema,
+    resolutionNote: nonEmptyString.max(COMMENT_BODY_MAX_LENGTH).optional(),
   })
   .strict();
 
-export type QueueConfigInput = z.infer<typeof queueConfigSchema>;
+export type ResolveReviewerCommentInput = z.infer<
+  typeof resolveReviewerCommentBodySchema
+>;
+
+/* -------------------------------------------------------------------------- */
+/* Pre-launch readiness checklist (issue #179)                                */
+/* -------------------------------------------------------------------------- */
+
+export const readinessNetworkSchema = z.enum(['mainnet', 'testnet', 'futurenet']);
+
+export const readinessAssetSchema = z
+  .object({
+    code: nonEmptyString.max(12),
+    issuer: nonEmptyString.max(100).optional(),
+  })
+  .strict();
+
+export const readinessMilestoneSchema = z
+  .object({
+    title: nonEmptyString.max(200),
+    targetDate: isoDateTimeSchema,
+    amount: z.coerce.number().positive(),
+  })
+  .strict();
+
+export const readinessPayoutTermsSchema = z
+  .object({
+    currency: nonEmptyString.max(12),
+    schedule: nonEmptyString.max(200),
+    termsSnapshotHash: termsSnapshotHashSchema,
+  })
+  .strict();
+
+/**
+ * Request body for validating a campaign before deployment. All sections are
+ * required so that missing metadata, network, assets, milestones, or payout
+ * terms surface as explicit validation errors.
+ */
+export const readinessChecklistBodySchema = z
+  .object({
+    metadata: z
+      .object({
+        title: nonEmptyString.max(200),
+        description: nonEmptyString.max(5_000),
+      })
+      .strict(),
+    network: readinessNetworkSchema,
+    assets: z.array(readinessAssetSchema).min(1),
+    milestones: z.array(readinessMilestoneSchema).min(1),
+    payoutTerms: readinessPayoutTermsSchema,
+  })
+  .strict();
+
+export type ReadinessChecklistInput = z.infer<
+  typeof readinessChecklistBodySchema
+>;
+
+export const readinessChecklistItemStatusSchema = z.enum([
+  'pass',
+  'fail',
+  'warning',
+]);
+
+export const readinessChecklistItemSchema = z
+  .object({
+    id: nonEmptyString,
+    status: readinessChecklistItemStatusSchema,
+    message: nonEmptyString,
+  })
+  .strict();
+
+export const readinessChecklistResponseSchema = z
+  .object({
+    ready: z.boolean(),
+    items: z.array(readinessChecklistItemSchema),
+  })
+  .strict();
+
+export type ReadinessChecklistResponse = z.infer<
+  typeof readinessChecklistResponseSchema
+>;
 
 /* -------------------------------------------------------------------------- */
 /* Parse helper                                                               */

@@ -270,90 +270,101 @@ export function parsePaymentStreamContractEvents(
   }, []);
 }
 
-function readSchemaVersion(event: ContractEventRaw): number | null {
-  const value = asObject(event.value);
-  if (!value) return null;
-  const raw = value.schema_version ?? value.version;
-  const normalized = normalizeInteger(raw);
-  return normalized === null ? null : Number(normalized);
+/**
+ * Identifies the ingestion partition an event belongs to.
+ *
+ * Ingestion is partitioned by `(network, deploymentId)` so that cursors,
+ * backfills and health tracking for one deployment cannot block or corrupt
+ * another. Events that cannot be attributed to a partition are rejected
+ * rather than silently merged into a shared bucket.
+ */
+export interface EventPartitionKey {
+  network: string;
+  deploymentId: string;
+}
+
+export interface PartitionedEventInput extends ContractEventRaw {
+  /** Network the event was observed on (e.g. "testnet", "mainnet"). */
+  network: string;
+  /** Deployment / contract instance identifier within the network. */
+  deploymentId: string;
+}
+
+export interface EventPartition {
+  key: EventPartitionKey;
+  /** Stable string form of the key, suitable for use as a map/cursor key. */
+  partitionId: string;
+  events: PaymentStreamContractEvent[];
+  /** Raw events that failed parsing, isolated to this partition only. */
+  malformed: ContractEventRaw[];
+}
+
+export interface PartitionedEventParseResult {
+  partitions: EventPartition[];
+  /** Events rejected because they could not be attributed to a partition. */
+  unattributed: ContractEventRaw[];
+}
+
+export function eventPartitionId(key: EventPartitionKey): string {
+  return `${key.network}::${key.deploymentId}`;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function resolvePartitionKey(
+  event: PartitionedEventInput,
+): EventPartitionKey | null {
+  if (typeof event !== "object" || event === null) {
+    return null;
+  }
+  const { network, deploymentId } = event;
+  if (!isNonEmptyString(network) || !isNonEmptyString(deploymentId)) {
+    return null;
+  }
+  return { network, deploymentId };
 }
 
 /**
- * Project a raw contract event onto the canonical domain model.
+ * Parses a batch of events and groups them by `(network, deploymentId)`.
  *
- * - Supported event names with a supported (or absent) schema version are
- *   returned as `{ kind: "supported" }`.
- * - Unknown event names, unsupported schema versions, and malformed payloads
- *   are retained verbatim as `{ kind: "unknown" }` so no event is silently
- *   dropped.
+ * Malformed events are collected per partition so a bad event in one
+ * deployment never drops or blocks events in another. Events missing a
+ * network or deployment identifier are returned in `unattributed` and are
+ * never merged into any partition.
  */
-export function projectContractEvent(
-  event: ContractEventRaw,
-): ContractEventProjection {
-  const schemaVersion = readSchemaVersion(event);
-  const isSupportedVersion =
-    schemaVersion === null ||
-    schemaVersion === PAYMENT_STREAM_EVENT_SCHEMA_VERSION;
+export function parsePaymentStreamContractEventsByPartition(
+  events: readonly PartitionedEventInput[] | undefined,
+): PartitionedEventParseResult {
+  const partitions = new Map<string, EventPartition>();
+  const unattributed: ContractEventRaw[] = [];
 
-  if (isSupportedVersion) {
+  if (!Array.isArray(events)) {
+    return { partitions: [], unattributed };
+  }
+
+  for (const event of events) {
+    const key = resolvePartitionKey(event);
+    if (!key) {
+      unattributed.push(event);
+      continue;
+    }
+
+    const partitionId = eventPartitionId(key);
+    let partition = partitions.get(partitionId);
+    if (!partition) {
+      partition = { key, partitionId, events: [], malformed: [] };
+      partitions.set(partitionId, partition);
+    }
+
     const parsed = parsePaymentStreamContractEvent(event);
     if (parsed) {
-      return { kind: "supported", event: parsed };
+      partition.events.push(parsed);
+    } else {
+      partition.malformed.push(event);
     }
   }
 
-  const topic = Array.isArray(event.topic)
-    ? event.topic.filter((item): item is string => typeof item === "string")
-    : [];
-
-  return {
-    kind: "unknown",
-    event: {
-      type: "Unknown",
-      contractId: typeof event.contract_id === "string" ? event.contract_id : "",
-      topic,
-      schemaVersion,
-      raw: event,
-    },
-  };
-}
-
-/**
- * Project a batch of raw contract events, retaining unknown events rather
- * than dropping them.
- */
-export function projectContractEvents(
-  events: readonly ContractEventRaw[] | undefined,
-): ContractEventProjection[] {
-  if (!Array.isArray(events)) {
-    return [];
-  }
-  return events.map((event) => projectContractEvent(event));
-}
-
-/**
- * Extract only the supported domain events from a projection batch.
- */
-export function supportedContractEvents(
-  projections: readonly ContractEventProjection[],
-): PaymentStreamContractEvent[] {
-  return projections.reduce<PaymentStreamContractEvent[]>((acc, projection) => {
-    if (projection.kind === "supported") acc.push(projection.event);
-    return acc;
-  }, []);
-}
-
-/**
- * Extract only the retained unknown events from a projection batch.
- */
-export function unknownContractEvents(
-  projections: readonly ContractEventProjection[],
-): UnknownContractEventProjection[] {
-  return projections.reduce<UnknownContractEventProjection[]>(
-    (acc, projection) => {
-      if (projection.kind === "unknown") acc.push(projection.event);
-      return acc;
-    },
-    [],
-  );
+  return { partitions: [...partitions.values()], unattributed };
 }
