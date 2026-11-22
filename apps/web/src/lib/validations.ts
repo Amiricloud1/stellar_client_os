@@ -10,6 +10,12 @@ import {
   streamIdSchema,
   paginationQuerySchema,
   streamStatusSchema,
+  sponsorPortfolioQuerySchema,
+  transactionTimelineQuerySchema,
+  transactionTimelineStageSchema,
+  transactionTimelineStatusSchema,
+  transactionTimelineEventSchema,
+  transactionTimelineSchema,
 } from './api-schemas'
 import {
   requestBudgetSchema,
@@ -34,10 +40,22 @@ export {
   streamIdSchema,
   paginationQuerySchema,
   streamStatusSchema,
+  sponsorPortfolioQuerySchema,
+  transactionTimelineQuerySchema,
+  transactionTimelineStageSchema,
+  transactionTimelineStatusSchema,
+  transactionTimelineEventSchema,
+  transactionTimelineSchema,
 }
 export type {
   PaginationQuery,
   StreamStatus,
+  SponsorPortfolioQuery,
+  TransactionTimelineQuery,
+  TransactionTimelineStage,
+  TransactionTimelineStatus,
+  TransactionTimelineEvent,
+  TransactionTimeline,
 } from './api-schemas'
 
 // Re-export the request/collection/filter budget schemas and helpers so that

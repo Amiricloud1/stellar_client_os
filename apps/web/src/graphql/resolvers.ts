@@ -628,6 +628,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         const args = guard<typeof rawArgs>("Query.campaignGrantAllocations", ctx, rawArgs, "campaignGrantAllocations");
         enforceAndMeter("Query.campaignGrantAllocations", ctx, args);
         validateListArgs(args.pagination, args.sort);
+        await authorizeResource(ctx, "campaign", "read", { campaignId: args.campaignId, resourceId: args.campaignId });
         const allocations = await getGrantProgramService().getCampaignAllocations(args.campaignId);
         return paginate(allocations.map((allocation) => ({
           ...allocation,

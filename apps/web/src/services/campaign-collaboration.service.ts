@@ -62,8 +62,29 @@ class CampaignCollaborationService {
     initialInvites.forEach((inv) => this.invites.set(inv.token, inv));
   }
 
-  getCollaborators(campaignId: string): CoCreator[] {
-    return this.collaborators.get(campaignId) || [];
+  private authorize(
+    campaignId: string,
+    principal: ResourcePrincipal | null | undefined,
+    action: ResourceAction,
+  ): PolicyDecision {
+    return policy.evaluate({
+      resource: "collaborator",
+      action,
+      parentId: campaignId,
+      principal,
+      collaborators: this.collaborators.get(campaignId) || [],
+    });
+  }
+
+  getCollaborators(
+    campaignId: string,
+    principal: ResourcePrincipal | null | undefined,
+  ): CollaborationResult<CoCreator[]> {
+    const decision = this.authorize(campaignId, principal, "read");
+    if (!decision.allowed) {
+      return { ok: false, error: decision.reason, code: decision.code };
+    }
+    return { ok: true, data: this.collaborators.get(campaignId) || [] };
   }
 
   /**
@@ -78,7 +99,13 @@ class CampaignCollaborationService {
     invitedBy: string;
     invitedByName: string;
     expiresInDays?: number;
-  }): CoCreatorInvite {
+    principal: ResourcePrincipal | null | undefined;
+  }): CollaborationResult<CoCreatorInvite> {
+    const decision = this.authorize(params.campaignId, params.principal, "invite");
+    if (!decision.allowed) {
+      return { ok: false, error: decision.reason, code: decision.code };
+    }
+
     const token = `inv_${Math.random().toString(36).substring(2, 10)}_${Date.now()}`;
     const days = params.expiresInDays || 7;
     const invite: CoCreatorInvite = {

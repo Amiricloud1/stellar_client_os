@@ -345,16 +345,86 @@ export class CampaignDonationService {
     return { ok: true, ...result };
   }
 
-  /** Every donation recorded for a campaign, oldest first. */
-  getDonations(campaignId: string): CampaignDonation[] {
-    return [...this.campaignDonations(campaignId)];
+  /**
+   * Every donation recorded for a campaign, oldest first.
+   *
+   * Authorization: owners and collaborators may read the full campaign ledger;
+   * donors may read only their own donations; anonymous callers are denied.
+   */
+  async getDonations(
+    campaignId: string,
+    principal: DonationPrincipal | null | undefined,
+    dataSource: CampaignDataSource = getCampaignDataSource(),
+  ): Promise<DonationAccessResult<CampaignDonation[]>> {
+    const campaign = await getCampaign(campaignId?.trim() ?? "", dataSource);
+    if (!campaign) {
+      return { ok: false, error: "Campaign not found.", code: "INVALID_CAMPAIGN" };
+    }
+
+    const donations = this.campaignDonations(campaignId);
+    const authorization = resolveCampaignRelationship(principal, campaign, donations);
+    if (!authorization.ok) {
+      return authorization;
+    }
+
+    if (authorization.relationship === "donor") {
+      const normalized = authorization.address.toLowerCase();
+      return {
+        ok: true,
+        relationship: authorization.relationship,
+        value: donations.filter(
+          (donation) => String(donation.donorAddress ?? "").trim().toLowerCase() === normalized,
+        ),
+      };
+    }
+
+    return { ok: true, relationship: authorization.relationship, value: [...donations] };
   }
 
-  getReceipt(donationId: string): DonationReceipt | undefined {
-    return this.receipts.get(donationId);
+  /**
+   * Fetch a receipt by donation id.
+   *
+   * Authorization: the receipt is a nested resource of the donation, so only
+   * the donating wallet, the campaign owner, or a collaborator may read it.
+   */
+  async getReceipt(
+    donationId: string,
+    principal: DonationPrincipal | null | undefined,
+    dataSource: CampaignDataSource = getCampaignDataSource(),
+  ): Promise<DonationAccessResult<DonationReceipt>> {
+    const receipt = this.receipts.get(donationId);
+    if (!receipt) {
+      return { ok: false, error: "Receipt not found.", code: "INVALID_CAMPAIGN" };
+    }
+
+    const campaign = await getCampaign(receipt.campaignId, dataSource);
+    if (!campaign) {
+      return { ok: false, error: "Campaign not found.", code: "INVALID_CAMPAIGN" };
+    }
+
+    const donations = this.campaignDonations(receipt.campaignId);
+    const authorization = resolveCampaignRelationship(principal, campaign, donations);
+    if (!authorization.ok) {
+      return authorization;
+    }
+
+    if (authorization.relationship === "donor") {
+      const normalized = authorization.address.toLowerCase();
+      const ownsReceipt = String(receipt.donorAddress ?? "").trim().toLowerCase() === normalized;
+      if (!ownsReceipt) {
+        return { ok: false, error: FORBIDDEN_ERROR, code: "FORBIDDEN" };
+      }
+    }
+
+    return { ok: true, relationship: authorization.relationship, value: receipt };
   }
 
-  /** Exact per-token totals for a campaign so mixed tokens are never summed. */
+  /**
+   * Exact per-token totals for a campaign so mixed tokens are never summed.
+   *
+   * Authorization: aggregate totals are public campaign data, so anonymous
+   * callers may read the summary; individual donations stay protected.
+   */
   getSummary(campaignId: string): DonationSummary {
     const donations = this.campaignDonations(campaignId);
     const totalsByToken: Record<DonationToken, string> = { XLM: "0", USDC: "0" };
@@ -386,5 +456,10 @@ export class CampaignDonationService {
     await this.idempotencyStore.clearScope(DONATION_IDEMPOTENCY_SCOPE);
   }
 }
+
+/** Discriminated result for authorized read paths. */
+export type DonationAccessResult<T> =
+  | { ok: true; relationship: CampaignRelationship; value: T }
+  | { ok: false; error: string; code: DonationErrorCode };
 
 export const donationService = new CampaignDonationService();

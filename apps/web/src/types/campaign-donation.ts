@@ -13,6 +13,240 @@ export type DonationToken = "XLM" | "USDC";
 /** A donation is only ever created once the ledger entry has been written. */
 export type DonationStatus = "CONFIRMED" | "FAILED";
 
+/**
+ * Transaction lifecycle (issue #239).
+ *
+ * A donation moves through a sequence of explicit states so the UI can show a
+ * confirmation timeline and recover after a page reload:
+ *
+ *   wallet_approval -> submitted -> ledger_confirmed -> settled
+ *
+ * Any non-terminal state may instead transition to `failed` (the wallet or
+ * network rejected the transaction) or `timed_out` (no confirmation was
+ * observed before the deadline). `ledger_confirmed`, `settled`, `failed` and
+ * `timed_out` are terminal for a given attempt; a retry starts a new attempt
+ * that is appended to the same timeline.
+ *
+ * Persistence contract: the timeline is stored client-side keyed by the
+ * transaction hash (see `TransactionTimeline`). It must be written *before*
+ * the wallet is asked to sign so a reload mid-approval can resume, and it is
+ * only discarded once the donation is durably recorded server-side. Recovery
+ * metadata (`attempt`, `lastUpdatedAt`, `recoverable`, `resumeFrom`) lets the
+ * UI rehydrate the correct step after a reload without re-submitting.
+ */
+export type TransactionLifecycleState =
+  | "wallet_approval"
+  | "submitted"
+  | "ledger_confirmed"
+  | "settled"
+  | "failed"
+  | "timed_out";
+
+export const TRANSACTION_LIFECYCLE_STATES: readonly TransactionLifecycleState[] = [
+  "wallet_approval",
+  "submitted",
+  "ledger_confirmed",
+  "settled",
+  "failed",
+  "timed_out",
+];
+
+/** States from which no further transition is expected for the attempt. */
+export const TERMINAL_TRANSACTION_STATES: readonly TransactionLifecycleState[] = [
+  "settled",
+  "failed",
+  "timed_out",
+];
+
+/** Human-readable labels for the confirmation timeline. */
+export const TRANSACTION_STATE_LABELS: Record<TransactionLifecycleState, string> = {
+  wallet_approval: "Awaiting wallet approval",
+  submitted: "Submitted to network",
+  ledger_confirmed: "Confirmed on ledger",
+  settled: "Settled",
+  failed: "Failed",
+  timed_out: "Timed out",
+};
+
+export function isTransactionLifecycleState(value: unknown): value is TransactionLifecycleState {
+  return (
+    typeof value === "string" &&
+    (TRANSACTION_LIFECYCLE_STATES as readonly string[]).includes(value)
+  );
+}
+
+export function isTerminalTransactionState(state: TransactionLifecycleState): boolean {
+  return TERMINAL_TRANSACTION_STATES.includes(state);
+}
+
+/** A single state transition recorded on a transaction timeline. */
+export interface TransactionLifecycleEvent {
+  state: TransactionLifecycleState;
+  /** Epoch milliseconds at which the transition was observed. */
+  at: number;
+  /** Attempt number (1-based) this event belongs to; retries increment it. */
+  attempt: number;
+  /** Optional human-readable detail, e.g. an error message for `failed`. */
+  detail?: string;
+  /** Ledger sequence, present once the transaction is confirmed on-chain. */
+  ledger?: number;
+}
+
+/** Recovery metadata persisted alongside a timeline. */
+export interface TransactionTimelineRecovery {
+  /** Whether the UI can resume this transaction after a reload. */
+  recoverable: boolean;
+  /** State the UI should resume from; `null` once the timeline is terminal. */
+  resumeFrom: TransactionLifecycleState | null;
+  /** Epoch milliseconds after which an in-flight attempt is considered timed out. */
+  deadlineAt?: number;
+  /** Number of attempts made so far (1-based). */
+  attempt: number;
+  /** Epoch milliseconds of the last persisted update. */
+  lastUpdatedAt: number;
+}
+
+/**
+ * Persisted confirmation timeline for a single transaction, keyed by hash.
+ * The hash may be provisional (client-generated) until the network returns the
+ * real one; `txHash` is updated in place when that happens.
+ */
+export interface TransactionTimeline {
+  txHash: string;
+  campaignId: string;
+  donationId?: string;
+  /** Current state — always the state of the last event. */
+  state: TransactionLifecycleState;
+  events: TransactionLifecycleEvent[];
+  recovery: TransactionTimelineRecovery;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Storage key prefix for persisted timelines. */
+export const TRANSACTION_TIMELINE_STORAGE_PREFIX = "treefund:tx-timeline:";
+
+export function transactionTimelineStorageKey(txHash: string): string {
+  return `${TRANSACTION_TIMELINE_STORAGE_PREFIX}${txHash}`;
+}
+
+/**
+ * Create a fresh timeline in `wallet_approval`. Call this *before* prompting
+ * the wallet so a reload mid-approval can recover.
+ */
+export function createTransactionTimeline(params: {
+  txHash: string;
+  campaignId: string;
+  donationId?: string;
+  now: number;
+  deadlineAt?: number;
+}): TransactionTimeline {
+  const event: TransactionLifecycleEvent = {
+    state: "wallet_approval",
+    at: params.now,
+    attempt: 1,
+  };
+  return {
+    txHash: params.txHash,
+    campaignId: params.campaignId,
+    donationId: params.donationId,
+    state: "wallet_approval",
+    events: [event],
+    recovery: {
+      recoverable: true,
+      resumeFrom: "wallet_approval",
+      deadlineAt: params.deadlineAt,
+      attempt: 1,
+      lastUpdatedAt: params.now,
+    },
+    createdAt: params.now,
+    updatedAt: params.now,
+  };
+}
+
+/**
+ * Append a transition to a timeline, returning a new immutable timeline.
+ * Throws when transitioning out of a terminal state — callers must start a new
+ * attempt (via `retryTransactionTimeline`) instead.
+ */
+export function appendTransactionEvent(
+  timeline: TransactionTimeline,
+  event: Omit<TransactionLifecycleEvent, "attempt"> & { attempt?: number },
+): TransactionTimeline {
+  if (isTerminalTransactionState(timeline.state)) {
+    throw new Error(
+      `Cannot transition from terminal state "${timeline.state}" to "${event.state}".`,
+    );
+  }
+  const attempt = event.attempt ?? timeline.recovery.attempt;
+  const nextEvent: TransactionLifecycleEvent = { ...event, attempt };
+  const terminal = isTerminalTransactionState(event.state);
+  return {
+    ...timeline,
+    state: event.state,
+    events: [...timeline.events, nextEvent],
+    recovery: {
+      ...timeline.recovery,
+      recoverable: !terminal,
+      resumeFrom: terminal ? null : event.state,
+      attempt,
+      lastUpdatedAt: event.at,
+    },
+    updatedAt: event.at,
+  };
+}
+
+/**
+ * Start a new attempt after a failure or timeout, preserving prior events so
+ * the full history remains visible. Returns a new timeline in
+ * `wallet_approval` for the next attempt.
+ */
+export function retryTransactionTimeline(
+  timeline: TransactionTimeline,
+  now: number,
+  deadlineAt?: number,
+): TransactionTimeline {
+  const attempt = timeline.recovery.attempt + 1;
+  const event: TransactionLifecycleEvent = { state: "wallet_approval", at: now, attempt };
+  return {
+    ...timeline,
+    state: "wallet_approval",
+    events: [...timeline.events, event],
+    recovery: {
+      recoverable: true,
+      resumeFrom: "wallet_approval",
+      deadlineAt,
+      attempt,
+      lastUpdatedAt: now,
+    },
+    updatedAt: now,
+  };
+}
+
+/**
+ * Rehydrate a timeline after a reload. Returns `null` when the stored value is
+ * missing or malformed so callers can fall back to a fresh attempt.
+ */
+export function parseTransactionTimeline(raw: string | null | undefined): TransactionTimeline | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<TransactionTimeline>;
+    if (
+      typeof parsed?.txHash !== "string" ||
+      typeof parsed?.campaignId !== "string" ||
+      !isTransactionLifecycleState(parsed?.state) ||
+      !Array.isArray(parsed?.events) ||
+      typeof parsed?.recovery !== "object" ||
+      parsed.recovery === null
+    ) {
+      return null;
+    }
+    return parsed as TransactionTimeline;
+  } catch {
+    return null;
+  }
+}
+
 /** How a donation's funds are allocated by the campaign. */
 export type DonationAllocation = "CREATOR_DISCRETION";
 

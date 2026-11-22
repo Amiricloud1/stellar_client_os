@@ -116,6 +116,167 @@ export function validateWorkspace(repoRoot: string = process.cwd()): WorkspaceVa
   };
 }
 
+export interface MigrationValidationResult {
+  ok: boolean;
+  issues: string[];
+  lockUnsafe: string[];
+  nonIdempotent: string[];
+  missingRollback: string[];
+  interrupted: string[];
+}
+
+export interface MigrationFile {
+  name: string;
+  sql: string;
+  rollbackSql?: string;
+}
+
+const MIGRATION_FILE_RE = /^(\d+)[-_].+\.sql$/;
+const ROLLBACK_SUFFIX_RE = /\.(down|rollback)\.sql$/;
+const INTERRUPTED_MARKER = "-- migration:interrupted";
+
+// Patterns that take long-lived locks on large tables and block overlapping
+// application versions. Each entry maps a regex to a remediation hint.
+const LOCK_UNSAFE_PATTERNS: Array<{ re: RegExp; hint: string }> = [
+  {
+    re: /\bcreate\s+(unique\s+)?index\s+(?!concurrently\b)/i,
+    hint: "Use CREATE INDEX CONCURRENTLY (outside a transaction) to avoid blocking writes.",
+  },
+  {
+    re: /\balter\s+table\b[^;]*\badd\s+column\b[^;]*\bnot\s+null\b(?![^;]*\bdefault\b)/i,
+    hint: "Add the column as nullable (or with a default), backfill, then add NOT NULL in a later migration.",
+  },
+  {
+    re: /\balter\s+table\b[^;]*\badd\s+constraint\b[^;]*\bforeign\s+key\b(?!\s+not\s+valid)/i,
+    hint: "Add the constraint as NOT VALID, then VALIDATE CONSTRAINT in a separate migration.",
+  },
+  {
+    re: /\balter\s+table\b[^;]*\bset\s+not\s+null\b/i,
+    hint: "Set NOT NULL only after a backfill migration has populated every row.",
+  },
+  {
+    re: /\balter\s+table\b[^;]*\btype\b/i,
+    hint: "Column type changes rewrite the table under an exclusive lock; stage via a new column and backfill.",
+  },
+];
+
+// Statements that are not safe to re-run after an interrupted deployment.
+const NON_IDEMPOTENT_PATTERNS: Array<{ re: RegExp; hint: string }> = [
+  {
+    re: /\bcreate\s+table\s+(?!if\s+not\s+exists\b)/i,
+    hint: "Use CREATE TABLE IF NOT EXISTS so an interrupted run can be resumed.",
+  },
+  {
+    re: /\bcreate\s+(unique\s+)?index\s+concurrently\s+(?!if\s+not\s+exists\b)/i,
+    hint: "Use CREATE INDEX CONCURRENTLY IF NOT EXISTS so a failed build can be retried.",
+  },
+  {
+    re: /\balter\s+table\b[^;]*\badd\s+column\s+(?!if\s+not\s+exists\b)/i,
+    hint: "Use ADD COLUMN IF NOT EXISTS so an interrupted run can be resumed.",
+  },
+  {
+    re: /\binsert\s+into\b(?![\s\S]*\bon\s+conflict\b)/i,
+    hint: "Use INSERT ... ON CONFLICT DO NOTHING for data backfills that may be retried.",
+  },
+];
+
+function stripSqlComments(sql: string): string {
+  return sql
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/--[^\n]*/g, " ");
+}
+
+/**
+ * Validates a single migration for lock-safe, idempotent, and rollback-aware
+ * patterns. Returns the list of issues found (empty when the migration is safe).
+ */
+export function validateMigration(migration: MigrationFile): string[] {
+  const issues: string[] = [];
+  const body = stripSqlComments(migration.sql);
+
+  for (const { re, hint } of LOCK_UNSAFE_PATTERNS) {
+    if (re.test(body)) {
+      issues.push(`Lock-unsafe statement in '${migration.name}': ${hint}`);
+    }
+  }
+
+  for (const { re, hint } of NON_IDEMPOTENT_PATTERNS) {
+    if (re.test(body)) {
+      issues.push(`Non-idempotent statement in '${migration.name}': ${hint}`);
+    }
+  }
+
+  if (!migration.rollbackSql || migration.rollbackSql.trim().length === 0) {
+    issues.push(
+      `Missing rollback SQL for '${migration.name}'. Remediation: add a matching '${migration.name.replace(/\.sql$/, "")}.down.sql' file.`
+    );
+  }
+
+  return issues;
+}
+
+/**
+ * Discovers migrations in `migrationsDir`, pairs each up migration with its
+ * rollback file, and validates them. Also detects interrupted deployments via
+ * the `-- migration:interrupted` marker so operators can resume or roll back.
+ */
+export function validateMigrations(
+  migrationsDir: string = path.join(process.cwd(), "migrations")
+): MigrationValidationResult {
+  const issues: string[] = [];
+  const lockUnsafe: string[] = [];
+  const nonIdempotent: string[] = [];
+  const missingRollback: string[] = [];
+  const interrupted: string[] = [];
+
+  if (!fs.existsSync(migrationsDir)) {
+    issues.push(
+      `Missing migrations directory '${migrationsDir}'. Remediation: create it or pass an explicit path.`
+    );
+    return { ok: false, issues, lockUnsafe, nonIdempotent, missingRollback, interrupted };
+  }
+
+  const entries = fs.readdirSync(migrationsDir).sort();
+  const rollbackFiles = new Set(
+    entries.filter((e) => ROLLBACK_SUFFIX_RE.test(e))
+  );
+
+  for (const entry of entries) {
+    if (!MIGRATION_FILE_RE.test(entry)) continue;
+    const fullPath = path.join(migrationsDir, entry);
+    const sql = fs.readFileSync(fullPath, "utf-8");
+
+    if (sql.includes(INTERRUPTED_MARKER)) {
+      interrupted.push(entry);
+      issues.push(
+        `Interrupted deployment detected for '${entry}'. Remediation: resume with 'pnpm migrate:resume' or roll back with 'pnpm migrate:rollback ${entry}'.`
+      );
+    }
+
+    const rollbackName = entry.replace(/\.sql$/, ".down.sql");
+    const rollbackSql = rollbackFiles.has(rollbackName)
+      ? fs.readFileSync(path.join(migrationsDir, rollbackName), "utf-8")
+      : undefined;
+
+    const migrationIssues = validateMigration({ name: entry, sql, rollbackSql });
+    for (const issue of migrationIssues) {
+      issues.push(issue);
+      if (issue.startsWith("Lock-unsafe")) lockUnsafe.push(entry);
+      else if (issue.startsWith("Non-idempotent")) nonIdempotent.push(entry);
+      else if (issue.startsWith("Missing rollback")) missingRollback.push(entry);
+    }
+  }
+
+  return {
+    ok: issues.length === 0,
+    issues,
+    lockUnsafe,
+    nonIdempotent,
+    missingRollback,
+    interrupted,
+  };
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
   console.log("Validating workspace manifests and lockfiles...");
   const res = validateWorkspace();
@@ -127,5 +288,20 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     process.exit(1);
   } else {
     console.log("Workspace manifests and lockfiles are valid.");
+  }
+
+  console.log("Validating database migrations...");
+  const migrationsDir = process.env.MIGRATIONS_DIR
+    ? path.resolve(process.env.MIGRATIONS_DIR)
+    : path.join(process.cwd(), "migrations");
+  const migRes = validateMigrations(migrationsDir);
+  if (!migRes.ok) {
+    console.error(`Migration validation failed with ${migRes.issues.length} issue(s):`);
+    for (const issue of migRes.issues) {
+      console.error(`- ${issue}`);
+    }
+    process.exit(1);
+  } else {
+    console.log("Database migrations are lock-safe, idempotent, and rollback-aware.");
   }
 }
