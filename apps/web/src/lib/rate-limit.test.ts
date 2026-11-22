@@ -5,6 +5,9 @@ import {
   RateLimiter,
   SharedAtomicCounterStore,
   SLIDING_WINDOW_SCRIPT,
+  WEIGHTED_BUDGET_SCRIPT,
+  SINGLE_FLIGHT_LOCK_SCRIPT,
+  SINGLE_FLIGHT_RELEASE_SCRIPT,
   resolveRouteClassPolicy,
   buildRateLimitHeaders,
   createRateLimiter,
@@ -14,6 +17,9 @@ import {
   CAMPAIGN_API_RATE_LIMIT_TIERS,
   resolveCampaignApiTier,
   resolveCampaignApiTierByFunding,
+  deductWeightedBudget,
+  acquireSingleFlightLock,
+  releaseSingleFlightLock,
   type RateLimitResult,
 } from "./rate-limit";
 import {
@@ -413,6 +419,173 @@ describe("RATE_LIMIT_TIERS & tier resolver", () => {
     expect(resolveTier("pk_live_t2_secret456").id).toBe("tier2");
     expect(resolveTier("tier2_key_xyz").id).toBe("tier2");
     expect(resolveTier("invalid_key").id).toBe("free");
+  });
+});
+
+// ── Weighted Budget Deduction (#234) ──────────────────────────────────────────
+
+describe("deductWeightedBudget — atomic weighted metering (Issue #234)", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("Lua script deducts cost atomically and only when budget remains", () => {
+    expect(WEIGHTED_BUDGET_SCRIPT).toContain("redis.call('INCRBY'");
+    expect(WEIGHTED_BUDGET_SCRIPT).toContain("redis.call('DECRBY'");
+    expect(WEIGHTED_BUDGET_SCRIPT).toContain("redis.call('PEXPIRE'");
+    expect(WEIGHTED_BUDGET_SCRIPT).toContain("redis.call('PTTL'");
+  });
+
+  it("returns the deducted amount and remaining budget on success", async () => {
+    const redis = {
+      eval: vi.fn().mockResolvedValue([42, 958, 60_000]),
+    };
+    const result = await deductWeightedBudget(redis as unknown as RedisClientParam, {
+      key: "meter:tenant-1:2024-06",
+      cost: 42,
+      limit: 1000,
+      windowMs: 60_000,
+    });
+    expect(result).not.toBeNull();
+    expect(result!.allowed).toBe(true);
+    expect(result!.used).toBe(42);
+    expect(result!.remaining).toBe(958);
+    expect(result!.limit).toBe(1000);
+    expect(result!.resetAt).toBeGreaterThan(Date.now());
+  });
+
+  it("passes cost, limit and TTL to the Lua script", async () => {
+    const redis = { eval: vi.fn().mockResolvedValue([5, 95, 30_000]) };
+    await deductWeightedBudget(redis as unknown as RedisClientParam, {
+      key: "meter:tenant-2",
+      cost: 5,
+      limit: 100,
+      windowMs: 30_000,
+    });
+    expect(redis.eval).toHaveBeenCalledWith(
+      WEIGHTED_BUDGET_SCRIPT,
+      1,
+      "meter:tenant-2",
+      "5",
+      "100",
+      "31"
+    );
+  });
+
+  it("rejects (allowed:false) when the weighted cost would exceed the budget", async () => {
+    const redis = { eval: vi.fn().mockResolvedValue([-1, 3, 12_000]) };
+    const result = await deductWeightedBudget(redis as unknown as RedisClientParam, {
+      key: "meter:tenant-3",
+      cost: 10,
+      limit: 5,
+      windowMs: 60_000,
+    });
+    expect(result).not.toBeNull();
+    expect(result!.allowed).toBe(false);
+    expect(result!.remaining).toBe(3);
+    expect(result!.used).toBe(0);
+  });
+
+  it("returns null when Redis is unavailable so callers apply their failure policy", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const nullResult = await deductWeightedBudget(null, {
+      key: "meter:tenant-4",
+      cost: 1,
+      limit: 10,
+      windowMs: 60_000,
+    });
+    expect(nullResult).toBeNull();
+
+    const brokenRedis = { eval: vi.fn().mockRejectedValue(new Error("ECONNREFUSED")) };
+    const errResult = await deductWeightedBudget(brokenRedis as unknown as RedisClientParam, {
+      key: "meter:tenant-4",
+      cost: 1,
+      limit: 10,
+      windowMs: 60_000,
+    });
+    expect(errResult).toBeNull();
+    spy.mockRestore();
+  });
+});
+
+// ── Single-flight lock primitives (#235) ──────────────────────────────────────
+
+describe("acquireSingleFlightLock / releaseSingleFlightLock (Issue #235)", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("Lua scripts use SET NX PX and compare-and-delete on release", () => {
+    expect(SINGLE_FLIGHT_LOCK_SCRIPT).toContain("redis.call('SET'");
+    expect(SINGLE_FLIGHT_LOCK_SCRIPT).toContain("'NX'");
+    expect(SINGLE_FLIGHT_LOCK_SCRIPT).toContain("'PX'");
+    expect(SINGLE_FLIGHT_RELEASE_SCRIPT).toContain("redis.call('GET'");
+    expect(SINGLE_FLIGHT_RELEASE_SCRIPT).toContain("redis.call('DEL'");
+  });
+
+  it("returns the lock token when the lock is acquired", async () => {
+    const redis = { eval: vi.fn().mockResolvedValue("1") };
+    const token = await acquireSingleFlightLock(redis as unknown as RedisClientParam, {
+      key: "sf:analytics:tenant-1",
+      ttlMs: 5_000,
+    });
+    expect(token).toBeTruthy();
+    expect(redis.eval).toHaveBeenCalledWith(
+      SINGLE_FLIGHT_LOCK_SCRIPT,
+      1,
+      "sf:analytics:tenant-1",
+      token,
+      "5000"
+    );
+  });
+
+  it("returns null when another caller already holds the lock", async () => {
+    const redis = { eval: vi.fn().mockResolvedValue(null) };
+    const token = await acquireSingleFlightLock(redis as unknown as RedisClientParam, {
+      key: "sf:analytics:tenant-1",
+      ttlMs: 5_000,
+    });
+    expect(token).toBeNull();
+  });
+
+  it("returns null when Redis is unavailable (caller falls back to direct compute)", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const token = await acquireSingleFlightLock(null, {
+      key: "sf:analytics:tenant-2",
+      ttlMs: 5_000,
+    });
+    expect(token).toBeNull();
+    spy.mockRestore();
+  });
+
+  it("release only deletes the lock when the token matches (compare-and-delete safety)", async () => {
+    const redis = { eval: vi.fn().mockResolvedValue(1) };
+    const released = await releaseSingleFlightLock(redis as unknown as RedisClientParam, {
+      key: "sf:analytics:tenant-1",
+      token: "token-abc",
+    });
+    expect(released).toBe(true);
+    expect(redis.eval).toHaveBeenCalledWith(
+      SINGLE_FLIGHT_RELEASE_SCRIPT,
+      1,
+      "sf:analytics:tenant-1",
+      "token-abc"
+    );
+  });
+
+  it("release reports false when the token no longer matches (lock expired/re-acquired)", async () => {
+    const redis = { eval: vi.fn().mockResolvedValue(0) };
+    const released = await releaseSingleFlightLock(redis as unknown as RedisClientParam, {
+      key: "sf:analytics:tenant-1",
+      token: "stale-token",
+    });
+    expect(released).toBe(false);
+  });
+
+  it("release returns false when Redis is unavailable", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const released = await releaseSingleFlightLock(null, {
+      key: "sf:analytics:tenant-3",
+      token: "token-xyz",
+    });
+    expect(released).toBe(false);
+    spy.mockRestore();
   });
 });
 

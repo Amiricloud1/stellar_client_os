@@ -4130,6 +4130,336 @@ fn test_cross_contract_token_authorization_and_rollback() {
     assert_eq!(stream.remaining_balance, 1000);
     assert_eq!(token_client.balance(&recipient), initial_recipient_balance);
 }
+
+    // -----------------------------------------------------------------------
+    // Issue #4: Executable Constraints Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_solvency() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let fee_collector = Address::generate(&env);
+        let contract_id = env.register(PaymentStreamContract, ());
+        let client = PaymentStreamContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &fee_collector, &0);
+
+        // Contract should be solvent initially
+        assert_eq!(client.check_solvency(), true);
+    }
+
+    #[test]
+    fn test_completed_streams_cannot_reopen() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let fee_collector = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let sac = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = sac.address();
+        let contract_id = env.register(PaymentStreamContract, ());
+        let client = PaymentStreamContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &fee_collector, &0);
+
+        let token_admin = token::StellarAssetClient::new(&env, &token);
+        token_admin.mint(&sender, &1000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &recipient,
+            &token,
+            &100,
+            &100,
+            &0,
+            &100,
+        );
+
+        env.ledger().set_timestamp(100);
+
+        // Withdraw full amount -> stream marked Completed
+        client.withdraw(&stream_id, &100);
+
+        let stream = client.get_stream(&stream_id);
+        assert_eq!(stream.status, StreamStatus::Completed);
+
+        // Verify terminal state check
+        assert_eq!(client.is_stream_terminal(&stream_id), true);
+
+        // Attempting to resume should fail (terminal state)
+        let result = client.try_resume_stream(&stream_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_canceled_streams_are_terminal() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let fee_collector = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let sac = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = sac.address();
+        let contract_id = env.register(PaymentStreamContract, ());
+        let client = PaymentStreamContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &fee_collector, &0);
+
+        let token_admin = token::StellarAssetClient::new(&env, &token);
+        token_admin.mint(&sender, &1000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &recipient,
+            &token,
+            &100,
+            &100,
+            &0,
+            &100,
+        );
+
+        // Cancel stream
+        client.cancel_stream(&stream_id);
+
+        let stream = client.get_stream(&stream_id);
+        assert_eq!(stream.status, StreamStatus::Canceled);
+        assert_eq!(client.is_stream_terminal(&stream_id), true);
+
+        // Attempting to resume canceled stream should fail
+        let result = client.try_resume_stream(&stream_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_executed_disputes_are_final() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let fee_collector = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let sac = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = sac.address();
+        let contract_id = env.register(PaymentStreamContract, ());
+        let client = PaymentStreamContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &fee_collector, &0);
+
+        let token_admin = token::StellarAssetClient::new(&env, &token);
+        token_admin.mint(&sender, &1000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &recipient,
+            &token,
+            &100,
+            &100,
+            &0,
+            &100,
+        );
+
+        // Create a dispute
+        let dispute_id = client.resolve_dispute(&stream_id, &50, &50);
+
+        // Advance time past timelock
+        env.ledger().set_timestamp(172_801);
+
+        // Execute the resolution
+        client.execute_resolution(&dispute_id);
+
+        // Verify dispute is marked executed
+        assert_eq!(client.is_dispute_executed(&dispute_id), true);
+
+        // Attempting to cancel the dispute should fail (already executed)
+        let result = client.try_cancel_queued_resolution(&dispute_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_operations_always_available() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let fee_collector = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let sac = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = sac.address();
+        let contract_id = env.register(PaymentStreamContract, ());
+        let client = PaymentStreamContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &fee_collector, &0);
+
+        let token_admin = token::StellarAssetClient::new(&env, &token);
+        token_admin.mint(&sender, &1000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &recipient,
+            &token,
+            &100,
+            &100,
+            &0,
+            &100,
+        );
+
+        // Pause contract
+        client.emergency_pause();
+        assert_eq!(client.is_paused(), true);
+
+        // Read operations should still work
+        let stream = client.get_stream(&stream_id);
+        assert_eq!(stream.id, stream_id);
+
+        let withdrawable = client.withdrawable_amount(&stream_id);
+        assert!(withdrawable >= 0);
+
+        let metrics = client.get_stream_metrics(&stream_id);
+        assert_eq!(metrics.total_withdrawn, 0);
+
+        let protocol_metrics = client.get_protocol_metrics();
+        assert_eq!(protocol_metrics.total_active_streams, 1);
+    }
+
+    #[test]
+    fn test_claim_operations_always_available_even_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let fee_collector = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let sac = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = sac.address();
+        let contract_id = env.register(PaymentStreamContract, ());
+        let client = PaymentStreamContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &fee_collector, &0);
+
+        let token_admin = token::StellarAssetClient::new(&env, &token);
+        token_admin.mint(&sender, &1000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &recipient,
+            &token,
+            &100,
+            &100,
+            &0,
+            &100,
+        );
+
+        env.ledger().set_timestamp(50);
+
+        // Pause contract
+        client.emergency_pause();
+        assert_eq!(client.is_paused(), true);
+
+        // Claim operations should still work (withdraw, cancel)
+        let withdrawable = client.withdrawable_amount(&stream_id);
+        if withdrawable > 0 {
+            let result = client.try_withdraw(&stream_id, &withdrawable);
+            assert!(result.is_ok(), "Withdraw should work even during pause");
+        }
+    }
+
+    #[test]
+    fn test_state_mutations_blocked_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let fee_collector = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let sac = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = sac.address();
+        let contract_id = env.register(PaymentStreamContract, ());
+        let client = PaymentStreamContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &fee_collector, &0);
+
+        let token_admin = token::StellarAssetClient::new(&env, &token);
+        token_admin.mint(&sender, &1000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &recipient,
+            &token,
+            &100,
+            &100,
+            &0,
+            &100,
+        );
+
+        // Pause contract
+        client.emergency_pause();
+
+        // State-mutating operations should fail
+        let result = client.try_deposit(&stream_id, &10);
+        assert!(result.is_err(), "Deposit should be blocked during pause");
+
+        let result = client.try_create_stream(&sender, &recipient, &token, &100, &100, &0, &100);
+        assert!(result.is_err(), "Create stream should be blocked during pause");
+    }
+
+    #[test]
+    fn test_pause_state_matrix_enforcement() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let fee_collector = Address::generate(&env);
+        let contract_id = env.register(PaymentStreamContract, ());
+        let client = PaymentStreamContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &fee_collector, &0);
+
+        // Test operation allowance in unpaused state
+        assert_eq!(
+            client.is_operation_allowed(symbol_short!("get_stream")),
+            true,
+            "get_stream should always be allowed"
+        );
+        assert_eq!(
+            client.is_operation_allowed(symbol_short!("withdraw")),
+            true,
+            "withdraw should be allowed when unpaused"
+        );
+        assert_eq!(
+            client.is_operation_allowed(symbol_short!("deposit")),
+            true,
+            "deposit should be allowed when unpaused"
+        );
+
+        // Pause contract
+        client.emergency_pause();
+
+        // Test operation allowance in paused state
+        assert_eq!(
+            client.is_operation_allowed(symbol_short!("get_stream")),
+            true,
+            "get_stream should always be allowed (read)"
+        );
+        assert_eq!(
+            client.is_operation_allowed(symbol_short!("withdraw")),
+            true,
+            "withdraw should be allowed even when paused (claim)"
+        );
+        assert_eq!(
+            client.is_operation_allowed(symbol_short!("deposit")),
+            false,
+            "deposit should be blocked when paused (state mutation)"
+        );
+    }
 }
 
 

@@ -21,6 +21,10 @@ pub enum DataKey {
     PoolCount,
     /// Per-sponsor contribution keyed by (pool_id, sponsor).
     Contribution(u64, Address),
+    /// Terms snapshot hash accepted for a pool, keyed by pool_id.
+    PoolTermsHash(u64),
+    /// Terms snapshot hash bound to a sponsor's contribution, keyed by (pool_id, sponsor).
+    ContributionTermsHash(u64, Address),
     /// Settlement state marker for one-time settlement verification.
     PoolSettled(u64),
     /// Payout marker guaranteeing raised funds are paid out only once.
@@ -93,8 +97,8 @@ pub enum Error {
     TargetNotReached = 8,
     NoContribution = 9,
     ArithmeticOverflow = 10,
-    BatchLimitExceeded = 11,
-    ConservationViolated = 12,
+    /// Supplied terms snapshot hash does not match the pool's accepted terms.
+    TermsSnapshotMismatch = 11,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,10 +156,17 @@ impl SponsorCrowdfundingContract {
     /// * `tree_id`       ??? ID of the tree to fund.
     /// * `target_amount` ??? Total amount needed.
     /// * `token`         ??? Stellar asset contract address for contributions.
+    /// * `terms_hash`    ??? Content hash of the donor-facing terms shown before signing.
     ///
     /// # Returns
     /// The newly assigned pool ID.
-    pub fn create_pool(env: Env, tree_id: u64, target_amount: i128, token: Address) -> u64 {
+    pub fn create_pool(
+        env: Env,
+        tree_id: u64,
+        target_amount: i128,
+        token: Address,
+        terms_hash: u64,
+    ) -> u64 {
         Self::assert_initialized(&env);
 
         checked_math::validate_amount(&env, target_amount);
@@ -184,12 +195,21 @@ impl SponsorCrowdfundingContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+
+        let terms_key = DataKey::PoolTermsHash(count);
+        env.storage().persistent().set(&terms_key, &terms_hash);
+        env.storage()
+            .persistent()
+            .extend_ttl(&terms_key, LEDGER_THRESHOLD, LEDGER_BUMP);
+
         env.storage()
             .instance()
             .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
 
-        env.events()
-            .publish(("PoolCreated", count), (count, tree_id, target_amount));
+        env.events().publish(
+            ("PoolCreated", count),
+            (count, tree_id, target_amount, terms_hash),
+        );
 
         count
     }
@@ -202,12 +222,20 @@ impl SponsorCrowdfundingContract {
     /// * `contributor` ??? Address making the contribution.
     /// * `pool_id`     ??? Target pool.
     /// * `amount`      ??? Positive token amount to contribute.
+    /// * `terms_hash`  ??? Content hash of the terms the contributor signed.
     ///
     /// # Errors
     /// * [`Error::PoolNotOpen`]       ??? pool is not open for contributions.
     /// * [`Error::InvalidAmount`]     ??? `amount <= 0`.
+    /// * [`Error::TermsSnapshotMismatch`] ??? `terms_hash` differs from the pool's terms.
     /// * [`Error::ArithmeticOverflow`] ??? internal overflow.
-    pub fn contribute(env: Env, contributor: Address, pool_id: u64, amount: i128) {
+    pub fn contribute(
+        env: Env,
+        contributor: Address,
+        pool_id: u64,
+        amount: i128,
+        terms_hash: u64,
+    ) {
         contributor.require_auth();
 
         let mut pool = Self::load_pool(&env, pool_id);
@@ -216,6 +244,16 @@ impl SponsorCrowdfundingContract {
             panic_with_error!(&env, Error::PoolNotOpen);
         }
         checked_math::validate_amount(&env, amount);
+
+        // Bind the contribution to the exact terms snapshot the donor signed.
+        let accepted_terms: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolTermsHash(pool_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::TermsSnapshotMismatch));
+        if accepted_terms != terms_hash {
+            panic_with_error!(&env, Error::TermsSnapshotMismatch);
+        }
 
         let new_total = checked_math::checked_add(&env, pool.total_raised, amount);
 
@@ -232,28 +270,14 @@ impl SponsorCrowdfundingContract {
             .persistent()
             .extend_ttl(&contrib_key, LEDGER_THRESHOLD, LEDGER_BUMP);
 
-        // Register contributor in the ordered list if not already present.
-        if prev == 0 {
-            let list_key = DataKey::ContributorList(pool_id);
-            let count_key = DataKey::ContributorCount(pool_id);
-            let mut list: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&list_key)
-                .unwrap_or_else(|| vec![&env]);
-            list.push_back(contributor.clone());
-            let new_count = list.len();
-            env.storage().persistent().set(&list_key, &list);
-            env.storage()
-                .persistent()
-                .extend_ttl(&list_key, LEDGER_THRESHOLD, LEDGER_BUMP);
-            env.storage()
-                .persistent()
-                .set(&count_key, &(new_count as u64));
-            env.storage()
-                .persistent()
-                .extend_ttl(&count_key, LEDGER_THRESHOLD, LEDGER_BUMP);
-        }
+        // Record the terms snapshot hash this contribution is bound to.
+        let terms_key = DataKey::ContributionTermsHash(pool_id, contributor.clone());
+        env.storage().persistent().set(&terms_key, &terms_hash);
+        env.storage()
+            .persistent()
+            .extend_ttl(&terms_key, LEDGER_THRESHOLD, LEDGER_BUMP);
+
+        pool.total_raised = new_total;
 
         pool.total_raised = new_total;
         if pool.total_raised >= pool.target_amount {
@@ -268,7 +292,7 @@ impl SponsorCrowdfundingContract {
 
         env.events().publish(
             ("ContributionMade", pool_id),
-            (contributor, pool_id, amount, pool.total_raised),
+            (contributor, pool_id, amount, pool.total_raised, terms_hash),
         );
     }
 
@@ -551,6 +575,25 @@ impl SponsorCrowdfundingContract {
             .unwrap_or(0)
     }
 
+    /// Return the terms snapshot hash accepted for a pool.
+    pub fn get_pool_terms_hash(env: Env, pool_id: u64) -> u64 {
+        Self::load_pool(&env, pool_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::PoolTermsHash(pool_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::TermsSnapshotMismatch))
+    }
+
+    /// Return the terms snapshot hash bound to a sponsor's contribution.
+    ///
+    /// Panics with [`Error::NoContribution`] if the sponsor has no contribution.
+    pub fn get_contribution_terms_hash(env: Env, pool_id: u64, contributor: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ContributionTermsHash(pool_id, contributor))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoContribution))
+    }
+
     /// Return the total number of pools created.
     pub fn get_pool_count(env: Env) -> u64 {
         env.storage()
@@ -629,6 +672,9 @@ mod tests {
         Address, Env,
     };
 
+    /// Terms snapshot hash used across tests.
+    const TERMS_HASH: u64 = 0xDEAD_BEEF_1234_5678;
+
     fn set_time(env: &Env, ts: u64) {
         env.ledger().set(LedgerInfo {
             timestamp: ts,
@@ -680,7 +726,7 @@ mod tests {
         set_time(&env, 1_000);
         let (_, client, _, token_addr) = setup_contract(&env);
 
-        let id = client.create_pool(&1, &10_000, &token_addr);
+        let id = client.create_pool(&1, &10_000, &token_addr, &TERMS_HASH);
         assert_eq!(id, 1);
         assert_eq!(client.get_pool_count(), 1);
 
@@ -689,6 +735,7 @@ mod tests {
         assert_eq!(pool.target_amount, 10_000);
         assert_eq!(pool.total_raised, 0);
         assert_eq!(pool.status, PoolStatus::Open);
+        assert_eq!(client.get_pool_terms_hash(&id), TERMS_HASH);
     }
 
     #[test]
@@ -705,9 +752,9 @@ mod tests {
         token_admin_client.mint(&sponsor1, &8_000);
         token_admin_client.mint(&sponsor2, &5_000);
 
-        let id = client.create_pool(&1, &10_000, &token_addr2);
-        client.contribute(&sponsor1, &id, &6_000);
-        client.contribute(&sponsor2, &id, &4_000);
+        let id = client.create_pool(&1, &10_000, &token_addr2, &TERMS_HASH);
+        client.contribute(&sponsor1, &id, &6_000, &TERMS_HASH);
+        client.contribute(&sponsor2, &id, &4_000, &TERMS_HASH);
 
         let pool = client.get_pool(&id);
         assert_eq!(pool.total_raised, 10_000);
@@ -715,6 +762,40 @@ mod tests {
 
         assert_eq!(client.get_contribution(&id, &sponsor1), 6_000);
         assert_eq!(client.get_contribution(&id, &sponsor2), 4_000);
+        assert_eq!(
+            client.get_contribution_terms_hash(&id, &sponsor1),
+            TERMS_HASH
+        );
+        assert_eq!(
+            client.get_contribution_terms_hash(&id, &sponsor2),
+            TERMS_HASH
+        );
+    }
+
+    #[test]
+    fn test_contribute_terms_snapshot_mismatch_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr2, token_client, token_admin_client) = create_token(&env, &token_admin);
+        let sponsor = Address::generate(&env);
+        token_admin_client.mint(&sponsor, &5_000);
+
+        let id = client.create_pool(&1, &10_000, &token_addr2, &TERMS_HASH);
+
+        let res = client.try_contribute(&sponsor, &id, &3_000, &(TERMS_HASH + 1));
+        assert_eq!(res, Err(Ok(Error::TermsSnapshotMismatch)));
+
+        // No state change: no funds moved, no contribution recorded.
+        assert_eq!(token_client.balance(&sponsor), 5_000);
+        assert_eq!(client.get_contribution(&id, &sponsor), 0);
+        assert_eq!(client.get_pool(&id).total_raised, 0);
+        assert!(client
+            .try_get_contribution_terms_hash(&id, &sponsor)
+            .is_err());
     }
 
     #[test]
@@ -729,8 +810,8 @@ mod tests {
         let sponsor = Address::generate(&env);
         token_admin_client.mint(&sponsor, &5_000);
 
-        let id = client.create_pool(&1, &10_000, &token_addr2);
-        client.contribute(&sponsor, &id, &3_000);
+        let id = client.create_pool(&1, &10_000, &token_addr2, &TERMS_HASH);
+        client.contribute(&sponsor, &id, &3_000, &TERMS_HASH);
 
         client.dissolve_pool(&id);
         assert_eq!(client.get_pool(&id).status, PoolStatus::Dissolved);
@@ -756,7 +837,7 @@ mod tests {
         env.mock_all_auths();
         set_time(&env, 1_000);
         let (_, client, _, token_addr) = setup_contract(&env);
-        client.create_pool(&1, &0, &token_addr);
+        client.create_pool(&1, &0, &token_addr, &TERMS_HASH);
     }
 
     #[test]
@@ -775,7 +856,7 @@ mod tests {
         env.mock_all_auths();
         set_time(&env, 1_000);
         let (_, client, _, token_addr) = setup_contract(&env);
-        let id = client.create_pool(&1, &MAX_AMOUNT, &token_addr);
+        let id = client.create_pool(&1, &MAX_AMOUNT, &token_addr, &TERMS_HASH);
         assert_eq!(client.get_pool(&id).target_amount, MAX_AMOUNT);
     }
 
@@ -786,7 +867,7 @@ mod tests {
         env.mock_all_auths();
         set_time(&env, 1_000);
         let (_, client, _, token_addr) = setup_contract(&env);
-        client.create_pool(&1, &(MAX_AMOUNT + 1), &token_addr);
+        client.create_pool(&1, &(MAX_AMOUNT + 1), &token_addr, &TERMS_HASH);
     }
 
     #[test]
@@ -797,8 +878,8 @@ mod tests {
         set_time(&env, 1_000);
         let (_, client, _, token_addr) = setup_contract(&env);
         let sponsor = Address::generate(&env);
-        let id = client.create_pool(&1, &10_000, &token_addr);
-        client.contribute(&sponsor, &id, &0);
+        let id = client.create_pool(&1, &10_000, &token_addr, &TERMS_HASH);
+        client.contribute(&sponsor, &id, &0, &TERMS_HASH);
     }
 
     #[test]
@@ -809,8 +890,8 @@ mod tests {
         set_time(&env, 1_000);
         let (_, client, _, token_addr) = setup_contract(&env);
         let sponsor = Address::generate(&env);
-        let id = client.create_pool(&1, &10_000, &token_addr);
-        client.contribute(&sponsor, &id, &-1);
+        let id = client.create_pool(&1, &10_000, &token_addr, &TERMS_HASH);
+        client.contribute(&sponsor, &id, &-1, &TERMS_HASH);
     }
 
     #[test]
@@ -825,10 +906,10 @@ mod tests {
         let sponsor = Address::generate(&env);
         token_admin_client.mint(&sponsor, &10_000);
 
-        let id = client.create_pool(&1, &10_000, &token_addr2);
+        let id = client.create_pool(&1, &10_000, &token_addr2, &TERMS_HASH);
 
         // Partial contribution of 4_000
-        client.contribute(&sponsor, &id, &4_000);
+        client.contribute(&sponsor, &id, &4_000, &TERMS_HASH);
         let pool = client.get_pool(&id);
         assert_eq!(pool.status, PoolStatus::Open);
         assert_eq!(pool.total_raised, 4_000);
@@ -847,8 +928,8 @@ mod tests {
         let sponsor = Address::generate(&env);
         token_admin_client.mint(&sponsor, &10_000);
 
-        let id = client.create_pool(&1, &10_000, &token_addr2);
-        client.contribute(&sponsor, &id, &10_000);
+        let id = client.create_pool(&1, &10_000, &token_addr2, &TERMS_HASH);
+        client.contribute(&sponsor, &id, &10_000, &TERMS_HASH);
 
         // First settlement succeeds
         client.settle_pool(&id, &500);
@@ -874,9 +955,9 @@ mod tests {
         token_admin_client.mint(&sponsor1, &6_000);
         token_admin_client.mint(&sponsor2, &4_000);
 
-        let id = client.create_pool(&1, &10_000, &token_addr2);
-        client.contribute(&sponsor1, &id, &6_000);
-        client.contribute(&sponsor2, &id, &4_000);
+        let id = client.create_pool(&1, &10_000, &token_addr2, &TERMS_HASH);
+        client.contribute(&sponsor1, &id, &6_000, &TERMS_HASH);
+        client.contribute(&sponsor2, &id, &4_000, &TERMS_HASH);
 
         let pool = client.get_pool(&id);
         assert_eq!(pool.status, PoolStatus::Settled);
@@ -902,8 +983,8 @@ mod tests {
         let sponsor = Address::generate(&env);
         token_admin_client.mint(&sponsor, &5_000);
 
-        let id = client.create_pool(&1, &10_000, &token_addr2);
-        client.contribute(&sponsor, &id, &3_000);
+        let id = client.create_pool(&1, &10_000, &token_addr2, &TERMS_HASH);
+        client.contribute(&sponsor, &id, &3_000, &TERMS_HASH);
         client.dissolve_pool(&id);
 
         client.refund(&sponsor, &id);

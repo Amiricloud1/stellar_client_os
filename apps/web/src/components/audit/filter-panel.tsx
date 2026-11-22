@@ -11,6 +11,19 @@ export type ActionType =
   | "pause"
   | "resume";
 
+/**
+ * Retention class of an audit record. Live envelopes are the hot, indexed
+ * records; archived summaries are compacted records produced by the archival
+ * job. "all" queries both sources.
+ */
+export type RetentionClass = "all" | "live" | "archived";
+
+/**
+ * Which archive source(s) an audit query should read from. "auto" lets the
+ * backend decide based on the requested date range and retention class.
+ */
+export type ArchiveSource = "auto" | "live" | "archive" | "both";
+
 export interface AuditFilters {
   actionType: ActionType;
   dateRange: "7d" | "30d" | "custom";
@@ -19,6 +32,8 @@ export interface AuditFilters {
   search: string;
   user: string;
   resource: string;
+  retentionClass: RetentionClass;
+  archiveSource: ArchiveSource;
 }
 
 export const DEFAULT_FILTERS: AuditFilters = {
@@ -29,6 +44,8 @@ export const DEFAULT_FILTERS: AuditFilters = {
   search: "",
   user: "",
   resource: "",
+  retentionClass: "all",
+  archiveSource: "auto",
 };
 
 interface FilterPanelProps {
@@ -164,6 +181,42 @@ export function FilterPanel({
             className="w-full rounded-lg border border-white/10 bg-slate-900 px-3 py-2 text-sm text-white outline-none focus-visible:ring-2 focus-visible:ring-fundable-purple-2"
             placeholder="stream-..."
           />
+        </div>
+
+        <div>
+          <label htmlFor="audit-filter-retention-class" className="mb-1 block text-xs uppercase tracking-wide text-slate-400">
+            Retention class
+          </label>
+          <select
+            id="audit-filter-retention-class"
+            value={filters.retentionClass}
+            onChange={(event) => updateField("retentionClass", event.target.value as RetentionClass)}
+            className="w-full rounded-lg border border-white/10 bg-slate-900 px-3 py-2 text-sm text-white outline-none focus-visible:ring-2 focus-visible:ring-fundable-purple-2"
+          >
+            <option value="all">All records</option>
+            <option value="live">Live envelopes</option>
+            <option value="archived">Archived summaries</option>
+          </select>
+          <p className="mt-1 text-[10px] text-slate-500">
+            Archived summaries are compacted; use the reconstruction path to expand details.
+          </p>
+        </div>
+
+        <div>
+          <label htmlFor="audit-filter-archive-source" className="mb-1 block text-xs uppercase tracking-wide text-slate-400">
+            Archive source
+          </label>
+          <select
+            id="audit-filter-archive-source"
+            value={filters.archiveSource}
+            onChange={(event) => updateField("archiveSource", event.target.value as ArchiveSource)}
+            className="w-full rounded-lg border border-white/10 bg-slate-900 px-3 py-2 text-sm text-white outline-none focus-visible:ring-2 focus-visible:ring-fundable-purple-2"
+          >
+            <option value="auto">Auto</option>
+            <option value="live">Live only</option>
+            <option value="archive">Archive only</option>
+            <option value="both">Live + archive</option>
+          </select>
         </div>
 
         <button

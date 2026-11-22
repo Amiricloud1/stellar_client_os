@@ -3,6 +3,7 @@
 import { TokenBalanceList } from "@/components/token-balance";
 import { ErrorBoundary } from "@/components/ui/error-boundary";
 import { ErrorFallback } from "@/components/ui/error-fallback";
+import { TransactionTimeline } from "@/components/transaction-timeline";
 
 export default function BalancesPage() {
   return (
@@ -32,6 +33,34 @@ export default function BalancesPage() {
         >
           <TokenBalanceList className="max-w-2xl" />
         </ErrorBoundary>
+
+        {/* Transaction confirmation timeline for recent balance-affecting transactions */}
+        <div className="mt-12">
+          <div className="mb-4">
+            <h2 className="text-xl font-semibold text-zinc-50 mb-1">
+              Recent Transactions
+            </h2>
+            <p className="text-sm text-zinc-400">
+              Track wallet approval, submission, ledger confirmation, and
+              settlement for transactions that affect your balances.
+            </p>
+          </div>
+
+          <ErrorBoundary
+            boundaryName="transaction-timeline-module"
+            fallback={({ error, reset }) => (
+              <ErrorFallback
+                title="Transaction Timeline Unavailable"
+                description="We couldn't render the transaction confirmation timeline."
+                error={error}
+                onRetry={reset}
+                className="max-w-2xl"
+              />
+            )}
+          >
+            <TransactionTimeline className="max-w-2xl" />
+          </ErrorBoundary>
+        </div>
       </div>
     </div>
   );

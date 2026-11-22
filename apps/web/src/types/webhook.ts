@@ -89,3 +89,63 @@ export interface WebhookDeliveryAttempt {
   errorMessage: string | null;
   attempt: number; // Retries count (1 for first try, 2, etc.)
 }
+
+/**
+ * Per-destination circuit breaker state.
+ *
+ * - `closed`: deliveries flow normally; failures are counted.
+ * - `open`: the destination is failing; deliveries are short-circuited (not
+ *   attempted) until `nextProbeAt`, so one failing subscriber cannot starve
+ *   healthy destinations.
+ * - `half_open`: a single probe delivery is allowed to test recovery; success
+ *   transitions back to `closed`, failure returns to `open`.
+ */
+export type CircuitBreakerState = "closed" | "open" | "half_open";
+
+/**
+ * Health record for a single webhook destination (subscription URL).
+ *
+ * Persistence contract:
+ * - Health is tracked per destination so failures are isolated to the failing
+ *   subscriber and do not affect delivery to healthy destinations.
+ * - `consecutiveFailures` resets to 0 on any successful delivery.
+ * - `openedAt` is set when the breaker transitions to `open` and cleared when it
+ *   returns to `closed`.
+ * - `nextProbeAt` is the earliest time a `half_open` probe may be attempted; it
+ *   is `null` while the breaker is `closed`.
+ */
+export interface WebhookDestinationHealth {
+  destination: string; // Subscription URL the health applies to
+  state: CircuitBreakerState;
+  consecutiveFailures: number;
+  openedAt: string | null; // ISO string; set when state becomes 'open'
+  nextProbeAt: string | null; // ISO string; earliest half-open probe time
+}
+
+/**
+ * Outcome of an operator-initiated manual redelivery.
+ */
+export type OperatorRedeliveryOutcome = "delivered" | "failed" | "short_circuited";
+
+/**
+ * Durable audit record for an authorized operator webhook redelivery.
+ *
+ * Persistence contract:
+ * - Records are append-only and MUST be persisted in durable storage.
+ * - The original event and signature inputs are preserved verbatim so the
+ *   redelivery is verifiable against the payload originally sent to the
+ *   subscriber; redelivery MUST NOT re-sign with a new timestamp.
+ * - `id` is the idempotency key for recording the audit entry; re-recording the
+ *   same `id` MUST be a no-op.
+ */
+export interface OperatorRedeliveryAuditRecord {
+  id: string; // Unique audit record ID (idempotency key)
+  operatorId: string; // Authenticated operator who authorized the redelivery
+  subscriptionId: string;
+  originalEventId: string; // Delivery ID of the original event
+  originalSignatureVersion: WebhookSignatureVersion;
+  originalSignatureTimestamp: number; // Epoch seconds from the original signature
+  attemptNumber: number; // Redelivery attempt count (1 for first manual attempt)
+  outcome: OperatorRedeliveryOutcome;
+  timestamp: string; // ISO string; when the redelivery was attempted
+}

@@ -31,6 +31,20 @@ pub enum AuditError {
     InvalidTreeId = 12,
     /// The tree already has a verification record.
     TreeAlreadyVerified = 13,
+    /// The evidence id `0` is reserved and invalid.
+    InvalidEvidenceId = 14,
+    /// The evidence version `0` is reserved and invalid.
+    InvalidEvidenceVersion = 15,
+    /// The evidence version is not the latest version for the evidence.
+    StaleEvidenceVersion = 16,
+    /// The reviewer is not assigned to the campaign and is not an admin.
+    UnauthorizedReviewer = 17,
+    /// A reviewer comment was submitted with no body text.
+    EmptyComment = 18,
+    /// The reviewer comment id `0` is reserved and invalid.
+    InvalidCommentId = 19,
+    /// The reviewer comment was not found.
+    CommentNotFound = 20,
 }
 
 /// The immutable activity type logged in the verification audit trail.
@@ -79,6 +93,36 @@ pub struct AuditEntry {
     pub timestamp: u64,
 }
 
+/// A reviewer comment attached to a specific evidence version.
+///
+/// Comments are append-only: the author, timestamp and evidence version are
+/// captured at write time and never mutated. Only the resolution status may be
+/// updated, and only by an authorized reviewer or the admin.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewerComment {
+    /// Sequential comment id within this evidence version.
+    pub id: u32,
+    /// The campaign the evidence belongs to.
+    pub campaign_id: u64,
+    /// The evidence being discussed.
+    pub evidence_id: u32,
+    /// The exact evidence version the comment refers to.
+    pub evidence_version: u32,
+    /// The reviewer wallet that authored the comment.
+    pub author: Address,
+    /// The comment body.
+    pub body: String,
+    /// Ledger Unix timestamp at the moment of recording.
+    pub timestamp: u64,
+    /// Whether the comment has been resolved.
+    pub resolved: bool,
+    /// The wallet that resolved the comment, if resolved.
+    pub resolved_by: Option<Address>,
+    /// Ledger Unix timestamp at the moment of resolution, if resolved.
+    pub resolved_at: Option<u64>,
+}
+
 /// The verification record for a single tree.
 ///
 /// A tree is identified by its id and shares the region-level GPS coordinate
@@ -106,6 +150,14 @@ pub enum DataKey {
     ActivityCount(u64),
     Status(u64),
     TreeVerification(u32),
+    /// Latest evidence version for `(campaign_id, evidence_id)`.
+    EvidenceVersion(u64, u32),
+    /// Reviewer comments for `(campaign_id, evidence_id, evidence_version)`.
+    ReviewerComments(u64, u32, u32),
+    /// Number of reviewer comments for `(campaign_id, evidence_id, evidence_version)`.
+    ReviewerCommentCount(u64, u32, u32),
+    /// Reviewer assigned to a campaign.
+    AssignedReviewer(u64, Address),
 }
 
 /// Maximum number of trees a single batch verification may contain.
@@ -412,6 +464,308 @@ impl CampaignVerificationAuditContract {
         env.storage()
             .persistent()
             .get(&DataKey::TreeVerification(tree_id))
+    }
+
+    /// Assign a reviewer to a campaign. Only the admin may assign reviewers.
+    pub fn assign_reviewer(
+        env: Env,
+        admin: Address,
+        campaign_id: u64,
+        reviewer: Address,
+    ) -> Result<(), AuditError> {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(&env)?;
+        if stored_admin != admin {
+            return Err(AuditError::Unauthorized);
+        }
+        if campaign_id == 0 {
+            return Err(AuditError::InvalidCampaignId);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::AssignedReviewer(campaign_id, reviewer.clone()), &true);
+        env.events()
+            .publish((symbol_short!("rvassign"), campaign_id), reviewer);
+        Ok(())
+    }
+
+    /// Returns whether `reviewer` is assigned to `campaign_id`.
+    pub fn is_assigned_reviewer(env: Env, campaign_id: u64, reviewer: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AssignedReviewer(campaign_id, reviewer))
+            .unwrap_or(false)
+    }
+
+    /// Record the latest evidence version for `(campaign_id, evidence_id)`.
+    ///
+    /// Only the admin may advance the evidence version. Versions must strictly
+    /// increase; re-submitting the current version is rejected as stale.
+    pub fn set_evidence_version(
+        env: Env,
+        admin: Address,
+        campaign_id: u64,
+        evidence_id: u32,
+        version: u32,
+    ) -> Result<(), AuditError> {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(&env)?;
+        if stored_admin != admin {
+            return Err(AuditError::Unauthorized);
+        }
+        if campaign_id == 0 {
+            return Err(AuditError::InvalidCampaignId);
+        }
+        if evidence_id == 0 {
+            return Err(AuditError::InvalidEvidenceId);
+        }
+        if version == 0 {
+            return Err(AuditError::InvalidEvidenceVersion);
+        }
+        let current: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EvidenceVersion(campaign_id, evidence_id))
+            .unwrap_or(0u32);
+        if version <= current {
+            return Err(AuditError::StaleEvidenceVersion);
+        }
+        env.storage().persistent().set(
+            &DataKey::EvidenceVersion(campaign_id, evidence_id),
+            &version,
+        );
+        env.events().publish(
+            (symbol_short!("evver"), campaign_id, evidence_id),
+            version,
+        );
+        Ok(())
+    }
+
+    /// Returns the latest evidence version for `(campaign_id, evidence_id)`.
+    pub fn get_evidence_version(env: Env, campaign_id: u64, evidence_id: u32) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EvidenceVersion(campaign_id, evidence_id))
+            .unwrap_or(0u32)
+    }
+
+    /// Add a reviewer comment against a specific evidence version.
+    ///
+    /// The author must be an assigned reviewer for the campaign or the admin.
+    /// The supplied `evidence_version` must match the latest recorded version,
+    /// otherwise [`AuditError::StaleEvidenceVersion`] is returned so callers can
+    /// refresh and retry against the current version.
+    pub fn add_reviewer_comment(
+        env: Env,
+        author: Address,
+        campaign_id: u64,
+        evidence_id: u32,
+        evidence_version: u32,
+        body: String,
+    ) -> Result<u32, AuditError> {
+        author.require_auth();
+        Self::require_reviewer(&env, campaign_id, &author)?;
+
+        if campaign_id == 0 {
+            return Err(AuditError::InvalidCampaignId);
+        }
+        if evidence_id == 0 {
+            return Err(AuditError::InvalidEvidenceId);
+        }
+        if evidence_version == 0 {
+            return Err(AuditError::InvalidEvidenceVersion);
+        }
+        if body.len() == 0 {
+            return Err(AuditError::EmptyComment);
+        }
+
+        let latest: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EvidenceVersion(campaign_id, evidence_id))
+            .unwrap_or(0u32);
+        if evidence_version != latest {
+            return Err(AuditError::StaleEvidenceVersion);
+        }
+
+        let mut comments: Vec<ReviewerComment> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReviewerComments(
+                campaign_id,
+                evidence_id,
+                evidence_version,
+            ))
+            .unwrap_or(Vec::new(&env));
+
+        let current_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReviewerCommentCount(
+                campaign_id,
+                evidence_id,
+                evidence_version,
+            ))
+            .unwrap_or(0u32);
+
+        let next_id = current_count + 1;
+        let timestamp = env.ledger().timestamp();
+
+        let comment = ReviewerComment {
+            id: next_id,
+            campaign_id,
+            evidence_id,
+            evidence_version,
+            author: author.clone(),
+            body: body.clone(),
+            timestamp,
+            resolved: false,
+            resolved_by: None,
+            resolved_at: None,
+        };
+
+        comments.push_back(comment);
+        env.storage().persistent().set(
+            &DataKey::ReviewerComments(campaign_id, evidence_id, evidence_version),
+            &comments,
+        );
+        env.storage().persistent().set(
+            &DataKey::ReviewerCommentCount(campaign_id, evidence_id, evidence_version),
+            &next_id,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("rvcomment"),
+                campaign_id,
+                evidence_id,
+                evidence_version,
+            ),
+            (author, next_id, timestamp, body),
+        );
+
+        Ok(next_id)
+    }
+
+    /// Update the resolution status of a reviewer comment.
+    ///
+    /// Only an assigned reviewer or the admin may resolve or reopen a comment.
+    pub fn set_comment_resolved(
+        env: Env,
+        actor: Address,
+        campaign_id: u64,
+        evidence_id: u32,
+        evidence_version: u32,
+        comment_id: u32,
+        resolved: bool,
+    ) -> Result<(), AuditError> {
+        actor.require_auth();
+        Self::require_reviewer(&env, campaign_id, &actor)?;
+
+        if comment_id == 0 {
+            return Err(AuditError::InvalidCommentId);
+        }
+
+        let key = DataKey::ReviewerComments(campaign_id, evidence_id, evidence_version);
+        let mut comments: Vec<ReviewerComment> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+
+        let mut found = false;
+        for i in 0..comments.len() {
+            let mut comment = comments.get(i).unwrap();
+            if comment.id == comment_id {
+                comment.resolved = resolved;
+                if resolved {
+                    comment.resolved_by = Some(actor.clone());
+                    comment.resolved_at = Some(env.ledger().timestamp());
+                } else {
+                    comment.resolved_by = None;
+                    comment.resolved_at = None;
+                }
+                comments.set(i, comment);
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return Err(AuditError::CommentNotFound);
+        }
+
+        env.storage().persistent().set(&key, &comments);
+        env.events().publish(
+            (
+                symbol_short!("rvresolve"),
+                campaign_id,
+                evidence_id,
+                evidence_version,
+            ),
+            (actor, comment_id, resolved),
+        );
+        Ok(())
+    }
+
+    /// Retrieve all reviewer comments for a specific evidence version.
+    pub fn get_reviewer_comments(
+        env: Env,
+        campaign_id: u64,
+        evidence_id: u32,
+        evidence_version: u32,
+    ) -> Vec<ReviewerComment> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReviewerComments(
+                campaign_id,
+                evidence_id,
+                evidence_version,
+            ))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Retrieve a single reviewer comment by id, if it exists.
+    pub fn get_reviewer_comment(
+        env: Env,
+        campaign_id: u64,
+        evidence_id: u32,
+        evidence_version: u32,
+        comment_id: u32,
+    ) -> Option<ReviewerComment> {
+        let comments: Vec<ReviewerComment> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReviewerComments(
+                campaign_id,
+                evidence_id,
+                evidence_version,
+            ))
+            .unwrap_or(Vec::new(&env));
+        for i in 0..comments.len() {
+            let comment = comments.get(i).unwrap();
+            if comment.id == comment_id {
+                return Some(comment);
+            }
+        }
+        None
+    }
+
+    /// Ensure `actor` is an assigned reviewer for the campaign or the admin.
+    fn require_reviewer(env: &Env, campaign_id: u64, actor: &Address) -> Result<(), AuditError> {
+        let admin = Self::get_admin(env)?;
+        if *actor == admin {
+            return Ok(());
+        }
+        let assigned: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssignedReviewer(campaign_id, actor.clone()))
+            .unwrap_or(false);
+        if !assigned {
+            return Err(AuditError::UnauthorizedReviewer);
+        }
+        Ok(())
     }
 
     /// Shared validation for single and batch tree verification submissions.
