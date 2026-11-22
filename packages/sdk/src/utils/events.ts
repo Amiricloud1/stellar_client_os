@@ -13,6 +13,12 @@ import type {
   StreamPausedEvent,
   StreamResumedEvent,
 } from "../generated/payment-stream/src/index.js";
+import {
+  buildRawEventEnvelope,
+  reconstructRawEvent,
+  type RawEventEnvelope,
+  type RawEventEnvelopeOptions,
+} from "../audit.js";
 
 export type ContractEventRaw = {
   contract_id: string;

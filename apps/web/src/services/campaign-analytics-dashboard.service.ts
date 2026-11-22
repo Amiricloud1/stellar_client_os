@@ -28,6 +28,11 @@ import {
   type PageMeta,
   type PaginatedResult,
 } from "./pagination";
+import {
+  AGGREGATE_VERSION,
+  getCampaignAggregate,
+  type CampaignAggregateSnapshot,
+} from "./campaign-analytics-aggregate.service";
 
 export type TrafficSourceName = "direct" | "search" | "social" | "referral" | "newsletter";
 export type FunnelStageName = "view" | "click_sponsor" | "contribute" | "confirm";
@@ -106,6 +111,12 @@ export interface DailyFundingPoint {
 export interface CampaignAnalyticsDashboard {
   campaignId: string;
   updatedAt: number;
+  /** Version of the incremental aggregate logic that produced these totals. */
+  aggregateVersion: number;
+  /** Timestamp of the last successful reconciliation against a full recomputation. */
+  lastReconciledAt: number | null;
+  /** True when the incremental aggregate drifted from a full recomputation. */
+  driftDetected: boolean;
   trafficSources: TrafficSourceStat[];
   funnel: FunnelStage[];
   demographics: BackerDemographic[];
@@ -310,22 +321,32 @@ export async function getCampaignAnalyticsDashboard(
 ): Promise<CampaignAnalyticsDashboard | null> {
   const campaign = await getCampaign(campaignId, dataSource);
   if (!campaign) return null;
-  const state = stateFor(campaignId);
 
-  const funnelViewers = state.funnel.get("view")?.size ?? 0;
-  const totalVisitors = Math.max(funnelViewers, state.viewers.size);
+  // Read from the versioned incremental aggregate. The aggregate is
+  // reconciled against a full recomputation on every read, so the totals
+  // returned here always match a deterministic full recomputation even in
+  // the presence of late or duplicate events.
+  const aggregate = await getCampaignAggregate(campaignId, dataSource, now);
+  return buildDashboardFromAggregate(campaignId, aggregate, now);
+}
+
+function buildDashboardFromAggregate(
+  campaignId: string,
+  aggregate: CampaignAggregateSnapshot,
+  now: number,
+): CampaignAnalyticsDashboard {
   const trafficSources: TrafficSourceStat[] = TRAFFIC_SOURCES.map((source) => {
-    const bucket = state.traffic.get(source)!;
+    const bucket = aggregate.traffic.get(source) ?? { visitors: new Set<string>(), views: 0 };
     return {
       source,
       label: sourceLabel(source),
       visitors: bucket.visitors.size,
       views: bucket.views,
-      share: toRate(bucket.views, state.traffic.size === 0 ? 0 : viewTotal(state)),
+      share: toRate(bucket.views, aggregate.trafficViewsTotal),
     };
   }).sort((a, b) => b.views - a.views || a.source.localeCompare(b.source));
 
-  const funnelEntries = FUNNEL_STAGES.map(({ stage }) => state.funnel.get(stage)!.size);
+  const funnelEntries = FUNNEL_STAGES.map(({ stage }) => aggregate.funnel.get(stage)?.size ?? 0);
   const firstStage = funnelEntries[0] ?? 0;
   const funnel: FunnelStage[] = FUNNEL_STAGES.map(({ stage, label }, index) => {
     const count = funnelEntries[index];
@@ -339,7 +360,7 @@ export async function getCampaignAnalyticsDashboard(
     };
   });
 
-  const demographicRegions = Array.from(state.demographics.entries());
+  const demographicRegions = Array.from(aggregate.demographics.entries());
   const totalDemographicAmount = sumBigInt(demographicRegions.map(([, bucket]) => bucket.totalAmount));
   const demographics: BackerDemographic[] = demographicRegions
     .map(([region, bucket]) => ({
@@ -354,7 +375,7 @@ export async function getCampaignAnalyticsDashboard(
     );
 
   const tierRevenue = new Map<string, { backers: Set<string>; revenue: bigint }>();
-  for (const selection of state.rewardSelections) {
+  for (const selection of aggregate.rewardSelections) {
     const bucket = tierRevenue.get(selection.tierId) ?? { backers: new Set<string>(), revenue: 0n };
     bucket.revenue += selection.amount;
     bucket.backers.add(selection.viewerId);
@@ -370,13 +391,13 @@ export async function getCampaignAnalyticsDashboard(
       price: tier.price,
       backers,
       revenue: revenue.toString(),
-      share: backers === 0 ? 0 : toRate(backers, state.rewardSelections.length),
+      share: backers === 0 ? 0 : toRate(backers, aggregate.rewardSelections.length),
     };
   }).sort(
     (a, b) => Number(BigInt(b.revenue) - BigInt(a.revenue)) || a.tierId.localeCompare(b.tierId),
   );
 
-  const days = Array.from(state.daily.entries()).sort(([a], [b]) => a.localeCompare(b));
+  const days = Array.from(aggregate.daily.entries()).sort(([a], [b]) => a.localeCompare(b));
   let cumulative = 0n;
   const dailyTrend: DailyFundingPoint[] = days.map(([date, bucket]) => {
     cumulative += bucket.amount;
@@ -388,12 +409,17 @@ export async function getCampaignAnalyticsDashboard(
     };
   });
 
-  const totalContributionCount = state.contributions.length;
-  const totalFunded = sumBigInt(state.contributions.map((contribution) => contribution.amount));
+  const totalVisitors = Math.max(
+    aggregate.funnel.get("view")?.size ?? 0,
+    aggregate.viewers.size,
+  );
 
   return {
     campaignId,
     updatedAt: now,
+    aggregateVersion: aggregate.version,
+    lastReconciledAt: aggregate.lastReconciledAt,
+    driftDetected: aggregate.driftDetected,
     trafficSources,
     funnel,
     demographics,
@@ -401,9 +427,9 @@ export async function getCampaignAnalyticsDashboard(
     dailyTrend,
     totals: {
       visitors: totalVisitors,
-      contributions: totalContributionCount,
-      totalFunded: totalFunded.toString(),
-      conversionRate: toRate(finalFunnelCount(state), totalVisitors),
+      contributions: aggregate.contributions.length,
+      totalFunded: aggregate.totalFunded.toString(),
+      conversionRate: toRate(aggregate.funnel.get("confirm")?.size ?? 0, totalVisitors),
     },
   };
 }
@@ -443,19 +469,7 @@ export async function getCampaignAnalyticsDashboardPage(
   };
 }
 
-export { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE };
-
-function viewTotal(state: DashboardState): number {
-  let total = 0;
-  state.traffic.forEach((bucket) => {
-    total += bucket.views;
-  });
-  return total;
-}
-
-function finalFunnelCount(state: DashboardState): number {
-  return state.funnel.get("confirm")?.size ?? 0;
-}
+export { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, AGGREGATE_VERSION };
 
 function sourceLabel(source: TrafficSourceName): string {
   const labels: Record<TrafficSourceName, string> = {

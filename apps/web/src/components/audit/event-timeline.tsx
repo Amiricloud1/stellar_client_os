@@ -11,6 +11,15 @@ export type AuditEvent = {
   txHash?: string;
   before?: Record<string, unknown>;
   after?: Record<string, unknown>;
+  /**
+   * Indicates where the event detail originates. `live` events are backed by a
+   * full raw envelope; `archived` events have had their raw rows compacted and
+   * their detail is reconstructed from an archived summary. Archived events may
+   * omit `before`/`after` payloads.
+   */
+  source?: "live" | "archived";
+  /** Timestamp at which the raw envelope was compacted into the archive. */
+  archivedAt?: string;
 };
 
 /**
@@ -215,6 +224,7 @@ export function EventTimeline({
 }: EventTimelineProps) {
   const start = (page - 1) * pageSize;
   const visible = events.slice(start, start + pageSize);
+  const archivedCount = events.reduce((count, event) => (isArchived(event) ? count + 1 : count), 0);
 
   return (
     <div className="space-y-4">

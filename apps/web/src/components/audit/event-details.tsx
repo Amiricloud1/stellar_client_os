@@ -15,7 +15,7 @@ export interface TransactionLifecycleMetadata {
 }
 
 interface EventDetailsProps {
-  event: AuditEvent;
+  event: AuditEventWithEnvelope;
   onClose: () => void;
   lifecycle?: TransactionLifecycleMetadata;
   onRetry?: (event: AuditEvent) => void;

@@ -78,6 +78,26 @@ export interface CampaignData {
   uniqueContributors?: number;
   contributionCount?: number;
   sustainabilityScore?: CampaignSustainabilityScore;
+  /**
+   * Version of the incremental aggregate logic that produced the totals above.
+   * Optional for backward compatibility with campaigns served by older backends.
+   */
+  aggregateVersion?: number;
+  /**
+   * Identifier of the last contribution event folded into the incremental
+   * aggregates. Used to detect duplicate or out-of-order event delivery.
+   */
+  lastProcessedEventId?: string;
+  /**
+   * Timestamp (ms since epoch) of the last successful reconciliation against a
+   * full recomputation. Absent when the campaign has never been reconciled.
+   */
+  lastReconciledAt?: number;
+  /**
+   * True when the incremental totals diverged from the full recomputation.
+   * UI should surface this state and gate on it until reconciliation succeeds.
+   */
+  driftDetected?: boolean;
 }
 
 export interface CampaignFilterOptions {
