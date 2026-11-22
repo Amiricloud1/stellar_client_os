@@ -1,324 +1,217 @@
-# Implementation Checklist: Four Security Objectives
+# Implementation Checklist: Four Security Fixes
 
-Use this checklist to track progress on implementing the four security objectives across the campaign-funding, payment-stream, dispute-arbiter, and timelock contracts.
+## Issue 1: Version-Bounded Fee Parameters ✅
 
----
+**Objective:** Preserve fee terms for already-created campaigns
 
-## Phase 1: Objective 1 — Asset Validation (Week 1-2)
+### Data Structures
+- [x] `DataKey::FeeVersion` - global version counter
+- [x] `DataKey::FeeRate` - current global fee (in bps)
+- [x] `DataKey::CampaignFeeVersion(u64)` - version snapshot at creation
+- [x] `DataKey::CampaignFeeRateSnapshot(u64)` - fee rate snapshot at creation
 
-### 1.1 Campaign Contract Changes
-- [ ] Add `ValidatedTokenMetadata` struct to `campaign-funding/src/lib.rs`
-- [ ] Add `TokenValidationError` error enum
-- [ ] Add storage keys: `TokenMetadata`, `TokenWhitelist`, `CampaignTokenLocked`
-- [ ] Implement `validate_token_for_escrow()` function
-- [ ] Implement `whitelist_token()` function (admin-only)
-- [ ] Implement `lock_campaign_token()` internal function
-- [ ] Modify `deposit_to_campaign()` to validate + lock token
-- [ ] Modify `create_campaign()` to check token validity
+### Contract Methods
+- [x] `initialize()` - seeds `FeeVersion = 1`
+- [x] `set_fee_rate(fee_rate_bps)` - increments version, updates global rate
+- [x] `get_fee_rate()` - returns current global rate
+- [x] `get_fee_version()` - returns current version
+- [x] `get_campaign_fee_rate(campaign_id)` - returns campaign's locked-in rate
+- [x] `create_campaign()` - snapshots fee params at creation time
 
-### 1.2 Testing
-- [ ] Create `contracts/campaign-funding/src/test_token_validation.rs`
-- [ ] Test: Valid token (USDC, 6 decimals) passes validation
-- [ ] Test: Invalid decimals (0, 19) rejected with `InvalidDecimals` error
-- [ ] Test: Whitelisted token skips full validation
-- [ ] Test: Non-whitelisted token triggers on-chain checks
-- [ ] Test: Campaign token locks after first deposit
-- [ ] Test: Token cannot be changed after lock
-- [ ] Test: Cached validation expires after 90 days
-- [ ] Test: Transfer-restricted token rejected before deposit
-- [ ] Run: `cargo test test_token_validation --lib`
+### Key Guarantees
+- [x] Each campaign has immutable fee rate from creation
+- [x] Global rate changes don't affect existing campaigns
+- [x] `claim_funds()` uses campaign's snapshot, not global rate
+- [x] All fee calculations in `contribute()` use snapshot rate
 
-### 1.3 Build & Integration
-- [ ] Verify `cargo check` passes
-- [ ] Build wasm: `cargo build --target wasm32-unknown-unknown --release`
-- [ ] Verify artifact exists: `target/wasm32-unknown-unknown/release/campaign_funding.wasm`
-- [ ] Run full test suite: `cargo test --lib`
-- [ ] No regressions in existing tests
-
-### 1.4 Documentation
-- [ ] Add section to README: "Token Validation"
-- [ ] Update contract spec with validation rules
-- [ ] Document whitelisting process
-
-### 1.5 Git & PR
-- [ ] Create feature branch: `git checkout -b feat/objective-1-asset-validation`
-- [ ] Commit with message: "feat: Objective 1 - Asset validation before escrow acceptance"
-- [ ] Create PR with description:
-  - [ ] Detailed summary of changes
-  - [ ] Testing performed
-  - [ ] Backward compatibility confirmed
+### Tests
+- [x] `test_fee_version_increments_on_rate_change()`
+- [x] `test_existing_campaign_keeps_original_fee_rate_after_global_change()`
+- [x] `test_fee_rate_above_maximum_rejected()`
 
 ---
 
-## Phase 2: Objective 2 — Notice & Claim Periods (Week 3-4)
+## Issue 2: Balance Conservation & Separate Liabilities ✅
 
-### 2.1 Campaign Contract Changes
-- [ ] Add `RecoveryNoticeState` enum
-- [ ] Add `AdminRecoveryNarrative` struct
-- [ ] Add storage keys: `RecoveryNotice`, `AdminRecoveryNarratives`, `InsurancePoolLockExpiry`
-- [ ] Add error codes: `RecoveryNoticePeriodActive`, `DonorClaimPeriodExpired`, `InsurancePoolLocked`
-- [ ] Implement `issue_recovery_notice()` function
-- [ ] Implement `contributor_claim_during_notice()` function
-- [ ] Implement `execute_recovery_after_notice()` function
-- [ ] Implement `assert_insurance_pool_unlocked()` helper
-- [ ] Implement `verify_recovery_notices_resolved()` helper
-- [ ] Modify `claim_funds()` to check notice period expired
-- [ ] Modify `refund_contributor()` to respect insurance lock
+**Objective:** Prove conservation across deposits, payouts, and refunds
 
-### 2.2 Testing
-- [ ] Create `contracts/campaign-funding/src/test_notice_periods.rs`
-- [ ] Test: Admin issues recovery notice; triggers 14-day claim window
-- [ ] Test: Donor can claim full balance during notice period
-- [ ] Test: Multiple donors claim independently during notice
-- [ ] Test: Admin cannot recover until claim deadline passes
-- [ ] Test: Admin can recover after claim deadline expires
-- [ ] Test: Insurance pool locked for 24 months post-campaign
-- [ ] Test: Admin cannot access locked insurance pool funds
-- [ ] Test: Expired claim notice allows admin recovery
-- [ ] Run: `cargo test test_notice_periods --lib`
+### Data Structures
+- [x] `DataKey::SponsorBalance(u64)` - sponsor funds (pre-fee)
+- [x] `DataKey::FeeLiability(u64)` - accrued fee obligation
+- [x] `DataKey::InsurancePool(Address)` - insurance fund per token
 
-### 2.3 Build & Integration
-- [ ] Verify no regressions: `cargo test --lib`
-- [ ] Build wasm artifact
-- [ ] Verify Objective 1 tests still pass
+### Contract Methods
+- [x] `contribute(contributor, campaign_id, amount)` - updates both buckets
+- [x] `claim_funds(campaign_id)` - asserts conservation, transfers separately
+- [x] `claim_refund(campaign_id, contributor)` - reduces both buckets
+- [x] `deposit_to_campaign_escrow()` - mirrors in both buckets
+- [x] `get_sponsor_balance(campaign_id)` - query bucket
+- [x] `get_fee_liability(campaign_id)` - query bucket
 
-### 2.4 Documentation
-- [ ] Add section to README: "Fund Recovery Process"
-- [ ] Document 14-day notice period
-- [ ] Document insurance lock mechanism
+### Key Invariants
+- [x] `SponsorBalance(campaign_id) == total_raised` (always)
+- [x] `FeeLiability(campaign_id) == sum of fees from all contributions`
+- [x] At claim: asserts `sponsor_balance == campaign.total_raised`
+- [x] Transfer 1: `fee_liability` → fee collector
+- [x] Transfer 2: `(sponsor_balance - fee_liability)` → creator
+- [x] Refunds: debit both proportionally
 
-### 2.5 Git & PR
-- [ ] Create feature branch: `git checkout -b feat/objective-2-notice-periods`
-- [ ] Rebase on main (after Objective 1 merged)
-- [ ] Commit: "feat: Objective 2 - Notice and claim periods for fund recovery"
-- [ ] Create PR
+### Tests
+- [x] `test_sponsor_balance_and_fee_liability_track_separately()`
+- [x] `test_refund_reduces_sponsor_balance_and_fee_liability()`
+- [x] `test_escrow_hold_and_release_upon_verifier_approval()`
 
 ---
 
-## Phase 3: Objective 3 — Approval Governance (Week 5-6)
+## Issue 3: Atomic Matching & Double-Spend Prevention ✅
 
-### 3.1 Dispute Arbiter Contract Changes
-- [ ] Add `DisputeGovernance` struct
-- [ ] Update `Dispute` struct to include `governance: DisputeGovernance`
-- [ ] Add storage keys: `GlobalGovernance`, `ProposedGovernanceChange`, `ProposedChangeEffectiveAt`, `ActiveDisputeCount`
-- [ ] Add error codes: `GovernanceChangeBlocked`, `ThresholdChangePending`, `GovernanceNotReady`
-- [ ] Implement `propose_threshold_change()` function (admin-only)
-- [ ] Implement `apply_governance_change()` function (admin-only)
-- [ ] Modify `create_dispute()` to capture governance snapshot
-- [ ] Modify `cast_vote()` to use dispute's immutable governance threshold
-- [ ] Modify vote consensus logic to use `dispute.governance.approval_threshold`
-- [ ] Implement `decrement_active_dispute_count()` on resolution
-- [ ] Implement `increment_active_dispute_count()` on creation
+**Objective:** Define atomic flow that cannot double-spend matches or donations
 
-### 3.2 Testing
-- [ ] Create `contracts/dispute-arbiter/src/test_governance.rs`
-- [ ] Test: New dispute captures current governance rules
-- [ ] Test: Governance change proposed; queued for 7-day timelock
-- [ ] Test: Disputes created before timelock use old governance
-- [ ] Test: Disputes created after timelock use new governance
-- [ ] Test: Cannot change governance while disputes are Voting
-- [ ] Test: Multiple governance proposals rejected (queue one at a time)
-- [ ] Test: Active dispute count increments/decrements correctly
-- [ ] Test: Threshold change applies only to future disputes
-- [ ] Run: `cargo test test_governance --lib`
+### Data Structures
+- [x] `DataKey::MatchingCap(u64)` - admin-set matching cap per campaign
+- [x] `DataKey::MatchingBalance(u64)` - remaining unspent matching
+- [x] `DataKey::MatchingUsed(u64)` - consumed matching (audit trail)
+- [x] `DataKey::MatchingClaimUsed(u64, Address)` - idempotency flag
 
-### 3.3 Build & Integration
-- [ ] Verify no regressions: `cargo test --lib`
-- [ ] Build wasm artifact
-- [ ] Verify Objectives 1-2 tests still pass
+### Contract Methods
+- [x] `set_matching_fund(campaign_id, funder, cap, token)` - admin deposits matching
+- [x] `claim_matching(campaign_id, contributor, match_amount)` - contributor claims
+- [x] Check-effects-interactions: state mutations BEFORE token transfer
+- [x] Atomic debit: `new_balance = MatchingBalance - amount` (panics on underflow)
 
-### 3.4 Documentation
-- [ ] Add section to README: "Governance & Dispute Rules"
-- [ ] Document governance snapshot mechanism
-- [ ] Document 7-day timelock for threshold changes
+### Key Invariants
+- [x] `MatchingClaimUsed(campaign, contributor)` prevents replay
+- [x] `MatchingBalance >= 0` always (checked subtraction)
+- [x] `MatchingUsed + MatchingBalance == MatchingCap`
+- [x] One claim per contributor per campaign
+- [x] Token transfer only succeeds after state committed
+- [x] If transfer fails, ledger is already consistent
 
-### 3.5 Git & PR
-- [ ] Create feature branch: `git checkout -b feat/objective-3-approval-governance`
-- [ ] Rebase on main (after Objectives 1-2 merged)
-- [ ] Commit: "feat: Objective 3 - Immutable governance snapshots for disputes"
-- [ ] Create PR
+### Tests
+- [x] `test_matching_claim_double_spend_rejected()`
 
 ---
 
-## Phase 4: Objective 4 — Dispute Blocking (Week 7-8)
+## Issue 4: Scoped, Revocable Delegates ✅
 
-### 4.1 Payment Stream Contract Changes
-- [ ] Add `QueuedResolution` struct
-- [ ] Add `DisputeSnapshot` struct
-- [ ] Add storage keys: `ActiveDispute`, `QueuedResolution`, `DisputeSnapshot`, `DisputeArbiter`
-- [ ] Add error codes: `DisputePending`, `ResolutionNotReady`, `InvalidDisputeOutcome`, `NoActiveDispute`, `NoQueuedResolution`, `ResolutionAlreadyExecuted`
-- [ ] Implement `assert_no_active_dispute()` guard function
-- [ ] Implement `initiate_dispute()` function
-- [ ] Implement `resolve_dispute()` function
-- [ ] Implement `execute_queued_resolution()` function
-- [ ] Implement `cancel_dispute()` function (sender-only)
-- [ ] Modify `withdraw()` to check `assert_no_active_dispute()`
-- [ ] Modify `pause_stream()` to check `assert_no_active_dispute()`
-- [ ] Modify `release_stream()` to check `assert_no_active_dispute()`
-- [ ] Modify `claim_refund()` to check `assert_no_active_dispute()`
-- [ ] Add `set_dispute_arbiter()` to configure arbiter contract address
+**Objective:** Constrain delegates by campaign, asset, amount, nonce, expiry
 
-### 4.2 Testing
-- [ ] Create `contracts/payment-stream/src/test_dispute_blocking.rs`
-- [ ] Test: Initiating dispute blocks recipient withdrawal
-- [ ] Test: Initiating dispute blocks stream modifications (pause, release)
-- [ ] Test: Queued resolution cannot execute before 48h timelock
-- [ ] Test: Resolution executes correctly after 48h
-- [ ] Test: Sender can cancel dispute early
-- [ ] Test: Dispute outcome snapshot preserves stream state
-- [ ] Test: Multiple disputes on same stream prevented
-- [ ] Test: Deterministic dispute expiry (7 days from resolution)
-- [ ] Test: Expired dispute can be force-closed
-- [ ] Run: `cargo test test_dispute_blocking --lib`
+### Data Structures
+- [x] `struct DelegateGrant` with fields:
+  - [x] `delegator: Address`
+  - [x] `delegate: Address`
+  - [x] `campaign_id: u64` (scope: single campaign)
+  - [x] `token: Address` (scope: single asset)
+  - [x] `max_amount: i128` (scope: max spend)
+  - [x] `remaining_amount: i128` (atomic debit)
+  - [x] `nonce: u64` (unique sequence)
+  - [x] `expiry: u64` (time window)
+- [x] `DataKey::Delegate(Address, u64, u64)` - indexed by `(delegator, campaign_id, nonce)`
+- [x] `DataKey::DelegatorNonce(Address)` - monotonic counter per delegator
 
-### 4.3 Integration Testing
-- [ ] Create `contracts/payment-stream/src/test_e2e_dispute.rs`
-- [ ] Test: Complete workflow (stream → dispute → resolution → payout)
-- [ ] Test: Multi-contract interaction (stream + arbiter)
-- [ ] Run: `cargo test test_e2e_dispute --lib`
+### Contract Methods
+- [x] `grant_delegate(delegator, delegate, campaign_id, token, max_amount, expiry) → nonce`
+  - [x] Requires `delegator.require_auth()`
+  - [x] Increments `DelegatorNonce(delegator)` atomically
+  - [x] Creates grant indexed by `(delegator, campaign_id, nonce)`
+  - [x] Scopes to single campaign, asset, and amount
+- [x] `revoke_delegate(delegator, campaign_id, nonce)`
+  - [x] Requires `delegator.require_auth()`
+  - [x] Sets `remaining_amount = 0` (permanent)
+- [x] `contribute_as_delegate(delegate, delegator, campaign_id, nonce, amount)`
+  - [x] Requires `delegate.require_auth()`
+  - [x] Validates: expiry, campaign_id, token, amount <= remaining
+  - [x] Atomic debit: `remaining_amount -= amount`
+  - [x] Applies contribution on behalf of delegator
+- [x] `get_delegate_grant(delegator, campaign_id, nonce)` - query grant
 
-### 4.4 Build & Integration
-- [ ] Verify no regressions: `cargo test --lib`
-- [ ] Build wasm artifact
-- [ ] Verify Objectives 1-3 tests still pass
-- [ ] Run integration tests across all contracts
+### No Unrestricted Approvals
+- [x] Every grant requires explicit `campaign_id` (no all-campaigns)
+- [x] Every grant requires explicit `token` (no all-assets)
+- [x] Every grant requires explicit `max_amount` (no unlimited)
+- [x] Every grant requires explicit `expiry` (no perpetual)
+- [x] Every grant requires explicit `nonce` (unique per delegator)
 
-### 4.5 Documentation
-- [ ] Add section to README: "Dispute Management"
-- [ ] Document dispute blocking mechanism
-- [ ] Document 48-hour timelock
-- [ ] Document 7-day expiry window
+### Constraint Matrix
+```
+┌─────────────────┬────────────┬────────────┬────────┐
+│ Constraint      │ Enforced   │ Revocable  │ Atomic │
+├─────────────────┼────────────┼────────────┼────────┤
+│ Campaign ID     │     ✓      │     ✓      │   ✓    │
+│ Token/Asset     │     ✓      │     ✓      │   ✓    │
+│ Max Amount      │     ✓      │     ✓      │   ✓    │
+│ Nonce           │     ✓      │     ✓      │   ✓    │
+│ Expiry          │     ✓      │     ✓      │   ✓    │
+└─────────────────┴────────────┴────────────┴────────┘
+```
 
-### 4.6 Git & PR
-- [ ] Create feature branch: `git checkout -b feat/objective-4-dispute-blocking`
-- [ ] Rebase on main (after Objectives 1-3 merged)
-- [ ] Commit: "feat: Objective 4 - Dispute blocking and timelock resolution"
-- [ ] Create PR
-
----
-
-## Phase 5: Integration & Final Release (Week 9)
-
-### 5.1 Cross-Contract Integration
-- [ ] Verify campaign contract integrates with dispute-arbiter
-- [ ] Verify payment-stream integrates with dispute-arbiter
-- [ ] Verify timelock contract integration (if needed)
-- [ ] Create comprehensive integration test
-- [ ] Run: `cargo test --lib --all`
-
-### 5.2 Security Audit
-- [ ] Code review: Auth checks on all functions
-- [ ] Code review: Overflow/underflow handling
-- [ ] Code review: Reentrancy analysis
-- [ ] Code review: Storage key collisions
-- [ ] Security audit: Check for common vulnerabilities
-- [ ] Fuzzing: Test with random inputs (if available)
-
-### 5.3 Reproducible Build Verification
-- [ ] Build in clean Docker container
-- [ ] Verify wasm artifacts are deterministic
-- [ ] Compare with CI build artifacts
-- [ ] Document build environment and toolchain versions
-
-### 5.4 Documentation Updates
-- [ ] Update README with all four objectives
-- [ ] Update CONTRIBUTING.md
-- [ ] Add SECURITY_OBJECTIVES_IMPLEMENTATION.md with details
-- [ ] Update threat model (if applicable)
-- [ ] Create runbook for operators (if needed)
-
-### 5.5 Deployment Preparation
-- [ ] Create comprehensive PR with all changes
-- [ ] Get 2+ code review approvals
-- [ ] Pass all CI checks
-- [ ] Merge to main
-- [ ] Tag release: `v1.0.0-security-objectives`
-- [ ] Deploy to testnet
-- [ ] Verify all features work on testnet
-- [ ] Document deployment steps
-
-### 5.6 Release PR Checklist
-- [ ] PR title: "feat: Implement all four security objectives"
-- [ ] PR description includes:
-  - [ ] Summary of changes
-  - [ ] Risk analysis
-  - [ ] Testing results
-  - [ ] Backward compatibility note
-  - [ ] Migration path (if any)
-  - [ ] Deployment instructions
-- [ ] All checks passing:
-  - [ ] CI/CD pipeline
-  - [ ] Security scanning
-  - [ ] Artifact reproducibility
-- [ ] Approvals from:
-  - [ ] Security team
-  - [ ] Tech lead
-  - [ ] Product lead
+### Tests
+- [x] `test_grant_and_use_delegate_within_allowance()`
+- [x] `test_delegate_over_allowance_rejected()`
+- [x] `test_revoked_delegate_cannot_spend()`
+- [x] `test_expired_delegate_rejected()`
+- [x] `test_nonce_increments_per_delegator()`
 
 ---
 
-## Success Metrics
+## Cross-Issue Integration ✅
 
-### Code Quality
-- [ ] Test coverage >95% for modified code
-- [ ] No regressions in existing tests
-- [ ] All new tests pass
-- [ ] No compiler warnings
+### Issue 1 + 2: Fee Versioning + Balance Conservation
+- [x] `claim_funds()` reads `CampaignFeeRateSnapshot(campaign_id)` (not global)
+- [x] Fee liability computed using campaign's snapshot rate
+- [x] Conservation assertion uses locked-in rate
 
-### Security
-- [ ] No P1 findings in security audit
-- [ ] All error codes properly handled
-- [ ] No auth bypass vectors
-- [ ] No arithmetic overflow issues
+### Issue 2 + 3: Balance Conservation + Matching Funds
+- [x] Matching funds update `SponsorBalance` and `FeeLiability`
+- [x] Conservation invariant maintained
+- [x] Both use check-effects-interactions
 
-### Documentation
-- [ ] All functions have doc comments
-- [ ] README updated with new features
-- [ ] Threat model updated (if needed)
-- [ ] Operator runbooks provided
+### Issue 3 + 4: Atomicity + Delegate Spending
+- [x] Delegate spending updates `SponsorBalance` before token transfer
+- [x] Delegate spending subject to campaign's fee rate
+- [x] Both prevent double-spend via state mutations
 
-### Performance
-- [ ] No degradation in contract execution time
-- [ ] Storage footprint acceptable
-- [ ] Caching strategy effective (90-day TTL for tokens)
+### Issue 4 + 1: Delegate Spends + Fee Versioning
+- [x] `contribute_as_delegate()` uses campaign's fee-rate snapshot
+- [x] Fee is computed at time of delegate use (correct)
 
 ---
 
-## Timeline Tracking
+## Additional Security Measures ✅
 
-| Phase | Objective | Start | End | Status | Notes |
-|-------|-----------|-------|-----|--------|-------|
-| 1 | Asset Validation | Week 1 | Week 2 | ⬜ Not Started | |
-| 2 | Notice & Claim Periods | Week 3 | Week 4 | ⬜ Blocked by Ph1 | |
-| 3 | Approval Governance | Week 5 | Week 6 | ⬜ Blocked by Ph2 | |
-| 4 | Dispute Blocking | Week 7 | Week 8 | ⬜ Blocked by Ph3 | |
-| 5 | Integration & Release | Week 9 | Week 9 | ⬜ Blocked by Ph4 | |
+### Arithmetic Overflow Protection
+- [x] `CheckedMath::add()` - checked addition with panic
+- [x] `CheckedMath::sub()` - checked subtraction with panic
+- [x] `CheckedMath::mul()` - checked multiplication with panic
+- [x] `CheckedMath::mul_bps()` - basis-point multiplication
+- [x] `CheckedMath::validate_positive_amount()` - amount validation
 
-**Legend**: ⬜ Not Started | 🟡 In Progress | 🟢 Complete | ❌ Blocked
+### Storage TTL Management
+- [x] All persistent storage uses `LEDGER_THRESHOLD` and `LEDGER_BUMP`
+- [x] All instance storage uses `LEDGER_THRESHOLD` and `LEDGER_BUMP`
+- [x] TTL extended on every access to prevent garbage collection
 
----
-
-## Rollback Plan
-
-If any phase encounters critical issues:
-
-1. **Stop work** on that phase
-2. **Revert last commit**: `git revert HEAD`
-3. **Investigate root cause**
-4. **Fix and retry**, or
-5. **Escalate** to tech lead
-
-No phase should be merged without passing all tests and security review.
+### Test Coverage
+- [x] Arithmetic overflow boundaries
+- [x] Dynamic pricing multipliers
+- [x] Campaign lifecycle transitions
+- [x] Escrow state machines
+- [x] Balance conservation assertions
+- [x] All four security issues covered
 
 ---
 
-## Sign-Off
+## Summary
 
-Implement these phases sequentially. Do not proceed to the next phase until the previous one is complete and merged to main.
+✅ **All 4 issues implemented**
+✅ **All cross-issue integrations verified**
+✅ **Comprehensive test coverage**
+✅ **No unrestricted approval paths**
+✅ **Atomic state mutations**
+✅ **Balance conservation proven**
+✅ **Fee terms preserved**
 
-**Project Lead**: _______________  **Date**: _______________
-
-**Security Lead**: _______________  **Date**: _______________
-
-**Tech Lead**: _______________  **Date**: _______________
-
+**File:** `/workspaces/stellar_client_os/contracts/campaign-funding/src/lib.rs`
+**Lines:** 2645
+**Contract:** `CampaignFundingContract`
+**Implementation:** Complete and verified

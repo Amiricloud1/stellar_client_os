@@ -287,3 +287,76 @@ export function buildUploadObjectKey(
   return parts.join("/")
 }
 
+/**
+ * Shared Campaign Form & Cross-Field Validation Schema (Issues #163, #240, #242, #253)
+ * Keeps immediate client feedback synchronized with authoritative server-side rules.
+ */
+export const campaignFormValidationSchema = z
+  .object({
+    title: z.string().trim().min(3, "Title must be at least 3 characters").max(100, "Title cannot exceed 100 characters"),
+    description: z.string().trim().min(10, "Description must be at least 10 characters").max(2000, "Description cannot exceed 2000 characters"),
+    targetAmount: tokenAmountSchema,
+    minTarget: tokenAmountSchema,
+    costPerTree: z.number().positive("Cost per tree must be greater than zero"),
+    targetTrees: z.number().int().positive("Target trees count must be positive"),
+    startTime: z.number().int().positive("Start time must be a valid timestamp"),
+    deadline: z.number().int().positive("Deadline must be a valid timestamp"),
+    treeType: z.string().min(1, "Tree type is required"),
+    region: z.string().min(1, "Region is required"),
+  })
+  .refine(
+    (data) => {
+      const target = parseFloat(data.targetAmount);
+      const min = parseFloat(data.minTarget);
+      return !isNaN(target) && !isNaN(min) && min <= target;
+    },
+    {
+      message: "Minimum target cannot exceed total campaign target amount",
+      path: ["minTarget"],
+    }
+  )
+  .refine(
+    (data) => data.deadline > data.startTime,
+    {
+      message: "Campaign deadline must be later than start time",
+      path: ["deadline"],
+    }
+  )
+  .refine(
+    (data) => {
+      const target = parseFloat(data.targetAmount);
+      return !isNaN(target) && (data.costPerTree * data.targetTrees) <= target;
+    },
+    {
+      message: "Target trees multiplied by cost per tree cannot exceed total target amount",
+      path: ["targetTrees"],
+    }
+  );
+
+export type CampaignFormValues = z.infer<typeof campaignFormValidationSchema>;
+
+/**
+ * Validates campaign form fields for real-time client feedback using the identical
+ * authoritative server-side cross-field validation rules.
+ */
+export function validateCampaignFormRealtime(values: unknown): {
+  valid: boolean;
+  errors: Record<string, string>;
+} {
+  const result = campaignFormValidationSchema.safeParse(values);
+  if (result.success) {
+    return { valid: true, errors: {} };
+  }
+
+  const errors: Record<string, string> = {};
+  for (const issue of result.error.issues) {
+    const key = issue.path[0] ? String(issue.path[0]) : "form";
+    if (!errors[key]) {
+      errors[key] = issue.message;
+    }
+  }
+
+  return { valid: false, errors };
+}
+
+
