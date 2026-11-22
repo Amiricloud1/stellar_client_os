@@ -10,6 +10,30 @@ set -e
 #   - Dry-run simulation mode (DRY_RUN=true or --dry-run)
 #   - Idempotent execution (skips already deployed unless FORCE_DEPLOY=true)
 #   - Atomic deployment state persistence (deployments/${NETWORK}.json)
+#   - Pre-launch readiness checklist gate (see below)
+#
+# Pre-Launch Readiness Checklist
+# ------------------------------
+# Before any live deployment the script validates the campaign configuration
+# supplied via environment variables (or .env). Every check must pass; on the
+# first failure the script prints the failing item plus a remediation hint and
+# aborts with a non-zero exit code. Dry runs report the checklist but do not
+# abort on failure so operators can iterate safely.
+#
+#   1. Campaign metadata  — CAMPAIGN_NAME, CAMPAIGN_DESCRIPTION,
+#                           CAMPAIGN_CREATOR (non-empty, sane length).
+#   2. Network            — NETWORK must be a known network and
+#                           NETWORK_PASSPHRASE must match its canonical value.
+#   3. Asset support      — CAMPAIGN_ASSET must be XLM or a valid SAC/asset
+#                           identifier (C.../G... StrKey, 56 chars).
+#   4. Milestones         — CAMPAIGN_MILESTONES must be a positive integer and
+#                           CAMPAIGN_MILESTONE_AMOUNTS (comma separated) must
+#                           contain exactly that many positive integers.
+#   5. Payout terms       — CAMPAIGN_PAYOUT_TERMS must be one of
+#                           all-or-nothing | milestone | immediate.
+#
+# Set SKIP_READINESS_CHECK=true to bypass the gate (not recommended; the
+# bypass is logged loudly). See docs/deployment.md for the full checklist.
 # ==============================================================================
 
 # Parse command line flags
@@ -109,6 +133,157 @@ fi
 mkdir -p deployments
 if [ ! -s "$DEPLOYMENTS_FILE" ]; then
   echo "{}" > "$DEPLOYMENTS_FILE"
+fi
+
+# ------------------------------------------------------------------------------
+# Pre-Launch Readiness Checklist
+# ------------------------------------------------------------------------------
+READINESS_FAILURES=0
+
+readiness_fail() {
+  # $1 = checklist item, $2 = remediation hint
+  echo "❌ [READINESS] $1"
+  echo "   ↳ Fix: $2"
+  READINESS_FAILURES=$((READINESS_FAILURES + 1))
+}
+
+check_campaign_metadata() {
+  if [ -z "${CAMPAIGN_NAME:-}" ]; then
+    readiness_fail "Campaign metadata: CAMPAIGN_NAME is not set." \
+      "Export CAMPAIGN_NAME with the public campaign title."
+  elif [ "${#CAMPAIGN_NAME}" -gt 128 ]; then
+    readiness_fail "Campaign metadata: CAMPAIGN_NAME exceeds 128 characters." \
+      "Shorten CAMPAIGN_NAME to 128 characters or fewer."
+  fi
+
+  if [ -z "${CAMPAIGN_DESCRIPTION:-}" ]; then
+    readiness_fail "Campaign metadata: CAMPAIGN_DESCRIPTION is not set." \
+      "Export CAMPAIGN_DESCRIPTION describing the campaign."
+  fi
+
+  if [ -z "${CAMPAIGN_CREATOR:-}" ]; then
+    readiness_fail "Campaign metadata: CAMPAIGN_CREATOR is not set." \
+      "Export CAMPAIGN_CREATOR with the creator's Stellar public key (G...)."
+  elif ! [[ "$CAMPAIGN_CREATOR" =~ ^G[A-Z2-7]{55}$ ]]; then
+    readiness_fail "Campaign metadata: CAMPAIGN_CREATOR is not a valid Stellar account (G...)." \
+      "Provide a 56-character StrKey starting with 'G'."
+  fi
+}
+
+check_network() {
+  case "$NETWORK" in
+    testnet)
+      EXPECTED_PASSPHRASE="Test SDF Network ; September 2015"
+      ;;
+    mainnet|public)
+      EXPECTED_PASSPHRASE="Public Global Stellar Network ; September 2015"
+      ;;
+    futurenet)
+      EXPECTED_PASSPHRASE="Test SDF Future Network ; October 2022"
+      ;;
+    *)
+      readiness_fail "Network: '$NETWORK' is not a supported network." \
+        "Set NETWORK to one of: testnet, mainnet, futurenet."
+      return
+      ;;
+  esac
+
+  if [ "$NETWORK_PASSPHRASE" != "$EXPECTED_PASSPHRASE" ]; then
+    readiness_fail "Network: NETWORK_PASSPHRASE does not match '$NETWORK'." \
+      "Set NETWORK_PASSPHRASE=\"$EXPECTED_PASSPHRASE\" (or unset it to use the default)."
+  fi
+}
+
+check_asset_support() {
+  if [ -z "${CAMPAIGN_ASSET:-}" ]; then
+    readiness_fail "Asset support: CAMPAIGN_ASSET is not set." \
+      "Export CAMPAIGN_ASSET=XLM or a 56-character SAC/asset identifier (C.../G...)."
+    return
+  fi
+  if [ "$CAMPAIGN_ASSET" = "XLM" ] || [ "$CAMPAIGN_ASSET" = "native" ]; then
+    return
+  fi
+  if ! [[ "$CAMPAIGN_ASSET" =~ ^[CG][A-Z2-7]{55}$ ]]; then
+    readiness_fail "Asset support: CAMPAIGN_ASSET '$CAMPAIGN_ASSET' is not supported." \
+      "Use XLM or a 56-character StrKey asset identifier starting with 'C' or 'G'."
+  fi
+}
+
+check_milestones() {
+  if [ -z "${CAMPAIGN_MILESTONES:-}" ]; then
+    readiness_fail "Milestones: CAMPAIGN_MILESTONES is not set." \
+      "Export CAMPAIGN_MILESTONES with the number of milestones (positive integer)."
+    return
+  fi
+  if ! [[ "$CAMPAIGN_MILESTONES" =~ ^[1-9][0-9]*$ ]]; then
+    readiness_fail "Milestones: CAMPAIGN_MILESTONES must be a positive integer." \
+      "Set CAMPAIGN_MILESTONES to a value like 3."
+    return
+  fi
+
+  if [ -z "${CAMPAIGN_MILESTONE_AMOUNTS:-}" ]; then
+    readiness_fail "Milestones: CAMPAIGN_MILESTONE_AMOUNTS is not set." \
+      "Export CAMPAIGN_MILESTONE_AMOUNTS as a comma-separated list of positive integers."
+    return
+  fi
+
+  IFS=',' read -r -a MILESTONE_AMOUNTS <<< "$CAMPAIGN_MILESTONE_AMOUNTS"
+  if [ "${#MILESTONE_AMOUNTS[@]}" -ne "$CAMPAIGN_MILESTONES" ]; then
+    readiness_fail "Milestones: expected $CAMPAIGN_MILESTONES amounts, got ${#MILESTONE_AMOUNTS[@]}." \
+      "Ensure CAMPAIGN_MILESTONE_AMOUNTS has exactly $CAMPAIGN_MILESTONES comma-separated entries."
+  fi
+  for AMOUNT in "${MILESTONE_AMOUNTS[@]}"; do
+    if ! [[ "$AMOUNT" =~ ^[1-9][0-9]*$ ]]; then
+      readiness_fail "Milestones: amount '$AMOUNT' is not a positive integer." \
+        "Every entry in CAMPAIGN_MILESTONE_AMOUNTS must be a positive integer."
+    fi
+  done
+}
+
+check_payout_terms() {
+  case "${CAMPAIGN_PAYOUT_TERMS:-}" in
+    all-or-nothing|milestone|immediate)
+      ;;
+    "")
+      readiness_fail "Payout terms: CAMPAIGN_PAYOUT_TERMS is not set." \
+        "Set CAMPAIGN_PAYOUT_TERMS to one of: all-or-nothing, milestone, immediate."
+      ;;
+    *)
+      readiness_fail "Payout terms: '$CAMPAIGN_PAYOUT_TERMS' is not supported." \
+        "Set CAMPAIGN_PAYOUT_TERMS to one of: all-or-nothing, milestone, immediate."
+      ;;
+  esac
+}
+
+run_readiness_checklist() {
+  echo ""
+  echo "🔎 Running pre-launch readiness checklist..."
+  READINESS_FAILURES=0
+
+  check_campaign_metadata
+  check_network
+  check_asset_support
+  check_milestones
+  check_payout_terms
+
+  if [ "$READINESS_FAILURES" -gt 0 ]; then
+    echo ""
+    echo "❌ Readiness checklist failed with $READINESS_FAILURES issue(s)."
+    if [ "$IS_DRY_RUN" = "true" ]; then
+      echo "🧪 [DRY-RUN] Continuing despite failures; fix the items above before a live deploy."
+    else
+      echo "Aborting deployment. Resolve the items above and re-run."
+      exit 1
+    fi
+  else
+    echo "✅ Readiness checklist passed."
+  fi
+}
+
+if [ "${SKIP_READINESS_CHECK:-false}" = "true" ]; then
+  echo "⚠️  WARNING: SKIP_READINESS_CHECK=true — pre-launch readiness checklist bypassed."
+else
+  run_readiness_checklist
 fi
 
 # Prerequisite Checks

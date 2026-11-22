@@ -2613,6 +2613,76 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Terms snapshot binding tests (Issue #176)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_contribute_binds_matching_terms_snapshot() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, token_admin_client) = create_token(&env, &token_admin);
+        let creator = Address::generate(&env);
+        let sponsor = Address::generate(&env);
+
+        token_admin_client.mint(&sponsor, &10_000);
+        let id = client.create_campaign(&creator, &token_addr, &10_000, &5_000, &2_000);
+
+        let terms_hash = BytesN::from_array(&env, &[7u8; 32]);
+        client.set_campaign_terms_hash(&id, &terms_hash, &1);
+
+        client.contribute(&sponsor, &id, &1_000, &terms_hash, &1);
+
+        assert_eq!(client.get_contribution(&id, &sponsor), 1_000);
+        assert_eq!(client.get_contribution_terms_hash(&id, &sponsor), terms_hash);
+        assert_eq!(client.get_contribution_terms_version(&id, &sponsor), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #44)")]
+    fn test_contribute_rejects_mismatched_terms_snapshot() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, token_admin_client) = create_token(&env, &token_admin);
+        let creator = Address::generate(&env);
+        let sponsor = Address::generate(&env);
+
+        token_admin_client.mint(&sponsor, &10_000);
+        let id = client.create_campaign(&creator, &token_addr, &10_000, &5_000, &2_000);
+
+        let terms_hash = BytesN::from_array(&env, &[7u8; 32]);
+        let wrong_hash = BytesN::from_array(&env, &[9u8; 32]);
+        client.set_campaign_terms_hash(&id, &terms_hash, &1);
+
+        client.contribute(&sponsor, &id, &1_000, &wrong_hash, &1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #44)")]
+    fn test_contribute_rejects_when_no_terms_snapshot_stored() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, token_admin_client) = create_token(&env, &token_admin);
+        let creator = Address::generate(&env);
+        let sponsor = Address::generate(&env);
+
+        token_admin_client.mint(&sponsor, &10_000);
+        let id = client.create_campaign(&creator, &token_addr, &10_000, &5_000, &2_000);
+
+        let terms_hash = BytesN::from_array(&env, &[7u8; 32]);
+        // No terms hash configured for the campaign -> mismatch.
+        client.contribute(&sponsor, &id, &1_000, &terms_hash, &1);
+    }
+
     #[test]
     fn test_campaign_funding_arithmetic_audit_rounding_and_units() {
         let env = Env::default();

@@ -8,6 +8,14 @@ export const VERIFICATION_EVENT_TYPES = [
 
 export type VerificationEventType = (typeof VERIFICATION_EVENT_TYPES)[number];
 
+export const REVIEWER_COMMENT_RESOLUTION_STATUSES = [
+  "open",
+  "resolved",
+  "dismissed",
+] as const;
+
+export type ResolutionStatus = (typeof REVIEWER_COMMENT_RESOLUTION_STATUSES)[number];
+
 export interface VerificationEvidence {
   id: string;
   campaignId: string;
@@ -20,6 +28,46 @@ export interface VerificationEvidence {
   verifierId?: string;
   caption?: string;
   contentHash?: string;
+  /**
+   * Monotonic version of this evidence record. Comments are anchored to a
+   * specific evidence version so discussions remain attributable even after
+   * the evidence is re-uploaded or amended.
+   */
+  version?: number;
+}
+
+export interface ReviewerComment {
+  id: string;
+  campaignId: string;
+  evidenceId: string;
+  /** Evidence version this comment was made against. */
+  evidenceVersion: number;
+  authorId: string;
+  body: string;
+  createdAt: number;
+  updatedAt: number;
+  resolutionStatus: ResolutionStatus;
+  resolvedAt?: number;
+  resolvedBy?: string;
+  resolutionNote?: string;
+}
+
+export interface CreateReviewerCommentInput {
+  campaignId: string;
+  evidenceId: string;
+  /** Evidence version the reviewer is commenting on. Defaults to the current version. */
+  evidenceVersion?: number;
+  authorId: string;
+  body: string;
+  createdAt?: number;
+}
+
+export interface ResolveReviewerCommentInput {
+  commentId: string;
+  actorId: string;
+  resolutionStatus: Exclude<ResolutionStatus, "open">;
+  resolutionNote?: string;
+  resolvedAt?: number;
 }
 
 export interface VerificationAuditEntry {

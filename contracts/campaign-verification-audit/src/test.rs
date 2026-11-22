@@ -280,6 +280,125 @@ fn test_verify_trees_batch_is_atomic_on_mid_batch_failure() {
 }
 
 #[test]
+fn test_reviewer_comment_flow_with_evidence_reference() {
+    let env = Env::default();
+    let client = setup_tree_env(&env);
+    let reviewer = Address::generate(&env);
+    let campaign_id = 77u64;
+    let evidence_version = 3u32;
+
+    let body = String::from_str(&env, "Row 4 photos look duplicated, please re-upload");
+    let comment_id = client.add_reviewer_comment(&campaign_id, &reviewer, &evidence_version, &body);
+    assert_eq!(comment_id, 1);
+
+    let comment = client.get_reviewer_comment(&campaign_id, &comment_id).unwrap();
+    assert_eq!(comment.id, 1);
+    assert_eq!(comment.campaign_id, campaign_id);
+    assert_eq!(comment.reviewer, reviewer);
+    assert_eq!(comment.evidence_version, evidence_version);
+    assert_eq!(comment.body, body);
+    assert_eq!(comment.timestamp, 1700000000);
+    assert!(!comment.resolved);
+
+    // Resolution preserves attribution and records the resolver.
+    env.ledger().set_timestamp(1700000100);
+    let resolver = Address::generate(&env);
+    client.resolve_reviewer_comment(&campaign_id, &comment_id, &resolver);
+
+    let resolved = client.get_reviewer_comment(&campaign_id, &comment_id).unwrap();
+    assert!(resolved.resolved);
+    assert_eq!(resolved.reviewer, reviewer);
+    assert_eq!(resolved.resolved_by, Some(resolver.clone()));
+    assert_eq!(resolved.resolved_at, Some(1700000100));
+    assert_eq!(resolved.body, body);
+    assert_eq!(resolved.timestamp, 1700000000);
+
+    assert_eq!(client.get_reviewer_comment_count(&campaign_id), 1);
+}
+
+#[test]
+fn test_reviewer_comment_unauthorized_author_rejected() {
+    let env = Env::default();
+    let client = setup_tree_env(&env);
+    let reviewer = Address::generate(&env);
+
+    // Disable the auth mocking used for setup so the unsigned call fails.
+    env.set_auths(&[]);
+
+    let result = client.try_add_reviewer_comment(
+        &55u64,
+        &reviewer,
+        &1u32,
+        &String::from_str(&env, "Unsigned comment"),
+    );
+    assert!(result.is_err());
+    assert_eq!(client.get_reviewer_comment_count(&55), 0);
+}
+
+#[test]
+fn test_reviewer_comment_stale_evidence_version_rejected() {
+    let env = Env::default();
+    let client = setup_tree_env(&env);
+    let reviewer = Address::generate(&env);
+    let campaign_id = 88u64;
+
+    client.set_latest_evidence_version(&campaign_id, &5u32);
+
+    let result = client.try_add_reviewer_comment(
+        &campaign_id,
+        &reviewer,
+        &4u32,
+        &String::from_str(&env, "Commenting on stale evidence"),
+    );
+    assert_eq!(result, Err(Ok(AuditError::StaleEvidenceVersion)));
+    assert_eq!(client.get_reviewer_comment_count(&campaign_id), 0);
+
+    // Commenting on the current version succeeds.
+    let comment_id = client.add_reviewer_comment(
+        &campaign_id,
+        &reviewer,
+        &5u32,
+        &String::from_str(&env, "Commenting on current evidence"),
+    );
+    assert_eq!(comment_id, 1);
+}
+
+#[test]
+fn test_reviewer_comment_idempotent_retry() {
+    let env = Env::default();
+    let client = setup_tree_env(&env);
+    let reviewer = Address::generate(&env);
+    let campaign_id = 99u64;
+    let body = String::from_str(&env, "Please add GPS metadata");
+
+    let first = client.add_reviewer_comment(&campaign_id, &reviewer, &1u32, &body);
+    // Retrying the identical submission returns the original id and does not
+    // create a duplicate comment.
+    let retry = client.add_reviewer_comment(&campaign_id, &reviewer, &1u32, &body);
+    assert_eq!(first, retry);
+    assert_eq!(client.get_reviewer_comment_count(&campaign_id), 1);
+
+    // Resolving twice is idempotent and keeps the original resolution data.
+    let resolver = Address::generate(&env);
+    client.resolve_reviewer_comment(&campaign_id, &first, &resolver);
+    env.ledger().set_timestamp(1700000500);
+    client.resolve_reviewer_comment(&campaign_id, &first, &resolver);
+    let comment = client.get_reviewer_comment(&campaign_id, &first).unwrap();
+    assert!(comment.resolved);
+    assert_eq!(comment.resolved_at, Some(1700000000));
+}
+
+#[test]
+fn test_resolve_unknown_reviewer_comment_rejected() {
+    let env = Env::default();
+    let client = setup_tree_env(&env);
+    let resolver = Address::generate(&env);
+
+    let result = client.try_resolve_reviewer_comment(&1u64, &42u64, &resolver);
+    assert_eq!(result, Err(Ok(AuditError::CommentNotFound)));
+}
+
+#[test]
 fn test_get_audit_trail_paginated_empty() {
     let env = Env::default();
     let client = setup_tree_env(&env);
