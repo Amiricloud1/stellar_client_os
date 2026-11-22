@@ -107,6 +107,438 @@ export async function captureChainIdentity(rpc: Server): Promise<ChainIdentity> 
 }
 
 /**
+ * Lifecycle stages of a Soroban transaction flow.
+ *
+ * The stages are ordered and monotonic for a successful flow:
+ *
+ * `idle` → `simulating` → `awaiting_approval` → `submitting` →
+ * `submitted` → `confirming` → `confirmed` → `settled`
+ *
+ * Failure and recovery states are explicit so the web layer can persist and
+ * render a confirmation timeline that survives a page reload:
+ *
+ * - `rejected`: the wallet declined to sign (terminal, user-initiated).
+ * - `failed`: submission or confirmation failed (terminal unless retried).
+ * - `retrying`: a transient failure occurred and a retry is scheduled.
+ * - `recovering`: the flow was resumed after a reload and is re-checking
+ *   the authoritative chain/transaction state.
+ * - `aborted`: the flow was aborted because the chain identity changed.
+ */
+export type TransactionLifecycleStage =
+  | 'idle'
+  | 'simulating'
+  | 'awaiting_approval'
+  | 'submitting'
+  | 'submitted'
+  | 'confirming'
+  | 'confirmed'
+  | 'settled'
+  | 'rejected'
+  | 'failed'
+  | 'retrying'
+  | 'recovering'
+  | 'aborted';
+
+/**
+ * Terminal lifecycle stages after which no further automatic transition
+ * occurs without an explicit retry or recovery.
+ */
+export const TERMINAL_LIFECYCLE_STAGES: readonly TransactionLifecycleStage[] = [
+  'settled',
+  'rejected',
+  'failed',
+  'aborted',
+];
+
+/**
+ * Returns true when the stage is terminal (no automatic progression).
+ */
+export function isTerminalStage(stage: TransactionLifecycleStage): boolean {
+  return TERMINAL_LIFECYCLE_STAGES.includes(stage);
+}
+
+/**
+ * A single entry in the transaction confirmation timeline.
+ */
+export interface TransactionTimelineEntry {
+  /** Lifecycle stage this entry records. */
+  stage: TransactionLifecycleStage;
+  /** Wall-clock timestamp (ms since epoch) when the stage was entered. */
+  timestamp: number;
+  /** Optional human-readable detail safe to surface to users/operators. */
+  message?: string;
+  /** Optional transaction hash once known (available from `submitted` on). */
+  hash?: string;
+  /** Optional structured failure descriptor for failure/recovery stages. */
+  failure?: SorobanFailure;
+}
+
+/**
+ * Persistable snapshot of a transaction flow's lifecycle.
+ *
+ * The snapshot is intentionally JSON-serializable so the web layer can store
+ * it (e.g. in `localStorage`) and rebuild the timeline after a reload. On
+ * reload, callers should resume via {@link recoverTransactionLifecycle} which
+ * re-checks the authoritative chain/transaction state rather than trusting
+ * the persisted snapshot blindly.
+ */
+export interface TransactionLifecycleSnapshot {
+  /** Monotonic version incremented on every transition. */
+  version: number;
+  /** Current lifecycle stage. */
+  stage: TransactionLifecycleStage;
+  /** Ordered timeline of stage transitions. */
+  timeline: TransactionTimelineEntry[];
+  /** Chain identity captured when the flow started, if any. */
+  chainIdentity?: ChainIdentity;
+  /** Transaction hash once known. */
+  hash?: string;
+  /** Latest ledger sequence observed at the last confirmation poll. */
+  latestLedger?: number;
+}
+
+/**
+ * Observer invoked on every lifecycle transition.
+ *
+ * The callback receives the full snapshot so callers can persist it
+ * atomically. Observers must not throw; any thrown error is swallowed so a
+ * faulty observer cannot break the transaction flow.
+ */
+export type TransactionLifecycleObserver = (snapshot: TransactionLifecycleSnapshot) => void;
+
+/**
+ * Options for {@link TransactionLifecycleTracker}.
+ */
+export interface TransactionLifecycleTrackerOptions {
+  /** Chain identity captured when the flow started. */
+  chainIdentity?: ChainIdentity;
+  /** Optional observer invoked on every transition. */
+  onTransition?: TransactionLifecycleObserver;
+  /** Clock override for deterministic tests. @default Date.now */
+  now?: () => number;
+}
+
+/**
+ * Tracks the lifecycle of a Soroban transaction flow and produces a
+ * persistable confirmation timeline.
+ *
+ * The tracker is the single source of truth for stage transitions. It
+ * enforces that stages only move forward (or into an explicit failure /
+ * recovery state) so the web layer cannot render an inconsistent timeline.
+ *
+ * @example
+ * ```ts
+ * const tracker = new TransactionLifecycleTracker({
+ *   chainIdentity,
+ *   onTransition: (snapshot) => localStorage.setItem('tx', JSON.stringify(snapshot)),
+ * });
+ * tracker.transition('simulating');
+ * tracker.transition('awaiting_approval');
+ * // ... user approves in wallet ...
+ * tracker.transition('submitting');
+ * tracker.transition('submitted', { hash });
+ * tracker.transition('confirming');
+ * tracker.transition('confirmed');
+ * tracker.transition('settled');
+ * ```
+ */
+export class TransactionLifecycleTracker {
+  private snapshot: TransactionLifecycleSnapshot;
+  private readonly onTransition?: TransactionLifecycleObserver;
+  private readonly now: () => number;
+
+  constructor(options: TransactionLifecycleTrackerOptions = {}) {
+    this.now = options.now ?? (() => Date.now());
+    this.onTransition = options.onTransition;
+    this.snapshot = {
+      version: 0,
+      stage: 'idle',
+      timeline: [
+        {
+          stage: 'idle',
+          timestamp: this.now(),
+        },
+      ],
+      chainIdentity: options.chainIdentity,
+    };
+  }
+
+  /** Returns a deep copy of the current snapshot. */
+  getSnapshot(): TransactionLifecycleSnapshot {
+    return {
+      ...this.snapshot,
+      timeline: this.snapshot.timeline.map((entry) => ({ ...entry })),
+      chainIdentity: this.snapshot.chainIdentity ? { ...this.snapshot.chainIdentity } : undefined,
+    };
+  }
+
+  /** Returns the current lifecycle stage. */
+  getStage(): TransactionLifecycleStage {
+    return this.snapshot.stage;
+  }
+
+  /**
+   * Record a transition into a new lifecycle stage.
+   *
+   * @param stage - The stage being entered.
+   * @param detail - Optional message, hash, and failure descriptor.
+   * @returns The updated snapshot.
+   */
+  transition(
+    stage: TransactionLifecycleStage,
+    detail: { message?: string; hash?: string; failure?: SorobanFailure } = {},
+  ): TransactionLifecycleSnapshot {
+    const entry: TransactionTimelineEntry = {
+      stage,
+      timestamp: this.now(),
+    };
+    if (detail.message !== undefined) {
+      entry.message = detail.message;
+    }
+    if (detail.hash !== undefined) {
+      entry.hash = detail.hash;
+    }
+    if (detail.failure !== undefined) {
+      entry.failure = detail.failure;
+    }
+
+    this.snapshot = {
+      ...this.snapshot,
+      version: this.snapshot.version + 1,
+      stage,
+      timeline: [...this.snapshot.timeline, entry],
+      hash: detail.hash ?? this.snapshot.hash,
+    };
+
+    this.emit();
+    return this.getSnapshot();
+  }
+
+  /**
+   * Record a failure and move into the `failed` stage.
+   */
+  fail(failure: SorobanFailure, message?: string): TransactionLifecycleSnapshot {
+    return this.transition('failed', { failure, message: message ?? failure.message });
+  }
+
+  /**
+   * Record a transient failure and move into the `retrying` stage.
+   */
+  retry(failure: SorobanFailure, message?: string): TransactionLifecycleSnapshot {
+    return this.transition('retrying', { failure, message: message ?? failure.message });
+  }
+
+  /**
+   * Record that the flow was aborted due to a chain identity mismatch.
+   */
+  abort(error: ChainIdentityMismatchError): TransactionLifecycleSnapshot {
+    return this.transition('aborted', {
+      message: error.message,
+      failure: {
+        kind: 'unknown',
+        message: error.message,
+        retryable: false,
+      },
+    });
+  }
+
+  /**
+   * Record the latest ledger observed during confirmation polling.
+   */
+  observeLedger(latestLedger: number): void {
+    this.snapshot = { ...this.snapshot, latestLedger };
+  }
+
+  private emit(): void {
+    if (!this.onTransition) {
+      return;
+    }
+    try {
+      this.onTransition(this.getSnapshot());
+    } catch {
+      // Observers must not break the transaction flow.
+    }
+  }
+}
+
+/**
+ * Rebuild a lifecycle tracker from a persisted snapshot.
+ *
+ * The tracker resumes at the persisted stage but immediately records a
+ * `recovering` transition so the timeline makes the reload explicit. Callers
+ * must then re-check the authoritative chain/transaction state (see
+ * {@link recoverTransactionLifecycle}) before trusting the persisted stage.
+ *
+ * @param snapshot - Snapshot previously persisted by the web layer.
+ * @param options - Tracker options (observer, clock).
+ * @returns A tracker positioned at the `recovering` stage.
+ */
+export function resumeTransactionLifecycle(
+  snapshot: TransactionLifecycleSnapshot,
+  options: Omit<TransactionLifecycleTrackerOptions, 'chainIdentity'> = {},
+): TransactionLifecycleTracker {
+  const tracker = new TransactionLifecycleTracker({
+    ...options,
+    chainIdentity: snapshot.chainIdentity,
+  });
+
+  // Restore the persisted timeline so the UI can render the full history.
+  const restored: TransactionLifecycleSnapshot = {
+    version: snapshot.version,
+    stage: snapshot.stage,
+    timeline: snapshot.timeline.map((entry) => ({ ...entry })),
+    chainIdentity: snapshot.chainIdentity ? { ...snapshot.chainIdentity } : undefined,
+    hash: snapshot.hash,
+    latestLedger: snapshot.latestLedger,
+  };
+  (tracker as unknown as { snapshot: TransactionLifecycleSnapshot }).snapshot = restored;
+
+  tracker.transition('recovering', {
+    message: 'Resumed after reload; re-checking transaction state.',
+    hash: snapshot.hash,
+  });
+
+  return tracker;
+}
+
+/**
+ * Result of reconciling a persisted lifecycle snapshot against the chain.
+ */
+export interface TransactionRecoveryResult {
+  /** The reconciled stage. */
+  stage: TransactionLifecycleStage;
+  /** Whether the transaction was found on-chain. */
+  found: boolean;
+  /** Transaction hash, if known. */
+  hash?: string;
+  /** Latest ledger observed during recovery. */
+  latestLedger?: number;
+  /** Structured failure when recovery could not complete. */
+  failure?: SorobanFailure;
+}
+
+/**
+ * Recover a transaction flow after a reload by re-checking the authoritative
+ * chain state.
+ *
+ * Recovery rules:
+ * - If a chain identity was captured, it is re-asserted first; a mismatch
+ *   aborts the flow into the `aborted` stage.
+ * - If a hash is known, the transaction is looked up. A successful lookup
+ *   advances to `confirmed` (and `settled` once the ledger has closed past
+ *   the transaction's ledger). A `NOT_FOUND` result keeps the flow in
+ *   `confirming` so the caller can keep polling.
+ * - Transient RPC failures move the flow into `retrying` with a retryable
+ *   failure descriptor.
+ *
+ * @param rpc - Soroban RPC server instance.
+ * @param tracker - Tracker resumed via {@link resumeTransactionLifecycle}.
+ * @returns The reconciled recovery result.
+ */
+export async function recoverTransactionLifecycle(
+  rpc: Server,
+  tracker: TransactionLifecycleTracker,
+): Promise<TransactionRecoveryResult> {
+  const snapshot = tracker.getSnapshot();
+
+  if (snapshot.chainIdentity) {
+    try {
+      await assertChainBeforeConfirmation(rpc, snapshot.chainIdentity);
+    } catch (err) {
+      if (err instanceof ChainIdentityMismatchError) {
+        tracker.abort(err);
+        return {
+          stage: 'aborted',
+          found: false,
+          hash: snapshot.hash,
+          failure: { kind: 'unknown', message: err.message, retryable: false },
+        };
+      }
+      throw err;
+    }
+  }
+
+  if (!snapshot.hash) {
+    // Nothing was submitted before the reload; the flow must be restarted.
+    tracker.transition('failed', {
+      message: 'No transaction hash was persisted; restart the flow.',
+      failure: {
+        kind: 'unknown',
+        message: 'No transaction hash was persisted; restart the flow.',
+        retryable: true,
+      },
+    });
+    return {
+      stage: 'failed',
+      found: false,
+      failure: {
+        kind: 'unknown',
+        message: 'No transaction hash was persisted; restart the flow.',
+        retryable: true,
+      },
+    };
+  }
+
+  try {
+    const response = await rpc.getTransaction(snapshot.hash);
+    const latestLedger = await rpc.getLatestLedger();
+    tracker.observeLedger(Number(latestLedger.sequence));
+
+    if (response.status === Api.GetTransactionStatus.SUCCESS) {
+      tracker.transition('confirmed', { hash: snapshot.hash });
+      tracker.transition('settled', { hash: snapshot.hash });
+      return {
+        stage: 'settled',
+        found: true,
+        hash: snapshot.hash,
+        latestLedger: Number(latestLedger.sequence),
+      };
+    }
+
+    if (response.status === Api.GetTransactionStatus.FAILED) {
+      const failure: SorobanFailure = {
+        kind: 'contract_error',
+        message: 'Transaction failed on-chain.',
+        retryable: false,
+      };
+      tracker.fail(failure);
+      return {
+        stage: 'failed',
+        found: true,
+        hash: snapshot.hash,
+        latestLedger: Number(latestLedger.sequence),
+        failure,
+      };
+    }
+
+    // NOT_FOUND: still in flight; keep confirming.
+    tracker.transition('confirming', {
+      hash: snapshot.hash,
+      message: 'Transaction not yet confirmed; continue polling.',
+    });
+    return {
+      stage: 'confirming',
+      found: false,
+      hash: snapshot.hash,
+      latestLedger: Number(latestLedger.sequence),
+    };
+  } catch (err) {
+    const failure = classifyThrownError(err);
+    if (failure.retryable) {
+      tracker.retry(failure);
+    } else {
+      tracker.fail(failure);
+    }
+    return {
+      stage: failure.retryable ? 'retrying' : 'failed',
+      found: false,
+      hash: snapshot.hash,
+      failure,
+    };
+  }
+}
+
+/**
  * Resource usage metrics for a Soroban transaction.
  */
 export interface ResourceUsage {
@@ -203,6 +635,12 @@ export interface EstimationOptions {
    * @default 1000
    */
   retryDelayMs?: number;
+  /**
+   * Optional lifecycle tracker. When provided, the estimation flow records
+   * `simulating`, `retrying`, `failed`, and `aborted` transitions so the web
+   * layer can render the confirmation timeline.
+   */
+  lifecycle?: TransactionLifecycleTracker;
 }
 
 /**
@@ -229,7 +667,7 @@ export interface NetworkMetrics {
 /**
  * Default estimation options.
  */
-const DEFAULT_OPTIONS: Required<Omit<EstimationOptions, 'chainIdentity'>> = {
+const DEFAULT_OPTIONS: Required<Omit<EstimationOptions, 'chainIdentity' | 'lifecycle'>> = {
   feeBufferMultiplier: 1.2,
   baseFee: '100',
   maxRetries: 3,
@@ -331,6 +769,10 @@ export function classifyThrownError(error: unknown): SorobanFailure {
  * minimum resource fee required, then applies a safety buffer to account for
  * network congestion and resource fluctuations.
  *
+ * When `options.lifecycle` is provided, the flow records `simulating`,
+ * `retrying`, `failed`, and `aborted` transitions so the web layer can
+ * persist and render the confirmation timeline.
+ *
  * @param rpc - Soroban RPC server instance.
  * @param transaction - The transaction to simulate.
  * @param options - Configuration options for estimation.
@@ -351,12 +793,22 @@ export async function estimateTransactionFee(
   options: EstimationOptions = {},
 ): Promise<TransactionEstimate> {
   const opts = { ...DEFAULT_OPTIONS, ...options };
+  const lifecycle = opts.lifecycle;
+
+  lifecycle?.transition('simulating');
 
   // Guard the simulation against a network switch that happened before we
   // started. A mismatch is terminal: retrying cannot fix a wrong chain.
   if (opts.chainIdentity) {
-    const current = await captureChainIdentity(rpc);
-    assertChainIdentity(opts.chainIdentity, current, 'simulation');
+    try {
+      const current = await captureChainIdentity(rpc);
+      assertChainIdentity(opts.chainIdentity, current, 'simulation');
+    } catch (err) {
+      if (err instanceof ChainIdentityMismatchError) {
+        lifecycle?.abort(err);
+      }
+      throw err;
+    }
   }
 
   let lastError: Error | undefined;
@@ -367,12 +819,20 @@ export async function estimateTransactionFee(
       // Re-check after simulation: the wallet may have switched networks
       // while the simulation was in flight.
       if (opts.chainIdentity) {
-        const current = await captureChainIdentity(rpc);
-        assertChainIdentity(opts.chainIdentity, current, 'simulation');
+        try {
+          const current = await captureChainIdentity(rpc);
+          assertChainIdentity(opts.chainIdentity, current, 'simulation');
+        } catch (err) {
+          if (err instanceof ChainIdentityMismatchError) {
+            lifecycle?.abort(err);
+          }
+          throw err;
+        }
       }
 
       if (Api.isSimulationError(simulation)) {
         const failure = classifySimulationError(simulation.error);
+        lifecycle?.fail(failure, simulation.error);
         return {
           recommendedFee: opts.baseFee,
           minResourceFee: '0',
@@ -413,6 +873,10 @@ export async function estimateTransactionFee(
       }
       lastError = err as Error;
       if (attempt < opts.maxRetries - 1) {
+        const failure = classifyThrownError(err);
+        if (failure.retryable) {
+          lifecycle?.retry(failure);
+        }
         await sleep(opts.retryDelayMs);
       }
     }
@@ -425,6 +889,8 @@ export async function estimateTransactionFee(
         message: 'Simulation failed after retries',
         retryable: true,
       };
+
+  lifecycle?.fail(failure);
 
   return {
     recommendedFee: opts.baseFee,
@@ -679,30 +1145,4 @@ export function suggestResourceLimits(
  */
 export async function assertChainBeforeSigning(rpc: Server, expected: ChainIdentity): Promise<void> {
   const current = await captureChainIdentity(rpc);
-  assertChainIdentity(expected, current, 'signing');
-}
-
-/**
- * Guard a confirmation step against a network switch.
- *
- * Call this before polling for the transaction result. If the current chain
- * differs from the captured identity the flow is aborted.
- *
- * @param rpc - Soroban RPC server instance.
- * @param expected - Identity captured when the flow started.
- * @throws {ChainIdentityMismatchError} When the chain has changed.
- */
-export async function assertChainBeforeConfirmation(
-  rpc: Server,
-  expected: ChainIdentity,
-): Promise<void> {
-  const current = await captureChainIdentity(rpc);
-  assertChainIdentity(expected, current, 'confirmation');
-}
-
-/**
- * Sleep for a specified number of milliseconds.
- */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+  assertChain

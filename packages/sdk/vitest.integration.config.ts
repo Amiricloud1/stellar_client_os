@@ -28,6 +28,15 @@ import { defineConfig } from 'vitest/config';
  *
  * These tests are intentionally excluded from the standard `test` /
  * `test:watch` scripts and must be triggered explicitly.
+ *
+ * Operational coverage (issues #218, #219, #220, #222):
+ *   - deployment registry validation and lifecycle transitions
+ *   - canonical contract-event domain mappings (known + unknown versions)
+ *   - projection replay across event-schema versions with cutover compare
+ *   - bounded-queue backpressure and recovery under RPC/consumer outages
+ *
+ * These suites are deterministic: they run against the mock harness (or a
+ * local node) and never depend on wall-clock ordering or live funds.
  */
 export default defineConfig({
   test: {
@@ -39,6 +48,11 @@ export default defineConfig({
     include: [
       'src/__integration_tests__/**/*.integration.test.ts',
       'src/__integration_tests__/**/*.lifecycle.test.ts',
+      // Operational suites: registry, event mappings, replay, bounded queues.
+      'src/__integration_tests__/**/*.registry.test.ts',
+      'src/__integration_tests__/**/*.events.test.ts',
+      'src/__integration_tests__/**/*.replay.test.ts',
+      'src/__integration_tests__/**/*.queue.test.ts',
     ],
     // Give each test file a generous timeout – local node startup + contract
     // deployment can take several seconds.

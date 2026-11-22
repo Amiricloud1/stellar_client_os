@@ -47,10 +47,30 @@ impl DistributorContract {
         storage.set(&Symbol::new(&env, "tot_dist"), &0u64);
         storage.set(&Symbol::new(&env, "tot_amt"), &0i128);
         storage.set(&Symbol::new(&env, "hist_cnt"), &0u64);
+        
+        // Issue #4: Initialize network ID for cross-network key prevention
+        let network_id = env.ledger().network_id();
+        storage.set(&Symbol::new(&env, "network_id"), &network_id);
     }
 
     
     pub const MAX_RECIPIENTS: u32 = 1000;
+
+    /// Issue #4: Verify that debits (distributions + fees) equal credits (sent tokens)
+    /// This function proves token conservation: no tokens created or destroyed
+    pub fn verify_token_conservation(env: &Env, sent: i128, recipients_count: usize, fee_rate: u32) -> bool {
+        // Expected credit to recipients: sent / recipients_count (integer division)
+        // Expected fee: (sent * fee_rate) / 10000
+        // Property: fee + (credit_per_recipient * recipients_count) <= sent
+        
+        let credit_per_recipient = sent / recipients_count as i128;
+        let total_credit = credit_per_recipient * recipients_count as i128;
+        let fee = (sent * fee_rate as i128) / 10000i128;
+        let total_distributed = fee + total_credit;
+        
+        // Token conservation: we never distribute more than sent
+        total_distributed <= sent && total_credit > 0
+    }
 
     pub fn distribute_equal(
         env: Env,

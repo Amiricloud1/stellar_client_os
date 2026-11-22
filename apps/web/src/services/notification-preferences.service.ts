@@ -142,6 +142,45 @@ export async function getDueDigests(
   return all.filter((p) => isDigestDue(p, p.lastNotifiedAt, now));
 }
 
+/**
+ * Send-time opt-out check (#226).
+ *
+ * Delivery workers must call this immediately before handing a notification to
+ * a provider: preferences can change between enqueue and send, and an opt-out
+ * must be honored at the authoritative boundary rather than at enqueue time.
+ *
+ * Returns `true` when the recipient has no preferences for the campaign (no
+ * opt-in exists, so nothing may be delivered), when the stored channel differs
+ * from the requested channel, or when the channel-specific destination is
+ * missing.
+ */
+export async function isChannelOptedOut(
+  campaignId: string,
+  sponsorId: string,
+  channel: NotificationChannel,
+  dataSource = getPreferencesDataSource(),
+): Promise<boolean> {
+  const prefs = await getPreferences(campaignId, sponsorId, dataSource);
+  if (!prefs) return true;
+  if (prefs.channel !== channel) return true;
+  if (channel === "email") return !prefs.email;
+  if (channel === "push") return !prefs.pushEndpoint;
+  return false;
+}
+
+/**
+ * Recipient-scoped lookup used by the delivery worker to resolve the current
+ * destination for a queued notification. Returns `null` when the recipient has
+ * no preferences for the campaign (treated as opted out).
+ */
+export async function getPreferencesForRecipient(
+  campaignId: string,
+  sponsorId: string,
+  dataSource = getPreferencesDataSource(),
+): Promise<NotificationPreferences | null> {
+  return getPreferences(campaignId, sponsorId, dataSource);
+}
+
 /** Record that a digest was delivered (advances the schedule). */
 export async function markNotified(
   campaignId: string,

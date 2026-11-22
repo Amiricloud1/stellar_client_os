@@ -32,6 +32,13 @@ import {
   resolveSort,
 } from "@/types/pagination";
 import { calculateSponsorshipPricing } from "./campaign-sponsorship.service";
+import {
+  NestedResourcePolicy,
+  NestedResourcePrincipal,
+  NestedResourceRole,
+  authorizeNestedResource,
+  resolveNestedResourceRole,
+} from "./nested-resource-policy";
 
 /**
  * Top backers per campaign.
@@ -77,6 +84,10 @@ export interface ListBackersOptions extends PaginationParams {
   includePrivate?: boolean;
   sortBy?: BackerSortField | string;
   sortDirection?: SortDirection | string;
+  /** Collaborators of the parent campaign, used to resolve the viewer's role. */
+  collaboratorAddresses?: string[];
+  /** Explicit principal override (e.g. anonymous requests). */
+  principal?: NestedResourcePrincipal;
 }
 
 export type ListBackersResult = PaginatedResult<TopBackerEntry> & {
@@ -112,6 +123,7 @@ class CampaignBackersService {
   private preferences = new Map<string, BackerPrivacyPreference>();
   private featured = new Map<string, FeaturedBacker[]>();
   private creators = new Map<string, string>();
+  private collaborators = new Map<string, string[]>();
 
   private prefKey(campaignId: string, backerAddress: string) {
     return `${campaignId}:${backerAddress.trim().toLowerCase()}`;
@@ -127,6 +139,38 @@ class CampaignBackersService {
 
   getCampaignCreator(campaignId: string): string | undefined {
     return this.creators.get(campaignId?.trim() ?? "");
+  }
+
+  /** Register collaborators of the parent campaign (owner-managed). */
+  registerCampaignCollaborators(campaignId: string, collaboratorAddresses: string[]): void {
+    if (!campaignId?.trim()) return;
+    const cleaned = (collaboratorAddresses ?? [])
+      .map((address) => address?.trim())
+      .filter((address): address is string => Boolean(address));
+    this.collaborators.set(campaignId.trim(), cleaned);
+  }
+
+  getCampaignCollaborators(campaignId: string): string[] {
+    return [...(this.collaborators.get(campaignId?.trim() ?? "") ?? [])];
+  }
+
+  /**
+   * Resolve the viewer's role on the parent campaign using the centralized
+   * nested-resource policy. Backers are a nested resource of a campaign, so
+   * ownership/collaboration is always evaluated against the campaign.
+   */
+  resolveViewerRole(
+    campaignId: string,
+    viewerAddress?: string,
+    options: { collaboratorAddresses?: string[]; principal?: NestedResourcePrincipal } = {},
+  ): NestedResourceRole {
+    const id = campaignId?.trim() ?? "";
+    return resolveNestedResourceRole({
+      ownerAddress: this.getCampaignCreator(id),
+      collaboratorAddresses: options.collaboratorAddresses ?? this.getCampaignCollaborators(id),
+      viewerAddress,
+      principal: options.principal,
+    });
   }
 
   // ----------------------------------------------------------- contributions
@@ -260,8 +304,16 @@ class CampaignBackersService {
 
     const creator = (input.campaignCreator?.trim() || this.getCampaignCreator(campaignId) || "").trim();
     if (!creator) return { ok: false, error: "Campaign creator is unknown — cannot feature backers" };
-    if (!sameAddress(creator, featuredBy)) {
-      return { ok: false, error: "Only the campaign creator can feature backers" };
+
+    const authorization = authorizeNestedResource({
+      resource: "backers",
+      action: "feature",
+      ownerAddress: creator,
+      collaboratorAddresses: this.getCampaignCollaborators(campaignId),
+      viewerAddress: featuredBy,
+    });
+    if (!authorization.allowed) {
+      return { ok: false, error: authorization.error };
     }
 
     if (!this.hasBacker(campaignId, backerAddress)) {
@@ -321,8 +373,16 @@ class CampaignBackersService {
 
     const creator = (input.campaignCreator?.trim() || this.getCampaignCreator(campaignId) || "").trim();
     if (!creator) return { ok: false, error: "Campaign creator is unknown — cannot feature backers" };
-    if (!sameAddress(creator, featuredBy)) {
-      return { ok: false, error: "Only the campaign creator can feature backers" };
+
+    const authorization = authorizeNestedResource({
+      resource: "backers",
+      action: "unfeature",
+      ownerAddress: creator,
+      collaboratorAddresses: this.getCampaignCollaborators(campaignId),
+      viewerAddress: featuredBy,
+    });
+    if (!authorization.allowed) {
+      return { ok: false, error: authorization.error };
     }
 
     return { ok: true, value: { removed: this.removeFeatured(campaignId, backerAddress) } };
@@ -406,8 +466,13 @@ class CampaignBackersService {
     const limit = Math.min(Math.max(Math.trunc(options.limit ?? TOP_BACKERS_LIMIT), 1), 100);
     const viewerAddress = options.viewerAddress?.trim();
     const creatorAddress = options.creatorAddress?.trim() || this.getCampaignCreator(id);
-    const viewerIsCreator = sameAddress(viewerAddress, creatorAddress);
-    const includePrivate = options.includePrivate ?? viewerIsCreator;
+    const viewerRole = this.resolveViewerRole(id, viewerAddress, {
+      collaboratorAddresses: options.collaboratorAddresses,
+      principal: options.principal,
+    });
+    const viewerIsCreator = viewerRole === "owner";
+    // Only the owner and authorized collaborators may see private backers.
+    const includePrivate = options.includePrivate ?? NestedResourcePolicy.canViewPrivateBackers(viewerRole);
 
     const featuredList = this.getFeaturedBackers(id);
     const aggregates = this.aggregateBackers(id);
@@ -497,6 +562,8 @@ class CampaignBackersService {
         viewerAddress: options.viewerAddress,
         creatorAddress: options.creatorAddress,
         includePrivate: options.includePrivate,
+        collaboratorAddresses: options.collaboratorAddresses,
+        principal: options.principal,
         limit: MAX_PAGE_SIZE,
       },
       now,
@@ -530,6 +597,7 @@ class CampaignBackersService {
     this.preferences.clear();
     this.featured.clear();
     this.creators.clear();
+    this.collaborators.clear();
   }
 }
 

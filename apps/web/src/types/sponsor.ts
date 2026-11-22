@@ -1,5 +1,77 @@
 export type SponsorTier = "PLATINUM" | "GOLD" | "SILVER" | "BRONZE";
 
+/**
+ * Lifecycle of a single portfolio amount against authoritative records.
+ *
+ * - `PENDING`: value recorded locally, not yet confirmed by the authoritative source.
+ * - `RECONCILED`: value matches the authoritative record exactly.
+ * - `MISMATCHED`: local value disagrees with the authoritative record; requires operator review.
+ * - `UNAVAILABLE`: authoritative source could not be reached; value is unverified (retryable).
+ */
+export type ReconciliationStatus =
+  | "PENDING"
+  | "RECONCILED"
+  | "MISMATCHED"
+  | "UNAVAILABLE";
+
+/**
+ * The three value stages tracked for every sponsor across supported campaigns.
+ *
+ * - `committed`: value the sponsor has pledged/authorized (e.g. signed intent or escrow deposit).
+ * - `matched`: value matched by a funding partner or matching pool against the commitment.
+ * - `settled`: value actually disbursed to the campaign on-chain (authoritative ledger).
+ *
+ * Amounts are decimal strings in the smallest display unit of `token` to avoid
+ * floating-point drift; they are compared against authoritative records verbatim.
+ */
+export interface PortfolioAmount {
+  committed: string;
+  matched: string;
+  settled: string;
+  token: string;
+  status: ReconciliationStatus;
+  /** Unix timestamp ms of the last successful reconciliation, if any. */
+  reconciledAt?: number;
+  /** Human-readable reason when `status` is not `RECONCILED`. */
+  statusReason?: string;
+}
+
+/**
+ * Pointer to the authoritative record backing a portfolio amount.
+ * `source` identifies the system of record (e.g. `"stellar-horizon"`, `"matching-pool"`).
+ */
+export interface PortfolioSourceReference {
+  source: string;
+  /** Stable identifier of the record within `source` (tx hash, ledger entry, pool id). */
+  referenceId: string;
+  /** Which amount stage this reference substantiates. */
+  stage: "committed" | "matched" | "settled";
+  /** Unix timestamp ms the reference was observed. */
+  observedAt: number;
+  /** Optional deep link for operators to inspect the record. */
+  url?: string;
+}
+
+/**
+ * Aggregated sponsor view across all supported campaigns.
+ *
+ * `amounts` holds one entry per token; each entry reconciles committed, matched
+ * and settled value against the authoritative records listed in `sources`.
+ * A portfolio is only `RECONCILED` when every amount entry is reconciled.
+ */
+export interface SponsorPortfolio {
+  sponsorId: string;
+  /** Campaign ids included in this portfolio (supported campaigns only). */
+  campaignIds: string[];
+  amounts: PortfolioAmount[];
+  sources: PortfolioSourceReference[];
+  status: ReconciliationStatus;
+  /** Unix timestamp ms when the portfolio was assembled. */
+  generatedAt: number;
+  /** Unix timestamp ms of the last successful full reconciliation. */
+  lastReconciledAt?: number;
+}
+
 export interface Sponsor {
   id: string;
   campaignId: string;

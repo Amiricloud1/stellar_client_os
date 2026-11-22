@@ -412,6 +412,186 @@ export class CompilationLimitError extends StellarError {
 }
 
 /**
+ * Stable reason codes explaining *why* a request was rejected by the
+ * request-size / collection-budget / workload-metering guards.
+ * These codes are part of the public API contract and must not change.
+ */
+export const RequestLimitReason = {
+  /** Raw request body exceeds the configured byte limit. */
+  BODY_SIZE: 'body_size',
+  /** A nested list/array exceeds the configured maximum depth. */
+  LIST_DEPTH: 'list_depth',
+  /** Too many filters were supplied in a single request. */
+  FILTER_COUNT: 'filter_count',
+  /** The tenant's weighted operation budget has been exhausted. */
+  WEIGHTED_BUDGET: 'weighted_budget',
+} as const;
+
+export type RequestLimitReasonValue = (typeof RequestLimitReason)[keyof typeof RequestLimitReason];
+
+/**
+ * Error thrown when a request body exceeds the configured byte limit.
+ * Maps to HTTP 413 (Payload Too Large).
+ */
+export class RequestTooLargeError extends StellarError {
+  public readonly reason: RequestLimitReasonValue;
+  public readonly limit?: number;
+  public readonly actual?: number;
+
+  constructor(
+    message = 'Request body is too large.',
+    options?: {
+      reason?: RequestLimitReasonValue;
+      limit?: number;
+      actual?: number;
+      requestId?: string;
+      originalError?: Error;
+    }
+  ) {
+    super(message, 'REQUEST_TOO_LARGE', {
+      requestId: options?.requestId,
+      originalError: options?.originalError,
+    });
+    this.name = 'RequestTooLargeError';
+    this.reason = options?.reason ?? RequestLimitReason.BODY_SIZE;
+    this.limit = options?.limit;
+    this.actual = options?.actual;
+    Object.setPrototypeOf(this, RequestTooLargeError.prototype);
+  }
+
+  toApiError(): ApiError {
+    const envelope = super.toApiError();
+    const details: Record<string, unknown> = { ...(envelope.details ?? {}), reason: this.reason };
+    if (this.limit !== undefined) details.limit = this.limit;
+    if (this.actual !== undefined) details.actual = this.actual;
+    envelope.details = details;
+    return envelope;
+  }
+}
+
+/**
+ * Error thrown when a request exceeds a collection budget (nested list depth
+ * or number of filters). Maps to HTTP 422 (Unprocessable Entity).
+ */
+export class RequestBudgetExceededError extends StellarError {
+  public readonly reason: RequestLimitReasonValue;
+  public readonly limit?: number;
+  public readonly actual?: number;
+
+  constructor(
+    message = 'Request exceeds the allowed collection budget.',
+    options?: {
+      reason?: RequestLimitReasonValue;
+      limit?: number;
+      actual?: number;
+      requestId?: string;
+      originalError?: Error;
+    }
+  ) {
+    super(message, 'REQUEST_BUDGET_EXCEEDED', {
+      requestId: options?.requestId,
+      originalError: options?.originalError,
+    });
+    this.name = 'RequestBudgetExceededError';
+    this.reason = options?.reason ?? RequestLimitReason.FILTER_COUNT;
+    this.limit = options?.limit;
+    this.actual = options?.actual;
+    Object.setPrototypeOf(this, RequestBudgetExceededError.prototype);
+  }
+
+  toApiError(): ApiError {
+    const envelope = super.toApiError();
+    const details: Record<string, unknown> = { ...(envelope.details ?? {}), reason: this.reason };
+    if (this.limit !== undefined) details.limit = this.limit;
+    if (this.actual !== undefined) details.actual = this.actual;
+    envelope.details = details;
+    return envelope;
+  }
+}
+
+/**
+ * Error thrown when a tenant's weighted operation budget is exhausted.
+ * Maps to HTTP 429 (Too Many Requests) and carries `retryAfterMs` so clients
+ * can back off deterministically.
+ */
+export class OperationBudgetExhaustedError extends StellarError {
+  public readonly reason: RequestLimitReasonValue;
+  /** Milliseconds the client should wait before retrying. */
+  public readonly retryAfterMs: number;
+  public readonly limit?: number;
+  public readonly cost?: number;
+
+  constructor(
+    message = 'Operation budget exhausted. Please retry later.',
+    options?: {
+      reason?: RequestLimitReasonValue;
+      retryAfterMs?: number;
+      limit?: number;
+      cost?: number;
+      requestId?: string;
+      originalError?: Error;
+    }
+  ) {
+    super(message, 'OPERATION_BUDGET_EXHAUSTED', {
+      requestId: options?.requestId,
+      originalError: options?.originalError,
+    });
+    this.name = 'OperationBudgetExhaustedError';
+    this.reason = options?.reason ?? RequestLimitReason.WEIGHTED_BUDGET;
+    this.retryAfterMs = options?.retryAfterMs ?? 1000;
+    this.limit = options?.limit;
+    this.cost = options?.cost;
+    Object.setPrototypeOf(this, OperationBudgetExhaustedError.prototype);
+  }
+
+  toApiError(): ApiError {
+    const envelope = super.toApiError();
+    const details: Record<string, unknown> = {
+      ...(envelope.details ?? {}),
+      reason: this.reason,
+      retryAfterMs: this.retryAfterMs,
+    };
+    if (this.limit !== undefined) details.limit = this.limit;
+    if (this.cost !== undefined) details.cost = this.cost;
+    envelope.details = details;
+    return envelope;
+  }
+}
+
+/**
+ * Metadata describing a bounded stale-serving analytics response.
+ * Attached to successful responses (not errors) so clients can surface
+ * freshness to users without treating stale data as a failure.
+ */
+export interface AnalyticsStaleMetadata {
+  /** Always `true` when present; indicates the payload is served stale. */
+  stale: true;
+  /** Age of the served payload in milliseconds. */
+  ageMs: number;
+  /** Maximum age (ms) the cache is allowed to serve stale before failing. */
+  maxStaleMs: number;
+}
+
+/**
+ * Build the `ANALYTICS_STALE` indicator metadata for a stale analytics read.
+ * This is a success-path indicator, not an error: it is returned alongside
+ * the payload so callers can render freshness without a failure state.
+ */
+export function analyticsStaleMetadata(
+  ageMs: number,
+  maxStaleMs: number
+): { code: 'ANALYTICS_STALE'; stale: AnalyticsStaleMetadata } {
+  return {
+    code: 'ANALYTICS_STALE',
+    stale: {
+      stale: true,
+      ageMs: Math.max(0, Math.floor(ageMs)),
+      maxStaleMs: Math.max(0, Math.floor(maxStaleMs)),
+    },
+  };
+}
+
+/**
  * Parse and transform SDK errors into user-friendly error classes
  */
 export function parseError(error: unknown, requestId?: string): StellarError {

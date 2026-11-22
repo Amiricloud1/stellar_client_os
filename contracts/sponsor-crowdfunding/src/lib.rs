@@ -2,7 +2,8 @@
 mod checked_math;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Env,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, vec, Address,
+    Env, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -20,10 +21,22 @@ pub enum DataKey {
     PoolCount,
     /// Per-sponsor contribution keyed by (pool_id, sponsor).
     Contribution(u64, Address),
+    /// Terms snapshot hash accepted for a pool, keyed by pool_id.
+    PoolTermsHash(u64),
+    /// Terms snapshot hash bound to a sponsor's contribution, keyed by (pool_id, sponsor).
+    ContributionTermsHash(u64, Address),
     /// Settlement state marker for one-time settlement verification.
     PoolSettled(u64),
     /// Payout marker guaranteeing raised funds are paid out only once.
     PoolPaidOut(u64),
+    /// Ordered list of contributor addresses registered for a pool (persistent storage).
+    ContributorList(u64),
+    /// Number of contributors registered in ContributorList (persistent storage).
+    ContributorCount(u64),
+    /// Index of the next contributor to refund in a resumable batch (persistent storage).
+    RefundCursor(u64),
+    /// Running total of tokens refunded so far for this batch (persistent storage).
+    RefundedTotal(u64),
 }
 
 /// Lifecycle state of a funding pool.
@@ -84,6 +97,8 @@ pub enum Error {
     TargetNotReached = 8,
     NoContribution = 9,
     ArithmeticOverflow = 10,
+    /// Supplied terms snapshot hash does not match the pool's accepted terms.
+    TermsSnapshotMismatch = 11,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +112,8 @@ const MAX_SHARE_BPS: u32 = 10_000;
 /// Set to `i128::MAX / 2` so the sum of any two individually-valid amounts
 /// still fits in `i128`; larger accumulations are caught by checked math.
 pub const MAX_AMOUNT: i128 = i128::MAX / 2;
+/// Maximum number of contributors processed in a single `batch_refund` call.
+pub const MAX_BATCH_REFUND: u32 = 50;
 /// Storage TTL threshold: ~30 days at 5 s/ledger.
 const LEDGER_THRESHOLD: u32 = 518_400;
 /// Storage TTL bump: ~31 days at 5 s/ledger.
@@ -139,10 +156,17 @@ impl SponsorCrowdfundingContract {
     /// * `tree_id`       ??? ID of the tree to fund.
     /// * `target_amount` ??? Total amount needed.
     /// * `token`         ??? Stellar asset contract address for contributions.
+    /// * `terms_hash`    ??? Content hash of the donor-facing terms shown before signing.
     ///
     /// # Returns
     /// The newly assigned pool ID.
-    pub fn create_pool(env: Env, tree_id: u64, target_amount: i128, token: Address) -> u64 {
+    pub fn create_pool(
+        env: Env,
+        tree_id: u64,
+        target_amount: i128,
+        token: Address,
+        terms_hash: u64,
+    ) -> u64 {
         Self::assert_initialized(&env);
 
         checked_math::validate_amount(&env, target_amount);
@@ -171,12 +195,21 @@ impl SponsorCrowdfundingContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+
+        let terms_key = DataKey::PoolTermsHash(count);
+        env.storage().persistent().set(&terms_key, &terms_hash);
+        env.storage()
+            .persistent()
+            .extend_ttl(&terms_key, LEDGER_THRESHOLD, LEDGER_BUMP);
+
         env.storage()
             .instance()
             .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
 
-        env.events()
-            .publish(("PoolCreated", count), (count, tree_id, target_amount));
+        env.events().publish(
+            ("PoolCreated", count),
+            (count, tree_id, target_amount, terms_hash),
+        );
 
         count
     }
@@ -189,12 +222,20 @@ impl SponsorCrowdfundingContract {
     /// * `contributor` ??? Address making the contribution.
     /// * `pool_id`     ??? Target pool.
     /// * `amount`      ??? Positive token amount to contribute.
+    /// * `terms_hash`  ??? Content hash of the terms the contributor signed.
     ///
     /// # Errors
     /// * [`Error::PoolNotOpen`]       ??? pool is not open for contributions.
     /// * [`Error::InvalidAmount`]     ??? `amount <= 0`.
+    /// * [`Error::TermsSnapshotMismatch`] ??? `terms_hash` differs from the pool's terms.
     /// * [`Error::ArithmeticOverflow`] ??? internal overflow.
-    pub fn contribute(env: Env, contributor: Address, pool_id: u64, amount: i128) {
+    pub fn contribute(
+        env: Env,
+        contributor: Address,
+        pool_id: u64,
+        amount: i128,
+        terms_hash: u64,
+    ) {
         contributor.require_auth();
 
         let mut pool = Self::load_pool(&env, pool_id);
@@ -203,6 +244,16 @@ impl SponsorCrowdfundingContract {
             panic_with_error!(&env, Error::PoolNotOpen);
         }
         checked_math::validate_amount(&env, amount);
+
+        // Bind the contribution to the exact terms snapshot the donor signed.
+        let accepted_terms: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolTermsHash(pool_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::TermsSnapshotMismatch));
+        if accepted_terms != terms_hash {
+            panic_with_error!(&env, Error::TermsSnapshotMismatch);
+        }
 
         let new_total = checked_math::checked_add(&env, pool.total_raised, amount);
 
@@ -219,9 +270,16 @@ impl SponsorCrowdfundingContract {
             .persistent()
             .extend_ttl(&contrib_key, LEDGER_THRESHOLD, LEDGER_BUMP);
 
+        // Record the terms snapshot hash this contribution is bound to.
+        let terms_key = DataKey::ContributionTermsHash(pool_id, contributor.clone());
+        env.storage().persistent().set(&terms_key, &terms_hash);
+        env.storage()
+            .persistent()
+            .extend_ttl(&terms_key, LEDGER_THRESHOLD, LEDGER_BUMP);
+
         pool.total_raised = new_total;
 
-        // Auto-settle when target is reached.
+        pool.total_raised = new_total;
         if pool.total_raised >= pool.target_amount {
             pool.status = PoolStatus::Settled;
             env.events().publish(
@@ -234,7 +292,7 @@ impl SponsorCrowdfundingContract {
 
         env.events().publish(
             ("ContributionMade", pool_id),
-            (contributor, pool_id, amount, pool.total_raised),
+            (contributor, pool_id, amount, pool.total_raised, terms_hash),
         );
     }
 
@@ -385,6 +443,121 @@ impl SponsorCrowdfundingContract {
             .publish(("RefundIssued", pool_id), (contributor, pool_id, amount));
     }
 
+    /// Process refunds for a dissolved pool in resumable batches.
+    ///
+    /// Returns `(processed_count, done)` where `done` is `true` when all
+    /// contributors have been refunded.
+    ///
+    /// # Arguments
+    /// * `pool_id` — Dissolved pool to refund from.
+    /// * `limit`   — Max contributors to process this call (1..=MAX_BATCH_REFUND).
+    ///
+    /// # Errors
+    /// * [`Error::PoolNotOpen`]       — pool is not dissolved.
+    /// * [`Error::InvalidAmount`]     — `limit` is 0.
+    /// * [`Error::BatchLimitExceeded`] — `limit` exceeds `MAX_BATCH_REFUND`.
+    /// * [`Error::ConservationViolated`] — sum of refunds ≠ total_raised at completion.
+    pub fn batch_refund(env: Env, pool_id: u64, limit: u32) -> (u32, bool) {
+        let pool = Self::load_pool(&env, pool_id);
+
+        if pool.status != PoolStatus::Dissolved {
+            panic_with_error!(&env, Error::PoolNotOpen);
+        }
+        if limit == 0 {
+            panic_with_error!(&env, Error::InvalidAmount);
+        }
+        if limit > MAX_BATCH_REFUND {
+            panic_with_error!(&env, Error::BatchLimitExceeded);
+        }
+
+        let cursor_key = DataKey::RefundCursor(pool_id);
+        let total_key = DataKey::RefundedTotal(pool_id);
+        let list_key = DataKey::ContributorList(pool_id);
+        let count_key = DataKey::ContributorCount(pool_id);
+
+        let cursor: u64 = env
+            .storage()
+            .persistent()
+            .get(&cursor_key)
+            .unwrap_or(0);
+        let contributor_count: u64 = env
+            .storage()
+            .persistent()
+            .get(&count_key)
+            .unwrap_or(0);
+        let contributors: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&list_key)
+            .unwrap_or_else(|| vec![&env]);
+
+        let end = (cursor + limit as u64).min(contributor_count);
+        let token_client = token::Client::new(&env, &pool.token);
+
+        let mut running_total: i128 = env
+            .storage()
+            .persistent()
+            .get(&total_key)
+            .unwrap_or(0i128);
+        let mut processed: u32 = 0;
+
+        let mut i = cursor;
+        while i < end {
+            let contributor = contributors.get(i as u32).unwrap();
+            let contrib_key = DataKey::Contribution(pool_id, contributor.clone());
+            let amount: i128 = env
+                .storage()
+                .persistent()
+                .get(&contrib_key)
+                .unwrap_or(0);
+            if amount > 0 {
+                // Check-effects-interactions: clear before transfer.
+                env.storage().persistent().remove(&contrib_key);
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &contributor,
+                    &amount,
+                );
+                running_total = checked_math::checked_add(&env, running_total, amount);
+                env.events().publish(
+                    ("RefundIssued", pool_id),
+                    (contributor, pool_id, amount),
+                );
+            }
+            processed += 1;
+            i += 1;
+        }
+
+        let new_cursor = end;
+        let done = new_cursor >= contributor_count;
+
+        if done {
+            // Conservation invariant: total refunded must equal total raised.
+            if running_total != pool.total_raised {
+                panic_with_error!(&env, Error::ConservationViolated);
+            }
+            // Clean up batch state.
+            env.storage().persistent().remove(&cursor_key);
+            env.storage().persistent().remove(&total_key);
+        } else {
+            // Persist progress for next call.
+            env.storage()
+                .persistent()
+                .set(&cursor_key, &new_cursor);
+            env.storage()
+                .persistent()
+                .extend_ttl(&cursor_key, LEDGER_THRESHOLD, LEDGER_BUMP);
+            env.storage()
+                .persistent()
+                .set(&total_key, &running_total);
+            env.storage()
+                .persistent()
+                .extend_ttl(&total_key, LEDGER_THRESHOLD, LEDGER_BUMP);
+        }
+
+        (processed, done)
+    }
+
     // -----------------------------------------------------------------------
     // Queries
     // -----------------------------------------------------------------------
@@ -400,6 +573,25 @@ impl SponsorCrowdfundingContract {
             .persistent()
             .get(&DataKey::Contribution(pool_id, contributor))
             .unwrap_or(0)
+    }
+
+    /// Return the terms snapshot hash accepted for a pool.
+    pub fn get_pool_terms_hash(env: Env, pool_id: u64) -> u64 {
+        Self::load_pool(&env, pool_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::PoolTermsHash(pool_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::TermsSnapshotMismatch))
+    }
+
+    /// Return the terms snapshot hash bound to a sponsor's contribution.
+    ///
+    /// Panics with [`Error::NoContribution`] if the sponsor has no contribution.
+    pub fn get_contribution_terms_hash(env: Env, pool_id: u64, contributor: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ContributionTermsHash(pool_id, contributor))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoContribution))
     }
 
     /// Return the total number of pools created.
@@ -480,6 +672,9 @@ mod tests {
         Address, Env,
     };
 
+    /// Terms snapshot hash used across tests.
+    const TERMS_HASH: u64 = 0xDEAD_BEEF_1234_5678;
+
     fn set_time(env: &Env, ts: u64) {
         env.ledger().set(LedgerInfo {
             timestamp: ts,
@@ -531,7 +726,7 @@ mod tests {
         set_time(&env, 1_000);
         let (_, client, _, token_addr) = setup_contract(&env);
 
-        let id = client.create_pool(&1, &10_000, &token_addr);
+        let id = client.create_pool(&1, &10_000, &token_addr, &TERMS_HASH);
         assert_eq!(id, 1);
         assert_eq!(client.get_pool_count(), 1);
 
@@ -540,6 +735,7 @@ mod tests {
         assert_eq!(pool.target_amount, 10_000);
         assert_eq!(pool.total_raised, 0);
         assert_eq!(pool.status, PoolStatus::Open);
+        assert_eq!(client.get_pool_terms_hash(&id), TERMS_HASH);
     }
 
     #[test]
@@ -556,9 +752,9 @@ mod tests {
         token_admin_client.mint(&sponsor1, &8_000);
         token_admin_client.mint(&sponsor2, &5_000);
 
-        let id = client.create_pool(&1, &10_000, &token_addr2);
-        client.contribute(&sponsor1, &id, &6_000);
-        client.contribute(&sponsor2, &id, &4_000);
+        let id = client.create_pool(&1, &10_000, &token_addr2, &TERMS_HASH);
+        client.contribute(&sponsor1, &id, &6_000, &TERMS_HASH);
+        client.contribute(&sponsor2, &id, &4_000, &TERMS_HASH);
 
         let pool = client.get_pool(&id);
         assert_eq!(pool.total_raised, 10_000);
@@ -566,6 +762,40 @@ mod tests {
 
         assert_eq!(client.get_contribution(&id, &sponsor1), 6_000);
         assert_eq!(client.get_contribution(&id, &sponsor2), 4_000);
+        assert_eq!(
+            client.get_contribution_terms_hash(&id, &sponsor1),
+            TERMS_HASH
+        );
+        assert_eq!(
+            client.get_contribution_terms_hash(&id, &sponsor2),
+            TERMS_HASH
+        );
+    }
+
+    #[test]
+    fn test_contribute_terms_snapshot_mismatch_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr2, token_client, token_admin_client) = create_token(&env, &token_admin);
+        let sponsor = Address::generate(&env);
+        token_admin_client.mint(&sponsor, &5_000);
+
+        let id = client.create_pool(&1, &10_000, &token_addr2, &TERMS_HASH);
+
+        let res = client.try_contribute(&sponsor, &id, &3_000, &(TERMS_HASH + 1));
+        assert_eq!(res, Err(Ok(Error::TermsSnapshotMismatch)));
+
+        // No state change: no funds moved, no contribution recorded.
+        assert_eq!(token_client.balance(&sponsor), 5_000);
+        assert_eq!(client.get_contribution(&id, &sponsor), 0);
+        assert_eq!(client.get_pool(&id).total_raised, 0);
+        assert!(client
+            .try_get_contribution_terms_hash(&id, &sponsor)
+            .is_err());
     }
 
     #[test]
@@ -580,8 +810,8 @@ mod tests {
         let sponsor = Address::generate(&env);
         token_admin_client.mint(&sponsor, &5_000);
 
-        let id = client.create_pool(&1, &10_000, &token_addr2);
-        client.contribute(&sponsor, &id, &3_000);
+        let id = client.create_pool(&1, &10_000, &token_addr2, &TERMS_HASH);
+        client.contribute(&sponsor, &id, &3_000, &TERMS_HASH);
 
         client.dissolve_pool(&id);
         assert_eq!(client.get_pool(&id).status, PoolStatus::Dissolved);
@@ -607,7 +837,7 @@ mod tests {
         env.mock_all_auths();
         set_time(&env, 1_000);
         let (_, client, _, token_addr) = setup_contract(&env);
-        client.create_pool(&1, &0, &token_addr);
+        client.create_pool(&1, &0, &token_addr, &TERMS_HASH);
     }
 
     #[test]
@@ -626,7 +856,7 @@ mod tests {
         env.mock_all_auths();
         set_time(&env, 1_000);
         let (_, client, _, token_addr) = setup_contract(&env);
-        let id = client.create_pool(&1, &MAX_AMOUNT, &token_addr);
+        let id = client.create_pool(&1, &MAX_AMOUNT, &token_addr, &TERMS_HASH);
         assert_eq!(client.get_pool(&id).target_amount, MAX_AMOUNT);
     }
 
@@ -637,7 +867,7 @@ mod tests {
         env.mock_all_auths();
         set_time(&env, 1_000);
         let (_, client, _, token_addr) = setup_contract(&env);
-        client.create_pool(&1, &(MAX_AMOUNT + 1), &token_addr);
+        client.create_pool(&1, &(MAX_AMOUNT + 1), &token_addr, &TERMS_HASH);
     }
 
     #[test]
@@ -648,8 +878,8 @@ mod tests {
         set_time(&env, 1_000);
         let (_, client, _, token_addr) = setup_contract(&env);
         let sponsor = Address::generate(&env);
-        let id = client.create_pool(&1, &10_000, &token_addr);
-        client.contribute(&sponsor, &id, &0);
+        let id = client.create_pool(&1, &10_000, &token_addr, &TERMS_HASH);
+        client.contribute(&sponsor, &id, &0, &TERMS_HASH);
     }
 
     #[test]
@@ -660,8 +890,8 @@ mod tests {
         set_time(&env, 1_000);
         let (_, client, _, token_addr) = setup_contract(&env);
         let sponsor = Address::generate(&env);
-        let id = client.create_pool(&1, &10_000, &token_addr);
-        client.contribute(&sponsor, &id, &-1);
+        let id = client.create_pool(&1, &10_000, &token_addr, &TERMS_HASH);
+        client.contribute(&sponsor, &id, &-1, &TERMS_HASH);
     }
 
     #[test]
@@ -676,10 +906,10 @@ mod tests {
         let sponsor = Address::generate(&env);
         token_admin_client.mint(&sponsor, &10_000);
 
-        let id = client.create_pool(&1, &10_000, &token_addr2);
+        let id = client.create_pool(&1, &10_000, &token_addr2, &TERMS_HASH);
 
         // Partial contribution of 4_000
-        client.contribute(&sponsor, &id, &4_000);
+        client.contribute(&sponsor, &id, &4_000, &TERMS_HASH);
         let pool = client.get_pool(&id);
         assert_eq!(pool.status, PoolStatus::Open);
         assert_eq!(pool.total_raised, 4_000);
@@ -698,8 +928,8 @@ mod tests {
         let sponsor = Address::generate(&env);
         token_admin_client.mint(&sponsor, &10_000);
 
-        let id = client.create_pool(&1, &10_000, &token_addr2);
-        client.contribute(&sponsor, &id, &10_000);
+        let id = client.create_pool(&1, &10_000, &token_addr2, &TERMS_HASH);
+        client.contribute(&sponsor, &id, &10_000, &TERMS_HASH);
 
         // First settlement succeeds
         client.settle_pool(&id, &500);
@@ -725,9 +955,9 @@ mod tests {
         token_admin_client.mint(&sponsor1, &6_000);
         token_admin_client.mint(&sponsor2, &4_000);
 
-        let id = client.create_pool(&1, &10_000, &token_addr2);
-        client.contribute(&sponsor1, &id, &6_000);
-        client.contribute(&sponsor2, &id, &4_000);
+        let id = client.create_pool(&1, &10_000, &token_addr2, &TERMS_HASH);
+        client.contribute(&sponsor1, &id, &6_000, &TERMS_HASH);
+        client.contribute(&sponsor2, &id, &4_000, &TERMS_HASH);
 
         let pool = client.get_pool(&id);
         assert_eq!(pool.status, PoolStatus::Settled);
@@ -753,8 +983,8 @@ mod tests {
         let sponsor = Address::generate(&env);
         token_admin_client.mint(&sponsor, &5_000);
 
-        let id = client.create_pool(&1, &10_000, &token_addr2);
-        client.contribute(&sponsor, &id, &3_000);
+        let id = client.create_pool(&1, &10_000, &token_addr2, &TERMS_HASH);
+        client.contribute(&sponsor, &id, &3_000, &TERMS_HASH);
         client.dissolve_pool(&id);
 
         client.refund(&sponsor, &id);
@@ -763,6 +993,136 @@ mod tests {
         // Second refund fails with NoContribution
         let res = client.try_refund(&sponsor, &id);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_batch_refund_single_pass() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr2, token_client, token_admin_client) = create_token(&env, &token_admin);
+        let s1 = Address::generate(&env);
+        let s2 = Address::generate(&env);
+        let s3 = Address::generate(&env);
+        token_admin_client.mint(&s1, &3_000);
+        token_admin_client.mint(&s2, &5_000);
+        token_admin_client.mint(&s3, &2_000);
+
+        let id = client.create_pool(&1, &100_000, &token_addr2);
+        client.contribute(&s1, &id, &3_000);
+        client.contribute(&s2, &id, &5_000);
+        client.contribute(&s3, &id, &2_000);
+        client.dissolve_pool(&id);
+
+        let (count, done) = client.batch_refund(&id, &50);
+        assert_eq!(count, 3);
+        assert!(done);
+
+        assert_eq!(token_client.balance(&s1), 3_000);
+        assert_eq!(token_client.balance(&s2), 5_000);
+        assert_eq!(token_client.balance(&s3), 2_000);
+    }
+
+    #[test]
+    fn test_batch_refund_resumable() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr2, token_client, token_admin_client) = create_token(&env, &token_admin);
+        let sponsors: soroban_sdk::Vec<Address> = {
+            let mut v = soroban_sdk::vec![&env];
+            for _ in 0..5 {
+                let s = Address::generate(&env);
+                token_admin_client.mint(&s, &1_000);
+                v.push_back(s);
+            }
+            v
+        };
+
+        let id = client.create_pool(&1, &100_000, &token_addr2);
+        for i in 0..5u32 {
+            client.contribute(&sponsors.get(i).unwrap(), &id, &1_000);
+        }
+        client.dissolve_pool(&id);
+
+        let (count1, done1) = client.batch_refund(&id, &2);
+        assert_eq!(count1, 2);
+        assert!(!done1);
+
+        let (count2, done2) = client.batch_refund(&id, &2);
+        assert_eq!(count2, 2);
+        assert!(!done2);
+
+        let (count3, done3) = client.batch_refund(&id, &2);
+        assert_eq!(count3, 1);
+        assert!(done3);
+
+        for i in 0..5u32 {
+            assert_eq!(token_client.balance(&sponsors.get(i).unwrap()), 1_000);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #11)")]
+    fn test_batch_refund_limit_exceeded() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr2, _, token_admin_client) = create_token(&env, &token_admin);
+        let sponsor = Address::generate(&env);
+        token_admin_client.mint(&sponsor, &1_000);
+
+        let id = client.create_pool(&1, &100_000, &token_addr2);
+        client.contribute(&sponsor, &id, &1_000);
+        client.dissolve_pool(&id);
+
+        // limit = 51 exceeds MAX_BATCH_REFUND (50)
+        client.batch_refund(&id, &51);
+    }
+
+    #[test]
+    fn test_batch_refund_conservation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (_, client, _, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr2, token_client, token_admin_client) = create_token(&env, &token_admin);
+        let s1 = Address::generate(&env);
+        let s2 = Address::generate(&env);
+        let s3 = Address::generate(&env);
+        token_admin_client.mint(&s1, &4_000);
+        token_admin_client.mint(&s2, &3_000);
+        token_admin_client.mint(&s3, &3_000);
+
+        let id = client.create_pool(&1, &100_000, &token_addr2);
+        client.contribute(&s1, &id, &4_000);
+        client.contribute(&s2, &id, &3_000);
+        client.contribute(&s3, &id, &3_000);
+
+        let pool_before = client.get_pool(&id);
+        let total_raised = pool_before.total_raised;
+        assert_eq!(total_raised, 10_000);
+
+        client.dissolve_pool(&id);
+        let (_, done) = client.batch_refund(&id, &50);
+        assert!(done);
+
+        // Sum of all refunds must equal total_raised
+        let refunded = token_client.balance(&s1)
+            + token_client.balance(&s2)
+            + token_client.balance(&s3);
+        assert_eq!(refunded, total_raised);
     }
 }
 
