@@ -19,6 +19,21 @@ function addressToString(address: AddressParam): string {
 }
 
 /**
+ * Map a contract-level `TermsSnapshotMismatch` failure to a typed
+ * {@link TermsSnapshotMismatchError}, preserving the original error otherwise.
+ */
+function toTermsSnapshotMismatch(
+  err: unknown,
+  provided: TermsSnapshot
+): unknown {
+  const message = err instanceof Error ? err.message : String(err);
+  if (/TermsSnapshotMismatch|terms snapshot/i.test(message)) {
+    return new TermsSnapshotMismatchError(message, { provided });
+  }
+  return err;
+}
+
+/**
  * Campaign lifecycle status.
  *
  * Mirrors the `CampaignStatus` enum in the on-chain contract.
@@ -68,7 +83,67 @@ export const CampaignFundingErrors: Record<number, { message: string }> = {
   17: { message: "StreamContractNotSet" },
   18: { message: "RewardsAlreadyStreamed" },
   19: { message: "CampaignNotClaimed" },
+  20: { message: "TermsSnapshotMismatch" },
 };
+
+/**
+ * A verifiable snapshot of the donor-facing terms shown before signing.
+ *
+ * The `hash` is the content hash (e.g. SHA-256 hex) of the exact terms text
+ * presented to the contributor. The contract stores it alongside the
+ * contribution so the terms can be audited later.
+ */
+export interface TermsSnapshot {
+  /** Monotonic version of the terms document (as published by the operator). */
+  version: number;
+  /** Content hash of the exact terms shown to the contributor. */
+  hash: string;
+}
+
+/**
+ * Thrown when the terms snapshot supplied with a contribution does not match
+ * the terms version/hash currently published on-chain.
+ *
+ * Recovery: re-fetch the current terms via {@link CampaignFundingClient.getTermsSnapshot},
+ * re-display them to the contributor, and retry the contribution with the
+ * refreshed snapshot.
+ */
+export class TermsSnapshotMismatchError extends Error {
+  public readonly code = 20;
+  public readonly expected?: TermsSnapshot;
+  public readonly provided?: TermsSnapshot;
+
+  constructor(
+    message = "Terms snapshot does not match the published terms",
+    details?: { expected?: TermsSnapshot; provided?: TermsSnapshot }
+  ) {
+    super(message);
+    this.name = "TermsSnapshotMismatchError";
+    this.expected = details?.expected;
+    this.provided = details?.provided;
+  }
+}
+
+/**
+ * Normalise a terms snapshot argument, validating its shape.
+ *
+ * @throws {TermsSnapshotMismatchError} If the snapshot is malformed.
+ */
+function normalizeTermsSnapshot(snapshot: TermsSnapshot): TermsSnapshot {
+  if (
+    !snapshot ||
+    typeof snapshot.hash !== "string" ||
+    snapshot.hash.length === 0 ||
+    !Number.isInteger(snapshot.version) ||
+    snapshot.version < 0
+  ) {
+    throw new TermsSnapshotMismatchError(
+      "Invalid terms snapshot: version must be a non-negative integer and hash must be a non-empty string",
+      { provided: snapshot }
+    );
+  }
+  return { version: snapshot.version, hash: snapshot.hash };
+}
 
 /**
  * High-level client for interacting with the campaign-funding contract.
@@ -171,6 +246,14 @@ export class CampaignFundingClient {
   /**
    * Contribute tokens to an active campaign.
    *
+   * The `terms` snapshot binds the contribution to the exact donor-facing
+   * terms shown before signing. The contract rejects the contribution with
+   * `TermsSnapshotMismatch` if the snapshot does not match the published
+   * terms; in that case a {@link TermsSnapshotMismatchError} is thrown so the
+   * caller can re-fetch the terms and retry.
+   *
+   * @throws {TermsSnapshotMismatchError} If the terms snapshot is malformed or
+   *   does not match the published terms (retry with a refreshed snapshot).
    * @throws {FundableStellarError} If the campaign is not active, amount is
    *   invalid, or the contribution would exceed the hard cap.
    */
@@ -178,35 +261,63 @@ export class CampaignFundingClient {
     contributor: AddressParam;
     campaign_id: bigint;
     amount: bigint;
+    terms: TermsSnapshot;
   }): Promise<AssembledTransaction<null>> {
+    const terms = normalizeTermsSnapshot(params.terms);
     return executeWithErrorHandling(
       () =>
         this.client.contribute({
           contributor: addressToString(params.contributor),
           campaign_id: params.campaign_id,
           amount: params.amount,
+          terms_version: terms.version,
+          terms_hash: terms.hash,
         }),
       "Contribute to campaign"
-    );
+    ).catch((err: unknown) => {
+      throw toTermsSnapshotMismatch(err, terms);
+    });
   }
 
   /**
    * Contribute without including the sponsor address in the contribution event.
    * The transaction signer and contract ledger storage remain publicly visible.
+   *
+   * As with {@link contribute}, the `terms` snapshot is recorded on-chain and
+   * a mismatch surfaces as a {@link TermsSnapshotMismatchError}.
    */
   public async contributeAnonymously(params: {
     contributor: AddressParam;
     campaign_id: bigint;
     amount: bigint;
+    terms: TermsSnapshot;
   }): Promise<AssembledTransaction<null>> {
+    const terms = normalizeTermsSnapshot(params.terms);
     return executeWithErrorHandling(
       () =>
         this.client.contribute_anonymously({
           contributor: addressToString(params.contributor),
           campaign_id: params.campaign_id,
           amount: params.amount,
+          terms_version: terms.version,
+          terms_hash: terms.hash,
         }),
       "Contribute anonymously to campaign"
+    ).catch((err: unknown) => {
+      throw toTermsSnapshotMismatch(err, terms);
+    });
+  }
+
+  /**
+   * Fetch the currently published donor-facing terms snapshot.
+   *
+   * Use this to obtain the `version`/`hash` to pass to {@link contribute}
+   * (and to refresh after a {@link TermsSnapshotMismatchError}).
+   */
+  public async getTermsSnapshot(): Promise<AssembledTransaction<TermsSnapshot>> {
+    return executeWithErrorHandling(
+      () => this.client.get_terms_snapshot(),
+      "Get terms snapshot"
     );
   }
 

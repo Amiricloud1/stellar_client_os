@@ -148,6 +148,144 @@ export interface ReceiptVerification {
 }
 
 /**
+ * Source references for a receipt (issue #238).
+ *
+ * A sponsor portfolio reconciles committed, matched and settled value against
+ * authoritative records. Every receipt therefore exposes the three handles a
+ * reconciliation needs: the receipt id (the human-facing handle), the
+ * commitment (what the ledger memo must carry) and the transaction hash (the
+ * authoritative ledger record, once one is known). `transactionHash` is `null`
+ * until the receipt has been matched to a chain transaction, which is what lets
+ * the portfolio distinguish "committed but not yet settled" from "settled".
+ */
+export interface SponsorshipReceiptSourceRefs {
+  campaignId: string;
+  receiptId: string;
+  receiptHash: string;
+  transactionHash: string | null;
+}
+
+/**
+ * Reconciliation state of a receipt against authoritative records.
+ *
+ * - `committed`: the receipt exists but no chain transaction has been matched.
+ * - `matched`: a transaction was found and carries the commitment, but it has
+ *   not been confirmed successful (or the caller has not checked yet).
+ * - `settled`: the transaction succeeded on the ledger and carries the
+ *   commitment — the value is authoritative.
+ * - `failed`: the transaction exists but did not succeed, or the receipt does
+ *   not match the transaction it was matched to. Retrying means re-issuing the
+ *   payment with the same commitment.
+ */
+export type SponsorshipReconciliationState = "committed" | "matched" | "settled" | "failed";
+
+export interface SponsorshipReconciliation {
+  state: SponsorshipReconciliationState;
+  /** True only when the receipt is settled against a successful ledger transaction. */
+  reconciled: boolean;
+  sourceRefs: SponsorshipReceiptSourceRefs;
+  /** Verification status that produced this state, or `null` when unmatched. */
+  verificationStatus: ReceiptVerificationStatus | null;
+  /** Human/operator-facing explanation of the state, including recovery steps. */
+  reason: string | null;
+}
+
+/**
+ * Extract the source references a portfolio aggregation needs from a receipt
+ * and, optionally, the transaction it has been matched to.
+ */
+export function getSponsorshipReceiptSourceRefs(
+  receipt: SponsorshipReceipt,
+  transactionHash?: string | null,
+): SponsorshipReceiptSourceRefs {
+  return {
+    campaignId: receipt.campaignId,
+    receiptId: receipt.receiptId,
+    receiptHash: receipt.receiptHash,
+    transactionHash:
+      typeof transactionHash === "string" && transactionHash.trim().length > 0
+        ? transactionHash.trim().toLowerCase()
+        : null,
+  };
+}
+
+/**
+ * Map a verification result onto an explicit reconciliation state.
+ *
+ * This is the authoritative boundary for the portfolio: a receipt only counts
+ * as settled value when {@link verifySponsorshipReceipt} says `verified`. Every
+ * other outcome is surfaced with a reason and, where recovery is possible, the
+ * step an operator or sponsor should take.
+ */
+export function reconcileSponsorshipReceipt(
+  receipt: SponsorshipReceipt,
+  transaction: ChainTransactionRecord | null,
+  transactionHash?: string,
+): SponsorshipReconciliation {
+  const verification = verifySponsorshipReceipt(receipt, transaction, transactionHash);
+  const sourceRefs = getSponsorshipReceiptSourceRefs(
+    receipt,
+    verification.transactionHash || transactionHash || null,
+  );
+
+  if (verification.status === "verified") {
+    return {
+      state: "settled",
+      reconciled: true,
+      sourceRefs,
+      verificationStatus: verification.status,
+      reason: null,
+    };
+  }
+
+  if (verification.status === "not_found") {
+    return {
+      state: "committed",
+      reconciled: false,
+      sourceRefs,
+      verificationStatus: verification.status,
+      reason:
+        "Committed but not yet matched to a ledger transaction. Retry once the payment is submitted, or re-submit it with the receipt commitment as a hash memo.",
+    };
+  }
+
+  if (verification.status === "transaction_failed") {
+    return {
+      state: "failed",
+      reconciled: false,
+      sourceRefs,
+      verificationStatus: verification.status,
+      reason:
+        "The matched transaction did not succeed on the ledger. Re-issue the payment with the same receipt commitment; the commitment does not change.",
+    };
+  }
+
+  if (verification.status === "receipt_mismatch") {
+    return {
+      state: "failed",
+      reconciled: false,
+      sourceRefs,
+      verificationStatus: verification.status,
+      reason:
+        "The receipt was altered after it was issued and cannot be reconciled. Re-issue the receipt from the original sponsorship payload.",
+    };
+  }
+
+  // memo_mismatch / unsupported_memo: a transaction was found but does not
+  // carry this receipt's commitment, so it cannot be counted as settled value.
+  return {
+    state: "matched",
+    reconciled: false,
+    sourceRefs,
+    verificationStatus: verification.status,
+    reason:
+      verification.reason ??
+      "A transaction was matched but does not carry this receipt's commitment. Re-check the memo, or re-submit the payment with the commitment as a hash memo.",
+  };
+}
+=======
+
+/**
  * Sort object keys recursively so two structurally equal receipts always
  * serialize identically, whatever order their properties were written in.
  */
@@ -664,6 +802,12 @@ export function buildMockReceiptTransaction(
  * The order of the checks is the order a reader cares about: is the receipt
  * itself intact, does the transaction exist, did it succeed, and does it carry
  * the commitment. `verified` is true only when all of them pass.
+ *
+ * Reconciliation (issue #238): this is the authoritative boundary for the
+ * sponsor portfolio. {@link reconcileSponsorshipReceipt} maps the result onto
+ * an explicit committed/matched/settled/failed state and exposes the source
+ * references (receipt id, commitment, transaction hash) a portfolio needs to
+ * reconcile committed, matched and settled value against ledger records.
  */
 export function verifySponsorshipReceipt(
   receipt: SponsorshipReceipt,
