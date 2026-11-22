@@ -2,6 +2,7 @@
 resolver = "2"
 
 members = [
+    "operation-registry",
     "payment-stream",
     "distributor",
     "nft-stream",
