@@ -20,81 +20,53 @@ import {
 export type { ContractEventRaw };
 
 /**
- * Sponsorship-related event types that feed the sponsor portfolio
- * reconciliation. These events carry the authoritative on-chain value
- * (committed, matched, settled) that must be reconciled against
- * off-chain records.
+ * Canonical mapping of a single raw contract event to a projection.
+ *
+ * Every raw event produces exactly one mapping entry, so unknown or
+ * unsupported event versions are retained (with their raw payload)
+ * rather than silently dropped.
+ *
+ * - `kind: "parsed"` — the event matched a supported schema version and
+ *   `event` holds the typed projection.
+ * - `kind: "unknown"` — the event could not be mapped (unknown event
+ *   name, unsupported version, or malformed payload). `raw` holds the
+ *   original event so callers can persist, forward, or alert on it.
  */
-export const SPONSORSHIP_EVENT_TYPES = [
-  "SponsorshipCommitted",
-  "SponsorshipMatched",
-  "SponsorshipSettled",
-  "SponsorshipRefunded",
-] as const;
-
-export type SponsorshipEventType = (typeof SPONSORSHIP_EVENT_TYPES)[number];
+export type ContractEventMapping =
+  | {
+      kind: "parsed";
+      /** Event name as reported by the contract (e.g. "StreamDeposit"). */
+      eventName: string;
+      /** Schema version reported by the contract, when present. */
+      version?: string;
+      /** Typed projection of the event. */
+      event: PaymentStreamContractEvent;
+      /** Original raw event, retained for auditability. */
+      raw: ContractEventRaw;
+    }
+  | {
+      kind: "unknown";
+      /** Event name as reported by the contract, when present. */
+      eventName?: string;
+      /** Schema version reported by the contract, when present. */
+      version?: string;
+      /** Reason the event could not be mapped. */
+      reason: "unsupported-event" | "unsupported-version" | "malformed-payload";
+      /** Original raw event, retained so nothing is lost. */
+      raw: ContractEventRaw;
+    };
 
 /**
- * A decoded sponsorship event surfaced for portfolio reconciliation.
- * `sourceRef` points back to the authoritative on-chain record
- * (transaction hash + event index) so operators can audit each value.
+ * Reads the event name from a raw contract event, tolerating the
+ * different shapes the RPC may return.
  */
-export interface SponsorshipEvent {
-  /** Sponsorship event type. */
-  type: SponsorshipEventType;
-  /** Contract that emitted the event. */
-  contractId: string;
-  /** Ledger at which the event was emitted. */
-  ledger: number;
-  /** Transaction hash of the emitting transaction. */
-  txHash: string;
-  /** Index of the event within its transaction (source reference). */
-  eventIndex: number;
-  /** Campaign the sponsorship belongs to, when present in the payload. */
-  campaignId?: string;
-  /** Sponsor account, when present in the payload. */
-  sponsor?: string;
-  /** Amount in stroops, when present in the payload. */
-  amount?: bigint;
-  /** Raw payload for downstream reconciliation. */
-  payload: Record<string, unknown>;
-}
-
-/**
- * Reconciliation status for a single sponsorship event.
- * - `reconciled`: matched to an authoritative record.
- * - `unreconciled`: decoded but no authoritative record matched yet.
- * - `partial`: some fields (e.g. amount) could not be decoded.
- */
-export type SponsorshipReconciliationStatus =
-  | "reconciled"
-  | "unreconciled"
-  | "partial";
-
-/**
- * Result of decoding sponsorship events for portfolio reconciliation.
- */
-export interface SponsorshipEventConsumptionResult {
-  /** Total events retrieved from the RPC. */
-  totalRetrieved: number;
-  /** Successfully decoded sponsorship events. */
-  sponsorshipEvents: SponsorshipEvent[];
-  /** Events that decoded but are missing required fields (`partial`). */
-  partialEvents: SponsorshipEvent[];
-  /** Events that could not be decoded at all. */
-  unparsedEvents: ContractEventRaw[];
-  /** Whether the caller should retry to obtain a complete picture. */
-  retryable: boolean;
-  /** Human-readable reason when `retryable` is true. */
-  retryReason?: string;
-}
-
-function readString(
-  payload: Record<string, unknown>,
-  ...keys: string[]
-): string | undefined {
-  for (const key of keys) {
-    const value = payload[key];
+function readEventName(event: ContractEventRaw): string | undefined {
+  const candidate = event as unknown as {
+    eventName?: unknown;
+    name?: unknown;
+    type?: unknown;
+  };
+  for (const value of [candidate.eventName, candidate.name, candidate.type]) {
     if (typeof value === "string" && value.length > 0) {
       return value;
     }
@@ -102,136 +74,76 @@ function readString(
   return undefined;
 }
 
-function readAmount(
-  payload: Record<string, unknown>,
-  ...keys: string[]
-): bigint | undefined {
-  for (const key of keys) {
-    const value = payload[key];
-    if (typeof value === "bigint") {
+/**
+ * Reads the schema version from a raw contract event, when present.
+ */
+function readEventVersion(event: ContractEventRaw): string | undefined {
+  const candidate = event as unknown as {
+    version?: unknown;
+    schemaVersion?: unknown;
+  };
+  for (const value of [candidate.version, candidate.schemaVersion]) {
+    if (typeof value === "string" && value.length > 0) {
       return value;
     }
     if (typeof value === "number" && Number.isFinite(value)) {
-      return BigInt(Math.trunc(value));
-    }
-    if (typeof value === "string" && /^-?\d+$/.test(value)) {
-      return BigInt(value);
+      return String(value);
     }
   }
   return undefined;
 }
 
-function isSponsorshipEventType(type: string): type is SponsorshipEventType {
-  return (SPONSORSHIP_EVENT_TYPES as readonly string[]).includes(type);
+/**
+ * Maps a single raw contract event to its canonical projection.
+ *
+ * Supported event names/versions are projected into typed events.
+ * Anything else is returned as an `unknown` mapping that retains the
+ * raw payload, so consumers can persist or forward it without data loss.
+ *
+ * @param event - Raw contract event from the RPC.
+ * @returns Canonical mapping for the event.
+ */
+export function mapContractEvent(event: ContractEventRaw): ContractEventMapping {
+  const eventName = readEventName(event);
+  const version = readEventVersion(event);
+
+  const parsed = parsePaymentStreamContractEvent(event);
+  if (parsed) {
+    return {
+      kind: "parsed",
+      eventName: eventName ?? parsed.type,
+      version,
+      event: parsed,
+      raw: event,
+    };
+  }
+
+  let reason: "unsupported-event" | "unsupported-version" | "malformed-payload";
+  if (!eventName) {
+    reason = "malformed-payload";
+  } else if (version !== undefined) {
+    reason = "unsupported-version";
+  } else {
+    reason = "unsupported-event";
+  }
+
+  return { kind: "unknown", eventName, version, reason, raw: event };
 }
 
 /**
- * Decodes raw Soroban contract events into sponsorship events used by the
- * sponsor portfolio reconciliation. Unlike {@link consumeContractEvents},
- * this surfaces partial and unreconciled states explicitly so operators can
- * distinguish "no data" from "data we could not fully decode".
+ * Maps a batch of raw contract events to canonical projections.
  *
- * Events that fail to decode are reported in `unparsedEvents`; if any exist
- * the result is marked `retryable` so callers can re-fetch from the RPC
- * (e.g. transient RPC errors or lagging ledgers) before reconciling.
+ * The returned array has the same length and ordering as the input;
+ * unknown events are retained rather than filtered out.
  *
  * @param events - Raw contract events from the RPC.
- * @returns Sponsorship consumption result with explicit failure states.
- *
- * @example
- * ```typescript
- * import { consumeSponsorshipEvents } from "@fundable/sdk";
- *
- * const rawEvents = await server.getEvents({ contractIds: [contractId] });
- * const result = consumeSponsorshipEvents(rawEvents);
- *
- * if (result.retryable) {
- *   console.warn("Retry event fetch:", result.retryReason);
- * }
- * for (const event of result.sponsorshipEvents) {
- *   console.log(event.type, event.amount, event.txHash, event.eventIndex);
- * }
- * ```
+ * @returns One mapping per input event, in input order.
  */
-export function consumeSponsorshipEvents(
+export function mapContractEvents(
   events: readonly ContractEventRaw[] | undefined,
-): SponsorshipEventConsumptionResult {
+): ContractEventMapping[] {
   const rawList = Array.isArray(events) ? events : [];
-
-  const sponsorshipEvents: SponsorshipEvent[] = [];
-  const partialEvents: SponsorshipEvent[] = [];
-  const unparsedEvents: ContractEventRaw[] = [];
-
-  for (const event of rawList) {
-    const parsed = parsePaymentStreamContractEvent(event);
-    if (!parsed) {
-      unparsedEvents.push(event);
-      continue;
-    }
-    if (!isSponsorshipEventType(parsed.type)) {
-      // Not a sponsorship event; ignore for portfolio reconciliation.
-      continue;
-    }
-
-    const payload = (parsed.payload ?? {}) as Record<string, unknown>;
-    const sponsorshipEvent: SponsorshipEvent = {
-      type: parsed.type,
-      contractId: parsed.contractId,
-      ledger: parsed.ledger,
-      txHash: parsed.txHash,
-      eventIndex: parsed.eventIndex,
-      campaignId: readString(payload, "campaign_id", "campaignId"),
-      sponsor: readString(payload, "sponsor", "sponsor_address"),
-      amount: readAmount(payload, "amount", "value"),
-      payload,
-    };
-
-    // A sponsorship event is partial when it lacks the fields required to
-    // reconcile value against authoritative records.
-    const isPartial =
-      sponsorshipEvent.amount === undefined ||
-      sponsorshipEvent.campaignId === undefined;
-
-    if (isPartial) {
-      partialEvents.push(sponsorshipEvent);
-    } else {
-      sponsorshipEvents.push(sponsorshipEvent);
-    }
-  }
-
-  const retryable = unparsedEvents.length > 0;
-  return {
-    totalRetrieved: rawList.length,
-    sponsorshipEvents,
-    partialEvents,
-    unparsedEvents,
-    retryable,
-    retryReason: retryable
-      ? `${unparsedEvents.length} event(s) could not be decoded; retry the fetch before reconciling.`
-      : undefined,
-  };
-}
-
-/**
- * Classifies a decoded sponsorship event against a set of authoritative
- * source references (e.g. `txHash:eventIndex` keys already reconciled).
- * Returns `reconciled` when the reference is present, otherwise
- * `unreconciled`.
- *
- * @param event - Decoded sponsorship event.
- * @param reconciledRefs - Set of `txHash:eventIndex` references already matched.
- * @returns Reconciliation status for the event.
- */
-export function classifySponsorshipEvent(
-  event: SponsorshipEvent,
-  reconciledRefs: ReadonlySet<string>,
-): SponsorshipReconciliationStatus {
-  if (event.amount === undefined || event.campaignId === undefined) {
-    return "partial";
-  }
-  return reconciledRefs.has(`${event.txHash}:${event.eventIndex}`)
-    ? "reconciled"
-    : "unreconciled";
+  return rawList.map((event) => mapContractEvent(event));
 }
 
 /**
@@ -244,6 +156,11 @@ export interface EventConsumptionResult {
   parsedEvents: PaymentStreamContractEvent[];
   /** Events that could not be parsed (unknown or malformed). */
   unparsedEvents: ContractEventRaw[];
+  /**
+   * Canonical mapping for every retrieved event, in input order.
+   * Unknown events are retained here with their raw payloads.
+   */
+  mappings: ContractEventMapping[];
   /** Cursor/token for pagination (if supported by the RPC). */
   cursor?: string;
 }
@@ -253,8 +170,17 @@ export interface EventConsumptionResult {
  * Returns both successfully parsed events and any that could not be
  * parsed, so callers can decide how to handle unknown event types.
  *
+ * Compatibility guarantees:
+ * - Every retrieved event appears exactly once in `mappings`, in input
+ *   order, regardless of whether it is a supported version.
+ * - Unknown event names, unsupported schema versions, and malformed
+ *   payloads are retained in `unparsedEvents` and as `kind: "unknown"`
+ *   mappings with their original raw payload. Nothing is dropped.
+ * - `parsedEvents` contains only supported projections; its contents are
+ *   unchanged from previous releases.
+ *
  * @param events - Raw contract events from the RPC.
- * @returns Consumption result with parsed and unparsed events.
+ * @returns Consumption result with parsed, unparsed, and mapped events.
  *
  * @example
  * ```typescript
@@ -267,8 +193,13 @@ export interface EventConsumptionResult {
  *   console.log(`${event.type} on ${event.contractId}:`, event.payload);
  * }
  *
- * if (result.unparsedEvents.length > 0) {
- *   console.warn(`${result.unparsedEvents.length} events could not be parsed`);
+ * for (const mapping of result.mappings) {
+ *   if (mapping.kind === "unknown") {
+ *     console.warn(
+ *       `Unmapped event ${mapping.eventName ?? "<unnamed>"} ` +
+ *         `(version ${mapping.version ?? "n/a"}): ${mapping.reason}`,
+ *     );
+ *   }
  * }
  * ```
  */
@@ -279,11 +210,13 @@ export function consumeContractEvents(
 
   const parsedEvents: PaymentStreamContractEvent[] = [];
   const unparsedEvents: ContractEventRaw[] = [];
+  const mappings: ContractEventMapping[] = [];
 
   for (const event of rawList) {
-    const parsed = parsePaymentStreamContractEvent(event);
-    if (parsed) {
-      parsedEvents.push(parsed);
+    const mapping = mapContractEvent(event);
+    mappings.push(mapping);
+    if (mapping.kind === "parsed") {
+      parsedEvents.push(mapping.event);
     } else {
       unparsedEvents.push(event);
     }
@@ -293,6 +226,7 @@ export function consumeContractEvents(
     totalRetrieved: rawList.length,
     parsedEvents,
     unparsedEvents,
+    mappings,
   };
 }
 

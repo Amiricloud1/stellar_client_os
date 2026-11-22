@@ -11,6 +11,29 @@ import { z } from 'zod';
  * - Path/query values arrive as strings, so numeric ids are coerced.
  * - Use `parseRequest` to convert a schema result into a consistent
  *   `{ error, code: 'INVALID_INPUT', details }` 400 payload.
+ *
+ * Request budgets (issue #233)
+ * ----------------------------
+ * Oversized bodies, deeply nested lists, and excessive filters are rejected
+ * *before* expensive application or database work. Budgets are expressed as
+ * Zod schemas so the same limits are shared by API routes and forms:
+ *
+ * - `requestBudgetSchema` — the effective limits for a request:
+ *   - `maxBodyBytes` (default `MAX_BODY_BYTES` = 1 MiB)
+ *   - `maxListDepth` (default `MAX_LIST_DEPTH` = 5)
+ *   - `maxFilterCount` (default `MAX_FILTER_COUNT` = 20)
+ * - `filterBudgetSchema` — enforces a maximum number of filters.
+ *
+ * Use `parseRequestBudget` (or `assertRequestBudget`) to obtain the explicit
+ * failure envelope instead of the generic 400:
+ *   `{ error, code: 'REQUEST_TOO_LARGE' | 'REQUEST_BUDGET_EXCEEDED',
+ *      reason, details }`
+ * `REQUEST_TOO_LARGE` maps to HTTP 413, `REQUEST_BUDGET_EXCEEDED` to 422.
+ *
+ * Migration note: previously oversized payloads were either accepted or
+ * surfaced as generic `INVALID_INPUT` 400s. Callers that need to distinguish
+ * budget failures must switch to `parseRequestBudget`; the generic
+ * `parseRequest` behavior is unchanged for backward compatibility.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -83,6 +106,24 @@ export const subscriptionIdParamsSchema = z
   })
   .strict();
 
+/** Donation id (positive integer). */
+export const donationIdSchema = idSchema;
+
+export const donationIdParamsSchema = z
+  .object({
+    donationId: donationIdSchema,
+  })
+  .strict();
+
+/** Reviewer comment id (positive integer). */
+export const commentIdSchema = idSchema;
+
+export const commentIdParamsSchema = z
+  .object({
+    commentId: commentIdSchema,
+  })
+  .strict();
+
 /* -------------------------------------------------------------------------- */
 /* Query params                                                               */
 /* -------------------------------------------------------------------------- */
@@ -94,56 +135,23 @@ export const listCampaignsQuerySchema = paginationSchema;
 export const listSubscriptionsQuerySchema = paginationSchema;
 
 /* -------------------------------------------------------------------------- */
-/* Sponsor portfolio (issue #238)                                             */
+/* Campaign discovery batch (issue #231)                                      */
 /* -------------------------------------------------------------------------- */
 
 /**
- * Reconciliation status of a portfolio line item, comparing committed,
- * matched, and settled value against authoritative records.
- *
- * - `reconciled`: committed, matched, and settled values agree.
- * - `pending`: authoritative records not yet available; retry later.
- * - `mismatch`: values disagree with authoritative records; needs review.
- * - `unavailable`: authoritative source could not be reached.
+ * Hard cap on the number of campaigns a single discovery batch may request.
+ * Services and routes share this limit so batch cost stays bounded.
  */
-export const reconciliationStatusSchema = z.enum([
-  'reconciled',
-  'pending',
-  'mismatch',
-  'unavailable',
-]);
+export const MAX_DISCOVERY_BATCH_SIZE = 100;
 
-export type ReconciliationStatus = z.infer<typeof reconciliationStatusSchema>;
+export const DEFAULT_DISCOVERY_BATCH_SIZE = 20;
 
-/** Source reference pointing at an authoritative record. */
-export const sourceReferenceSchema = z
+export const campaignDiscoveryBatchQuerySchema = z
   .object({
-    source: nonEmptyString.max(100),
-    reference: nonEmptyString.max(200),
-    url: urlSchema.optional(),
-  })
-  .strict();
-
-export type SourceReference = z.infer<typeof sourceReferenceSchema>;
-
-/**
- * Query params for `GET /api/sponsors/:sponsorId/portfolio`.
- *
- * `campaignIds` filters to specific supported campaigns; `status` filters by
- * reconciliation status. Both are optional and additive.
- */
-export const sponsorPortfolioQuerySchema = z
-  .object({
-    cursor: nonEmptyString.optional(),
-    limit: z.coerce
-      .number()
-      .int()
-      .min(1)
-      .max(MAX_PAGE_LIMIT)
-      .default(DEFAULT_PAGE_LIMIT),
-    campaignIds: z
+    // Explicit campaign ids to fetch. Bounded to avoid unbounded IN clauses.
+    ids: z
       .union([
-        z.array(campaignIdSchema),
+        z.array(idSchema),
         z
           .string()
           .trim()
@@ -153,89 +161,91 @@ export const sponsorPortfolioQuerySchema = z
               .split(',')
               .map((part) => part.trim())
               .filter((part) => part.length > 0),
-          )
-          .pipe(z.array(campaignIdSchema).min(1)),
+          ),
       ])
+      .pipe(z.array(idSchema).min(1).max(MAX_DISCOVERY_BATCH_SIZE))
       .optional(),
-    status: reconciliationStatusSchema.optional(),
+    cursor: nonEmptyString.optional(),
+    limit: z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_DISCOVERY_BATCH_SIZE)
+      .default(DEFAULT_DISCOVERY_BATCH_SIZE),
   })
   .strict();
 
-export type SponsorPortfolioQueryInput = z.infer<
-  typeof sponsorPortfolioQuerySchema
+export type CampaignDiscoveryBatchInput = z.infer<
+  typeof campaignDiscoveryBatchQuerySchema
 >;
 
 /* -------------------------------------------------------------------------- */
-/* Transaction confirmation timeline (issue #239)                             */
+/* Campaign export jobs (issue #228)                                          */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Lifecycle states of a transaction, ordered from wallet approval through
- * settlement. Clients render these as a timeline and use them to recover
- * after a reload.
- *
- * - `awaiting_approval`: wallet approval requested, not yet granted.
- * - `approved`: wallet approved; not yet submitted.
- * - `submitted`: submitted to the network; awaiting ledger confirmation.
- * - `confirmed`: included in a ledger.
- * - `settled`: final settlement recorded.
- * - `failed`: terminal failure (approval rejected, submission error, etc.).
- */
-export const transactionLifecycleStateSchema = z.enum([
-  'awaiting_approval',
-  'approved',
-  'submitted',
-  'confirmed',
-  'settled',
+export const exportFormatSchema = z.enum(['csv', 'json']);
+
+export type ExportFormat = z.infer<typeof exportFormatSchema>;
+
+export const exportJobStatusSchema = z.enum([
+  'queued',
+  'running',
+  'succeeded',
   'failed',
+  'expired',
 ]);
 
-export type TransactionLifecycleState = z.infer<
-  typeof transactionLifecycleStateSchema
->;
+export type ExportJobStatus = z.infer<typeof exportJobStatusSchema>;
 
-/** A single timeline entry for a transaction lifecycle transition. */
-export const transactionTimelineEventSchema = z
+export const exportJobIdSchema = idSchema;
+
+export const createExportJobBodySchema = z
   .object({
-    state: transactionLifecycleStateSchema,
-    at: isoDateTimeSchema,
-    ledger: z.coerce.number().int().nonnegative().optional(),
-    txHash: nonEmptyString.max(200).optional(),
-    error: nonEmptyString.max(500).optional(),
+    campaignId: campaignIdSchema,
+    format: exportFormatSchema.default('csv'),
   })
   .strict();
 
-export type TransactionTimelineEvent = z.infer<
-  typeof transactionTimelineEventSchema
->;
+export type CreateExportJobInput = z.infer<typeof createExportJobBodySchema>;
 
-/** Path params for transaction timeline endpoints. */
-export const transactionIdParamsSchema = z
+export const exportJobIdParamsSchema = z
   .object({
-    transactionId: nonEmptyString.max(200),
+    jobId: exportJobIdSchema,
   })
   .strict();
 
-export type TransactionIdParams = z.infer<typeof transactionIdParamsSchema>;
-
-/**
- * Query params for `GET /api/transactions/:transactionId/timeline`.
- *
- * `includeEvents` defaults to true; set to `false` to fetch only the current
- * state (useful for lightweight polling after a reload).
- */
-export const transactionTimelineQuerySchema = z
+export const exportJobStatusQuerySchema = z
   .object({
-    includeEvents: z
-      .enum(['true', 'false'])
-      .transform((value) => value === 'true')
-      .default('true'),
+    // Optional long-poll hint (seconds) for clients waiting on completion.
+    waitSeconds: z.coerce.number().int().min(0).max(30).optional(),
   })
   .strict();
 
-export type TransactionTimelineQueryInput = z.infer<
-  typeof transactionTimelineQuerySchema
->;
+export type ExportJobStatusQuery = z.infer<typeof exportJobStatusQuerySchema>;
+
+export const exportArtifactParamsSchema = z
+  .object({
+    jobId: exportJobIdSchema,
+    // Opaque, unguessable artifact token bound to the job.
+    artifactToken: nonEmptyString.max(256),
+  })
+  .strict();
+
+export type ExportArtifactParams = z.infer<typeof exportArtifactParamsSchema>;
+
+/* -------------------------------------------------------------------------- */
+/* Operator webhook redelivery (issue #230)                                   */
+/* -------------------------------------------------------------------------- */
+
+export const redeliverWebhookBodySchema = z
+  .object({
+    subscriptionId: subscriptionIdSchema,
+    eventId: nonEmptyString.max(256),
+    reason: nonEmptyString.max(500),
+  })
+  .strict();
+
+export type RedeliverWebhookInput = z.infer<typeof redeliverWebhookBodySchema>;
 
 /* -------------------------------------------------------------------------- */
 /* Webhook subscriptions                                                      */
@@ -285,6 +295,153 @@ export const revokeWebhookSubscriptionBodySchema = z
 
 export type RevokeWebhookSubscriptionInput = z.infer<
   typeof revokeWebhookSubscriptionBodySchema
+>;
+
+/* -------------------------------------------------------------------------- */
+/* Donations (issue #176)                                                     */
+/* -------------------------------------------------------------------------- */
+
+/** Lowercase or uppercase 64-character hex digest (sha256). */
+export const termsSnapshotHashSchema = z
+  .string()
+  .trim()
+  .regex(/^[0-9a-fA-F]{64}$/, 'must be a 64-character hex string');
+
+/**
+ * A contribution MUST be bound to the exact terms the donor saw before
+ * signing. `termsSnapshotHash` is the content hash of those terms and
+ * `termsVersion` identifies the published version they came from.
+ */
+export const createDonationBodySchema = z
+  .object({
+    streamId: streamIdSchema,
+    amount: z.coerce.number().positive(),
+    termsSnapshotHash: termsSnapshotHashSchema,
+    termsVersion: nonEmptyString.max(100),
+  })
+  .strict();
+
+export type CreateDonationInput = z.infer<typeof createDonationBodySchema>;
+
+/* -------------------------------------------------------------------------- */
+/* Reviewer comments (issue #178)                                             */
+/* -------------------------------------------------------------------------- */
+
+export const commentResolutionStatusSchema = z.enum([
+  'open',
+  'resolved',
+  'dismissed',
+]);
+
+export type CommentResolutionStatus = z.infer<
+  typeof commentResolutionStatusSchema
+>;
+
+export const COMMENT_BODY_MAX_LENGTH = 5_000;
+
+/**
+ * A reviewer comment is anchored to a specific evidence version so that
+ * attribution and discussion remain reproducible.
+ */
+export const createReviewerCommentBodySchema = z
+  .object({
+    evidenceId: nonEmptyString.max(200),
+    evidenceVersion: z.coerce.number().int().positive(),
+    body: nonEmptyString.max(COMMENT_BODY_MAX_LENGTH),
+  })
+  .strict();
+
+export type CreateReviewerCommentInput = z.infer<
+  typeof createReviewerCommentBodySchema
+>;
+
+export const resolveReviewerCommentBodySchema = z
+  .object({
+    resolutionStatus: commentResolutionStatusSchema,
+    resolutionNote: nonEmptyString.max(COMMENT_BODY_MAX_LENGTH).optional(),
+  })
+  .strict();
+
+export type ResolveReviewerCommentInput = z.infer<
+  typeof resolveReviewerCommentBodySchema
+>;
+
+/* -------------------------------------------------------------------------- */
+/* Pre-launch readiness checklist (issue #179)                                */
+/* -------------------------------------------------------------------------- */
+
+export const readinessNetworkSchema = z.enum(['mainnet', 'testnet', 'futurenet']);
+
+export const readinessAssetSchema = z
+  .object({
+    code: nonEmptyString.max(12),
+    issuer: nonEmptyString.max(100).optional(),
+  })
+  .strict();
+
+export const readinessMilestoneSchema = z
+  .object({
+    title: nonEmptyString.max(200),
+    targetDate: isoDateTimeSchema,
+    amount: z.coerce.number().positive(),
+  })
+  .strict();
+
+export const readinessPayoutTermsSchema = z
+  .object({
+    currency: nonEmptyString.max(12),
+    schedule: nonEmptyString.max(200),
+    termsSnapshotHash: termsSnapshotHashSchema,
+  })
+  .strict();
+
+/**
+ * Request body for validating a campaign before deployment. All sections are
+ * required so that missing metadata, network, assets, milestones, or payout
+ * terms surface as explicit validation errors.
+ */
+export const readinessChecklistBodySchema = z
+  .object({
+    metadata: z
+      .object({
+        title: nonEmptyString.max(200),
+        description: nonEmptyString.max(5_000),
+      })
+      .strict(),
+    network: readinessNetworkSchema,
+    assets: z.array(readinessAssetSchema).min(1),
+    milestones: z.array(readinessMilestoneSchema).min(1),
+    payoutTerms: readinessPayoutTermsSchema,
+  })
+  .strict();
+
+export type ReadinessChecklistInput = z.infer<
+  typeof readinessChecklistBodySchema
+>;
+
+export const readinessChecklistItemStatusSchema = z.enum([
+  'pass',
+  'fail',
+  'warning',
+]);
+
+export const readinessChecklistItemSchema = z
+  .object({
+    id: nonEmptyString,
+    status: readinessChecklistItemStatusSchema,
+    message: nonEmptyString,
+  })
+  .strict();
+
+export const readinessChecklistResponseSchema = z
+  .object({
+    ready: z.boolean(),
+    items: z.array(readinessChecklistItemSchema),
+  })
+  .strict();
+
+export type ReadinessChecklistResponse = z.infer<
+  typeof readinessChecklistResponseSchema
 >;
 
 /* -------------------------------------------------------------------------- */

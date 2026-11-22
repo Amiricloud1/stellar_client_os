@@ -29,6 +29,49 @@ export interface TransactionConfig {
   rpcUrl?: string;
 }
 
+/**
+ * Asset descriptor used for pre-launch readiness checks.
+ *
+ * `code` is the asset code (e.g. "XLM", "USDC"); `issuer` is required for
+ * non-native assets and must be a valid Stellar account ID.
+ */
+export interface AssetConfig {
+  code: string;
+  issuer?: string;
+  native?: boolean;
+}
+
+/**
+ * Network readiness input for pre-launch validation.
+ */
+export interface NetworkReadinessConfig {
+  networkPassphrase: string;
+  rpcUrl?: string;
+  customNetwork?: CustomNetworkConfig;
+}
+
+/**
+ * Result of a single readiness check.
+ */
+export interface ReadinessCheckResult {
+  name: string;
+  passed: boolean;
+  message?: string;
+}
+
+/**
+ * Aggregated readiness report. `ready` is true only when every check passed.
+ */
+export interface ReadinessReport {
+  ready: boolean;
+  checks: ReadinessCheckResult[];
+  failures: ReadinessCheckResult[];
+}
+
+const NATIVE_ASSET_CODE = 'XLM';
+const ASSET_CODE_PATTERN = /^[A-Za-z0-9]{1,12}$/;
+=======
+
 export class ConfigurationError extends Error {
   constructor(message: string) {
     super(message);
@@ -142,6 +185,153 @@ export function validateContractConfig(config: ContractConfig): void {
 
   if (config.rpcUrl && config.networkPassphrase) {
     assertNetworkCompatibility(config.rpcUrl, config.networkPassphrase);
+  }
+}
+
+/**
+ * Validates a single asset descriptor for deployment readiness.
+ *
+ * Native assets (XLM) must not declare an issuer. Non-native assets require a
+ * 1-12 character alphanumeric code and a valid Stellar issuer account.
+ */
+export function assertSupportedAsset(asset: AssetConfig, context?: string): void {
+  const prefix = context ? `${context}: ` : '';
+
+  if (!asset || typeof asset.code !== 'string' || asset.code.trim() === '') {
+    throw new ConfigurationError(`${prefix}Asset requires a non-empty "code".`);
+  }
+
+  const isNative = asset.native === true || asset.code.toUpperCase() === NATIVE_ASSET_CODE;
+
+  if (isNative) {
+    if (asset.issuer) {
+      throw new ConfigurationError(
+        `${prefix}Native asset "${asset.code}" must not declare an issuer.`
+      );
+    }
+    return;
+  }
+
+  if (!ASSET_CODE_PATTERN.test(asset.code)) {
+    throw new ConfigurationError(
+      `${prefix}Invalid asset code "${asset.code}". Must be 1-12 alphanumeric characters.`
+    );
+  }
+
+  if (!asset.issuer) {
+    throw new ConfigurationError(
+      `${prefix}Non-native asset "${asset.code}" requires an issuer account.`
+    );
+  }
+
+  assertValidAccountId(asset.issuer, `${prefix}Asset "${asset.code}" issuer`);
+}
+
+/**
+ * Validates a list of assets, rejecting empty lists and unsupported entries.
+ */
+export function assertSupportedAssets(assets: AssetConfig[], context?: string): void {
+  const prefix = context ? `${context}: ` : '';
+
+  if (!Array.isArray(assets) || assets.length === 0) {
+    throw new ConfigurationError(`${prefix}At least one supported asset is required.`);
+  }
+
+  const seen = new Set<string>();
+  for (const asset of assets) {
+    assertSupportedAsset(asset, context);
+    const key = `${asset.code.toUpperCase()}:${asset.issuer ?? ''}`;
+    if (seen.has(key)) {
+      throw new ConfigurationError(`${prefix}Duplicate asset "${asset.code}".`);
+    }
+    seen.add(key);
+  }
+}
+
+/**
+ * Validates network readiness: passphrase presence, custom network completeness,
+ * and RPC/passphrase compatibility.
+ */
+export function assertNetworkReady(config: NetworkReadinessConfig, context?: string): void {
+  const prefix = context ? `${context}: ` : '';
+
+  if (!config) {
+    throw new ConfigurationError(`${prefix}Network configuration is required.`);
+  }
+
+  if (!config.networkPassphrase || config.networkPassphrase.trim() === '') {
+    throw new ConfigurationError(`${prefix}Network requires a non-empty networkPassphrase.`);
+  }
+
+  if (config.customNetwork) {
+    const { name, passphrase, rpcUrl } = config.customNetwork;
+    if (!name || !passphrase || !rpcUrl) {
+      throw new ConfigurationError(
+        `${prefix}CustomNetworkConfig must include "name", "passphrase", and "rpcUrl".`
+      );
+    }
+    if (passphrase !== config.networkPassphrase) {
+      throw new ConfigurationError(
+        `${prefix}Custom network passphrase does not match the configured networkPassphrase.`
+      );
+    }
+    assertSecureRpcUrl(rpcUrl);
+    return;
+  }
+
+  if (config.rpcUrl) {
+    assertNetworkCompatibility(config.rpcUrl, config.networkPassphrase);
+  }
+}
+
+/**
+ * Runs all pre-launch readiness checks and returns an aggregated report
+ * instead of throwing. Use this to surface every failure to operators at once.
+ */
+export function checkDeploymentReadiness(input: {
+  network: NetworkReadinessConfig;
+  assets: AssetConfig[];
+  contractId?: string;
+}): ReadinessReport {
+  const checks: ReadinessCheckResult[] = [];
+
+  const run = (name: string, fn: () => void): void => {
+    try {
+      fn();
+      checks.push({ name, passed: true });
+    } catch (error) {
+      checks.push({
+        name,
+        passed: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
+  run('network', () => assertNetworkReady(input.network, 'Readiness'));
+  run('assets', () => assertSupportedAssets(input.assets, 'Readiness'));
+  if (input.contractId !== undefined) {
+    run('contractId', () => assertValidContractId(input.contractId, 'Readiness'));
+  }
+
+  const failures = checks.filter((check) => !check.passed);
+  return { ready: failures.length === 0, checks, failures };
+}
+
+/**
+ * Throws a ConfigurationError summarizing all failed readiness checks.
+ */
+export function assertDeploymentReady(input: {
+  network: NetworkReadinessConfig;
+  assets: AssetConfig[];
+  contractId?: string;
+}): void {
+  const report = checkDeploymentReadiness(input);
+  if (!report.ready) {
+    const details = report.failures
+      .map((failure) => `- ${failure.name}: ${failure.message ?? 'failed'}`)
+      .join('\n');
+    throw new ConfigurationError(`Deployment readiness checks failed:\n${details}`);
   }
 }
 

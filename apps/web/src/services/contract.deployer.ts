@@ -10,10 +10,40 @@ import {
 } from '@stellar/stellar-sdk';
 import { Server as RpcServer, Api, assembleTransaction } from '@stellar/stellar-sdk/rpc';
 import { getStellarServerOptions } from '@/utils/rpc-connection-options';
+import {
+  DeploymentRecord,
+  DeploymentRegistry,
+  DeploymentRegistryError,
+  DeploymentRegistryErrorCode,
+  DeploymentStatus,
+} from './deployment.registry';
 
 interface DeployConfig {
   rpcUrl: string;
   networkPassphrase: string;
+  /**
+   * Optional deployment registry. When provided, every successful deployment is
+   * recorded and the resulting {@link DeploymentRecord} is returned to callers.
+   */
+  registry?: DeploymentRegistry;
+  /** Maximum attempts made when writing to the registry (default: 3). */
+  registryMaxAttempts?: number;
+  /** Base backoff between registry write attempts, in ms (default: 250). */
+  registryRetryDelayMs?: number;
+}
+
+/**
+ * Outcome of a deployment that was also written to the registry.
+ *
+ * - `recorded` — the deployment succeeded and the registry write succeeded.
+ * - `registry_failed` — the deployment succeeded on-chain but the registry
+ *   write failed after all retries. Callers should surface this to operators
+ *   and retry via {@link ContractDeployer.recordDeployment}.
+ */
+export interface DeploymentOutcome {
+  state: 'recorded' | 'registry_failed';
+  record: DeploymentRecord;
+  registryError?: DeploymentRegistryError;
 }
 
 /**
@@ -61,6 +91,7 @@ export type CompilationErrorCode =
   | 'COMPILATION_TIMEOUT'
   | 'COMPILATION_OUTPUT_TOO_LARGE';
 
+
 export class CompilationLimitError extends Error {
   readonly code: CompilationErrorCode;
 
@@ -70,6 +101,269 @@ export class CompilationLimitError extends Error {
     this.code = code;
   }
 }
+
+/**
+ * Categories of pre-launch readiness checks. Each category is validated
+ * independently so operators can see exactly what must be fixed before a
+ * campaign can be deployed.
+ */
+export type ReadinessCategory =
+  | 'metadata'
+  | 'network'
+  | 'assetSupport'
+  | 'milestones'
+  | 'payoutTerms';
+
+export const READINESS_CATEGORIES: readonly ReadinessCategory[] = Object.freeze([
+  'metadata',
+  'network',
+  'assetSupport',
+  'milestones',
+  'payoutTerms',
+]);
+
+/**
+ * A single item in the pre-launch readiness checklist.
+ *
+ * - `category`  — Which readiness area the item belongs to.
+ * - `id`        — Stable identifier for the check (safe to branch on).
+ * - `passed`    — Whether the check succeeded.
+ * - `message`   — Human-readable, operator-facing explanation.
+ */
+export interface ReadinessCheckItem {
+  category: ReadinessCategory;
+  id: string;
+  passed: boolean;
+  message: string;
+}
+
+/**
+ * Structured result of a readiness validation run.
+ *
+ * - `ready`  — True only when every check passed.
+ * - `items`  — The full checklist (both passing and failing items).
+ * - `failed` — Convenience list of only the failing items.
+ */
+export interface ReadinessReport {
+  ready: boolean;
+  items: ReadinessCheckItem[];
+  failed: ReadinessCheckItem[];
+}
+
+/**
+ * Campaign metadata required before deployment.
+ */
+export interface CampaignMetadata {
+  name?: string;
+  description?: string;
+  owner?: string;
+}
+
+/**
+ * Milestone definition used for readiness validation.
+ */
+export interface CampaignMilestone {
+  title?: string;
+  amount?: string | number;
+  dueDate?: string | Date;
+}
+
+/**
+ * Payout terms used for readiness validation.
+ */
+export interface PayoutTerms {
+  assetCode?: string;
+  assetIssuer?: string;
+  totalAmount?: string | number;
+  /** Whether the payout asset is a native (XLM) asset. */
+  native?: boolean;
+}
+
+/**
+ * Inputs to the pre-launch readiness validator.
+ */
+export interface CampaignReadinessInput {
+  /** Campaign metadata (name, description, owner). */
+  metadata?: CampaignMetadata;
+  /** Network the campaign will be deployed to. */
+  network?: {
+    networkPassphrase?: string;
+    rpcUrl?: string;
+  };
+  /** Assets the campaign will accept / pay out. */
+  assets?: {
+    supported?: string[];
+    required?: string[];
+  };
+  /** Milestones the campaign defines. */
+  milestones?: CampaignMilestone[];
+  /** Payout terms for the campaign. */
+  payoutTerms?: PayoutTerms;
+  /** Address of the account attempting the deployment (authorization). */
+  deployerAddress?: string;
+  /** Addresses authorized to deploy the campaign. */
+  authorizedDeployers?: string[];
+}
+
+/**
+ * Raised when a deployment is attempted while the readiness checklist has
+ * failing items. Carries the full {@link ReadinessReport} so operators can
+ * surface every problem at once and retry after fixes.
+ */
+export class ReadinessError extends Error {
+  readonly code = 'DEPLOYMENT_NOT_READY' as const;
+  readonly report: ReadinessReport;
+
+  constructor(report: ReadinessReport) {
+    const summary = report.failed
+      .map((item) => `[${item.category}] ${item.message}`)
+      .join('; ');
+    super(`Deployment blocked: campaign is not ready. ${summary}`);
+    this.name = 'ReadinessError';
+    this.report = report;
+  }
+}
+
+/**
+ * Validates campaign readiness before deployment. Returns a structured
+ * checklist covering metadata, network, asset support, milestones, and payout
+ * terms. This is a pure function so it can be reused by the API layer and by
+ * the deployer's authoritative pre-deployment gate.
+ */
+export function validateCampaignReadiness(input: CampaignReadinessInput): ReadinessReport {
+  const items: ReadinessCheckItem[] = [];
+
+  const push = (
+    category: ReadinessCategory,
+    id: string,
+    passed: boolean,
+    message: string
+  ): void => {
+    items.push({ category, id, passed, message });
+  };
+
+  // --- Metadata -----------------------------------------------------------
+  const name = input.metadata?.name?.trim();
+  push(
+    'metadata',
+    'metadata.name',
+    Boolean(name),
+    name ? 'Campaign name is set.' : 'Campaign name is required.'
+  );
+
+  const description = input.metadata?.description?.trim();
+  push(
+    'metadata',
+    'metadata.description',
+    Boolean(description),
+    description ? 'Campaign description is set.' : 'Campaign description is required.'
+  );
+
+  const owner = input.metadata?.owner?.trim();
+  push(
+    'metadata',
+    'metadata.owner',
+    Boolean(owner),
+    owner ? 'Campaign owner is set.' : 'Campaign owner address is required.'
+  );
+
+  // --- Network ------------------------------------------------------------
+  const passphrase = input.network?.networkPassphrase?.trim();
+  push(
+    'network',
+    'network.passphrase',
+    Boolean(passphrase),
+    passphrase
+      ? 'Network passphrase is configured.'
+      : 'Network passphrase is required.'
+  );
+
+  const rpcUrl = input.network?.rpcUrl?.trim();
+  const rpcValid = Boolean(rpcUrl) && /^https?:\/\//i.test(rpcUrl as string);
+  push(
+    'network',
+    'network.rpcUrl',
+    rpcValid,
+    rpcValid
+      ? 'RPC URL is configured.'
+      : 'A valid http(s) RPC URL is required.'
+  );
+
+  // --- Asset support ------------------------------------------------------
+  const supported = input.assets?.supported ?? [];
+  const required = input.assets?.required ?? [];
+  const supportedSet = new Set(supported);
+  const missingAssets = required.filter((asset) => !supportedSet.has(asset));
+  push(
+    'assetSupport',
+    'assets.requiredSupported',
+    required.length > 0 && missingAssets.length === 0,
+    required.length === 0
+      ? 'At least one required asset must be declared.'
+      : missingAssets.length === 0
+        ? 'All required assets are supported.'
+        : `Unsupported required asset(s): ${missingAssets.join(', ')}.`
+  );
+
+  // --- Milestones ---------------------------------------------------------
+  const milestones = input.milestones ?? [];
+  const milestonesValid =
+    milestones.length > 0 &&
+    milestones.every((m) => {
+      const title = m.title?.trim();
+      const amount = Number(m.amount);
+      const hasAmount = Number.isFinite(amount) && amount > 0;
+      const hasDue = Boolean(m.dueDate);
+      return Boolean(title) && hasAmount && hasDue;
+    });
+  push(
+    'milestones',
+    'milestones.valid',
+    milestonesValid,
+    milestones.length === 0
+      ? 'At least one milestone is required.'
+      : milestonesValid
+        ? 'All milestones have a title, positive amount, and due date.'
+        : 'Every milestone must have a title, a positive amount, and a due date.'
+  );
+
+  // --- Payout terms -------------------------------------------------------
+  const terms = input.payoutTerms;
+  const native = terms?.native === true;
+  const assetCode = terms?.assetCode?.trim();
+  const assetIssuer = terms?.assetIssuer?.trim();
+  const totalAmount = Number(terms?.totalAmount);
+  const hasTotal = Number.isFinite(totalAmount) && totalAmount > 0;
+  const assetOk = native ? true : Boolean(assetCode) && Boolean(assetIssuer);
+  const payoutValid = hasTotal && assetOk;
+  push(
+    'payoutTerms',
+    'payoutTerms.valid',
+    payoutValid,
+    !hasTotal
+      ? 'Payout total amount must be a positive number.'
+      : !assetOk
+        ? 'Payout asset code and issuer are required (or mark the asset as native).'
+        : 'Payout terms are complete.'
+  );
+
+  // --- Authorization ------------------------------------------------------
+  const deployer = input.deployerAddress?.trim();
+  const authorized = input.authorizedDeployers ?? [];
+  const authorizedOk =
+    Boolean(deployer) && authorized.length > 0 && authorized.includes(deployer as string);
+  push(
+    'metadata',
+    'authorization.deployer',
+    authorizedOk,
+    authorizedOk
+      ? 'Deployer is authorized.'
+      : 'Deployer address is not authorized to deploy this campaign.'
+  );
+
+  const failed = items.filter((item) => !item.passed);
+  return { ready: failed.length === 0, items, failed };
+}
 =======
 
 export class ContractDeployer {
@@ -77,11 +371,80 @@ export class ContractDeployer {
   private networkPassphrase: string;
   private limits: CompilationLimits;
   private inFlight = 0;
+  private registry?: DeploymentRegistry;
+  private registryMaxAttempts: number;
+  private registryRetryDelayMs: number;
 
   constructor(config: DeployConfig & { limits?: Partial<CompilationLimits> }) {
     this.rpcServer = new RpcServer(config.rpcUrl, getStellarServerOptions(config.rpcUrl));
     this.networkPassphrase = config.networkPassphrase;
     this.limits = { ...DEFAULT_COMPILATION_LIMITS, ...(config.limits ?? {}) };
+    this.registry = config.registry;
+    this.registryMaxAttempts = config.registryMaxAttempts ?? 3;
+    this.registryRetryDelayMs = config.registryRetryDelayMs ?? 250;
+  }
+
+  /**
+   * Records a deployment in the registry, retrying transient failures.
+   *
+   * Throws a {@link DeploymentRegistryError} when the registry is not
+   * configured, the record is invalid, the caller is unauthorized, or all
+   * retry attempts are exhausted. Non-retryable errors (validation,
+   * authorization) fail immediately.
+   */
+  async recordDeployment(record: DeploymentRecord): Promise<DeploymentRecord> {
+    if (!this.registry) {
+      throw new DeploymentRegistryError(
+        'REGISTRY_NOT_CONFIGURED',
+        'No deployment registry is configured for this deployer.'
+      );
+    }
+
+    let lastError: DeploymentRegistryError | undefined;
+    for (let attempt = 1; attempt <= this.registryMaxAttempts; attempt++) {
+      try {
+        return await this.registry.record(record);
+      } catch (err) {
+        const registryError =
+          err instanceof DeploymentRegistryError
+            ? err
+            : new DeploymentRegistryError(
+                'REGISTRY_WRITE_FAILED',
+                err instanceof Error ? err.message : String(err)
+              );
+        lastError = registryError;
+        if (!isRetryableRegistryError(registryError.code) || attempt === this.registryMaxAttempts) {
+          throw registryError;
+        }
+        await new Promise((resolve) =>
+          setTimeout(resolve, this.registryRetryDelayMs * attempt)
+        );
+      }
+    }
+
+    // Unreachable: the loop either returns or throws.
+    throw lastError ?? new DeploymentRegistryError('REGISTRY_WRITE_FAILED', 'Registry write failed.');
+  }
+
+  /**
+   * Records a deployment and converts registry failures into an explicit
+   * {@link DeploymentOutcome} state instead of throwing, so callers can surface
+   * the failure to operators while preserving the on-chain result.
+   */
+  async recordDeploymentOutcome(record: DeploymentRecord): Promise<DeploymentOutcome> {
+    try {
+      const stored = await this.recordDeployment(record);
+      return { state: 'recorded', record: stored };
+    } catch (err) {
+      const registryError =
+        err instanceof DeploymentRegistryError
+          ? err
+          : new DeploymentRegistryError(
+              'REGISTRY_WRITE_FAILED',
+              err instanceof Error ? err.message : String(err)
+            );
+      return { state: 'registry_failed', record, registryError };
+    }
   }
 
   /** Returns the effective compilation limits (read-only copy). */
@@ -403,6 +766,41 @@ export class ContractDeployer {
     return contractAddress;
   }
 
+  /**
+   * Authoritative pre-deployment readiness gate.
+   *
+   * Runs the full pre-launch checklist (metadata, network, asset support,
+   * milestones, payout terms, and deployer authorization) and throws a
+   * {@link ReadinessError} carrying the structured report if any item fails.
+   * This must be called before any deployment transaction is built or
+   * submitted so that invalid campaigns are blocked at the boundary.
+   *
+   * @returns The passing {@link ReadinessReport} when the campaign is ready.
+   */
+  assertReadyForDeployment(input: CampaignReadinessInput): ReadinessReport {
+    const report = validateCampaignReadiness(input);
+    if (!report.ready) {
+      throw new ReadinessError(report);
+    }
+    return report;
+  }
+
+  /**
+   * Builds the create-contract transaction only after the campaign passes the
+   * pre-launch readiness checklist. Fails fast with a {@link ReadinessError}
+   * (and never contacts the network) when the campaign is not ready.
+   */
+  async buildCreateContractTxIfReady(
+    readiness: CampaignReadinessInput,
+    address: string,
+    wasmHash: Buffer,
+    salt?: Buffer,
+    fee: string = '1000',
+  ): Promise<{ transaction: Transaction; simulation: Api.SimulateTransactionSuccessResponse; salt: Buffer }> {
+    this.assertReadyForDeployment(readiness);
+    return this.buildCreateContractTx(address, wasmHash, salt, fee);
+  }
+
   private async getAccount(address: string): Promise<Account> {
     try {
       const account = await this.rpcServer.getAccount(address);
@@ -411,4 +809,43 @@ export class ContractDeployer {
        throw new Error("Wait! Account not found on the network. Is it funded with XLM?");
     }
   }
+}
+
+/**
+ * Registry error codes that are safe to retry. Validation and authorization
+ * failures are terminal and must not be retried.
+ */
+function isRetryableRegistryError(code: DeploymentRegistryErrorCode): boolean {
+  return code === 'REGISTRY_WRITE_FAILED' || code === 'REGISTRY_UNAVAILABLE';
+}
+
+/**
+ * Builds a {@link DeploymentRecord} for a completed deployment.
+ *
+ * The record captures network, address, deployment ledger, spec version, and
+ * lifecycle state as required by the registry contract. `ledger` and
+ * `specVersion` must be supplied by the caller from the confirmed transaction.
+ */
+export function buildDeploymentRecord(params: {
+  networkPassphrase: string;
+  contractId: string;
+  deployerAddress: string;
+  ledger: number;
+  specVersion: string;
+  status?: DeploymentStatus;
+  wasmHash?: string;
+  salt?: string;
+  metadata?: Record<string, string>;
+}): DeploymentRecord {
+  return {
+    network: params.networkPassphrase,
+    contractId: params.contractId,
+    deployer: params.deployerAddress,
+    ledger: params.ledger,
+    specVersion: params.specVersion,
+    status: params.status ?? 'deployed',
+    wasmHash: params.wasmHash,
+    salt: params.salt,
+    metadata: params.metadata,
+  };
 }

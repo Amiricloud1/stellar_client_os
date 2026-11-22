@@ -1,5 +1,31 @@
 #![no_std]
 use crate::Error;
+use soroban_sdk::{panic_with_error, Env};
+
+/// Panic-on-overflow addition, used in contract code with `&env` context.
+#[inline]
+pub fn checked_add(env: &Env, a: i128, b: i128) -> i128 {
+    a.checked_add(b)
+        .unwrap_or_else(|| panic_with_error!(env, Error::ArithmeticOverflow))
+}
+
+/// Panic-on-underflow subtraction (unsigned semantics), used in contract code.
+#[inline]
+pub fn checked_sub(env: &Env, a: i128, b: i128) -> i128 {
+    if b > a {
+        panic_with_error!(env, Error::ArithmeticOverflow);
+    }
+    a.checked_sub(b)
+        .unwrap_or_else(|| panic_with_error!(env, Error::ArithmeticOverflow))
+}
+
+/// Safe amount validation — positive and within `i128::MAX / 2`.
+#[inline]
+pub fn validate_amount(env: &Env, amount: i128) {
+    if amount <= 0 || amount > i128::MAX / 2 {
+        panic_with_error!(env, Error::InvalidAmount);
+    }
+}
 
 /// Safe checked arithmetic library for campaign financial calculations (Issue #850).
 /// Audits all amounts and ensures no overflow occurs across addition, subtraction,
