@@ -21,6 +21,8 @@ export interface StreamHistoryOptions {
   startLedger?: number;
   /** Page size passed to getEvents (default: 100). */
   limit?: number;
+  /** Optional caller-controlled abort signal to cancel polling and reads. */
+  signal?: AbortSignal;
 }
 
 export interface StreamHistoryResult {
@@ -39,7 +41,13 @@ export async function getStreamHistory(
   options: StreamHistoryOptions,
   cursor?: string
 ): Promise<StreamHistoryResult> {
-  const { rpcUrl, contractId, streamId, startLedger, limit = 100 } = options;
+  const { rpcUrl, contractId, streamId, startLedger, limit = 100, signal } = options;
+
+  if (signal?.aborted) {
+    const err = new Error(signal.reason ? String(signal.reason) : "Stream history fetch aborted");
+    err.name = "AbortError";
+    throw err;
+  }
 
   const server = new StellarSdk.rpc.Server(rpcUrl);
 
@@ -100,6 +108,11 @@ export async function getAllStreamHistory(
   let pages = 0;
 
   while (pages < maxPages) {
+    if (options.signal?.aborted) {
+      const err = new Error(options.signal.reason ? String(options.signal.reason) : "Stream history fetch aborted");
+      err.name = "AbortError";
+      throw err;
+    }
     const result = await getStreamHistory(options, cursor);
     allEvents.push(...result.events);
 

@@ -15,6 +15,42 @@ export interface BackupManifestItem {
   sha256: string;
 }
 
+/**
+ * A single retained raw event, captured verbatim so projections can be
+ * deterministically rebuilt from the event log after a restore.
+ */
+export interface RetainedRawEvent {
+  eventId: string;
+  eventType: string;
+  schemaVersion: string;
+  aggregateId: string;
+  sequence: number;
+  occurredAt: string;
+  payload: Record<string, unknown>;
+}
+
+/**
+ * A projection output captured at backup time. Used as the reference output
+ * that a post-restore replay must reproduce exactly before cutover.
+ */
+export interface ProjectionSnapshot {
+  projectionName: string;
+  schemaVersion: string;
+  state: Record<string, unknown>;
+  lastEventSequence: number;
+}
+
+export interface ReplayVerificationResult {
+  projectionName: string;
+  schemaVersion: string;
+  deterministic: boolean;
+  replayedState: Record<string, unknown>;
+  expectedState: Record<string, unknown>;
+  eventsReplayed: number;
+  mismatchPaths: string[];
+  error?: string;
+}
+
 export interface BackupManifest {
   backupId: string;
   version: string;
@@ -58,6 +94,8 @@ export interface RestoreDrillResult {
   rtoSlaMet: boolean;
   fileChecks: RestoreFileCheck[];
   status: 'SUCCESS' | 'INTEGRITY_FAILURE' | 'DECRYPTION_FAILURE' | 'ERROR';
+  replayVerifications: ReplayVerificationResult[];
+  allReplaysDeterministic: boolean;
 }
 
 export interface CreateBackupOptions {
@@ -65,6 +103,10 @@ export interface CreateBackupOptions {
   baseDir: string;
   passphrase: string;
   rpoWindowMinutes?: number;
+  /** Retained raw events used to rebuild projections deterministically. */
+  rawEvents?: RetainedRawEvent[];
+  /** Projection outputs captured at backup time, used as replay reference. */
+  projectionSnapshots?: ProjectionSnapshot[];
 }
 
 export interface RestoreOptions {
@@ -76,6 +118,72 @@ export interface RestoreOptions {
 
 const PBKDF2_ITERATIONS = 100_000;
 const KEY_LEN = 32; // 256 bits
+
+/**
+ * Deterministic projection reducer. Given a projection name and the ordered
+ * raw events, produces the projection state. Must be pure and version-stable
+ * so replays across event-schema versions are reproducible.
+ */
+export type ProjectionReducer = (
+  projectionName: string,
+  events: RetainedRawEvent[]
+) => Record<string, unknown>;
+
+/**
+ * Default reducer: folds events into a per-aggregate sequence map. This is
+ * intentionally simple and deterministic; callers may supply a richer reducer.
+ */
+const defaultProjectionReducer: ProjectionReducer = (_projectionName, events) => {
+  const state: Record<string, unknown> = {};
+  const sorted = [...events].sort((a, b) => a.sequence - b.sequence);
+  for (const event of sorted) {
+    const key = event.aggregateId;
+    const existing = (state[key] as { lastSequence?: number; eventCount?: number }) || {};
+    state[key] = {
+      lastSequence: event.sequence,
+      eventCount: (existing.eventCount ?? 0) + 1,
+    };
+  }
+  return state;
+};
+
+/**
+ * Recursively collects dotted paths where two JSON-like values differ.
+ */
+function collectMismatchPaths(
+  expected: unknown,
+  actual: unknown,
+  prefix: string,
+  out: string[]
+): void {
+  if (expected === actual) return;
+  const bothObjects =
+    expected !== null &&
+    actual !== null &&
+    typeof expected === 'object' &&
+    typeof actual === 'object';
+  if (!bothObjects) {
+    out.push(prefix || '<root>');
+    return;
+  }
+  const expObj = expected as Record<string, unknown>;
+  const actObj = actual as Record<string, unknown>;
+  const keys = new Set([...Object.keys(expObj), ...Object.keys(actObj)]);
+  for (const key of keys) {
+    collectMismatchPaths(expObj[key], actObj[key], prefix ? `${prefix}.${key}` : key, out);
+  }
+}
+
+/**
+ * Stable JSON serialization used for deterministic comparison.
+ */
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(',')}}`;
+}
 
 /**
  * Derives a 256-bit encryption key from a passphrase and salt using PBKDF2-HMAC-SHA256.
@@ -96,7 +204,14 @@ export class BackupRestoreService {
    * Creates an encrypted backup bundle with cryptographic checksums and manifest.
    */
   async createBackup(options: CreateBackupOptions): Promise<EncryptedBackupArchive> {
-    const { sourcePaths, baseDir, passphrase, rpoWindowMinutes = 15 } = options;
+    const {
+      sourcePaths,
+      baseDir,
+      passphrase,
+      rpoWindowMinutes = 15,
+      rawEvents = [],
+      projectionSnapshots = [],
+    } = options;
     const backupId = `bak_${Date.now()}_${randomUUID().slice(0, 8)}`;
     const items: BackupManifestItem[] = [];
     const filesToArchive: Record<string, string> = {}; // relativePath -> base64 content
@@ -143,6 +258,8 @@ export class BackupRestoreService {
     const plaintext = JSON.stringify({
       manifest,
       files: filesToArchive,
+      rawEvents,
+      projectionSnapshots,
     });
 
     const cipher = createCipheriv('aes-256-gcm', key, iv);
@@ -178,7 +295,12 @@ export class BackupRestoreService {
     const drillId = `drill_${Date.now()}_${randomUUID().slice(0, 8)}`;
     await fs.mkdir(isolatedDir, { recursive: true });
 
-    let decryptedPayload: { manifest: BackupManifest; files: Record<string, string> };
+    let decryptedPayload: {
+      manifest: BackupManifest;
+      files: Record<string, string>;
+      rawEvents?: RetainedRawEvent[];
+      projectionSnapshots?: ProjectionSnapshot[];
+    };
 
     try {
       const salt = Buffer.from(archive.saltHex, 'hex');
@@ -208,10 +330,12 @@ export class BackupRestoreService {
         rtoSlaMet: elapsedMs <= rtoTargetMs,
         fileChecks: [],
         status: 'DECRYPTION_FAILURE',
+        replayVerifications: [],
+        allReplaysDeterministic: false,
       };
     }
 
-    const { manifest, files } = decryptedPayload;
+    const { manifest, files, rawEvents = [], projectionSnapshots = [] } = decryptedPayload;
     const fileChecks: RestoreFileCheck[] = [];
     let totalRestoredBytes = 0;
     let allChecksumsMatch = true;
@@ -266,9 +390,14 @@ export class BackupRestoreService {
       });
     }
 
+    // Replay retained raw events to rebuild projections and compare against
+    // the captured reference snapshots before cutover.
+    const replayVerifications = this.replayProjections(rawEvents, projectionSnapshots);
+    const allReplaysDeterministic = replayVerifications.every((r) => r.deterministic);
+
     const elapsedMs = Number((performance.now() - start).toFixed(2));
     const rtoSlaMet = elapsedMs <= rtoTargetMs;
-    const overallSuccess = allChecksumsMatch && allJsonValid;
+    const overallSuccess = allChecksumsMatch && allJsonValid && allReplaysDeterministic;
 
     return {
       drillId,
@@ -283,7 +412,52 @@ export class BackupRestoreService {
       rtoSlaMet,
       fileChecks,
       status: overallSuccess ? 'SUCCESS' : 'INTEGRITY_FAILURE',
+      replayVerifications,
+      allReplaysDeterministic,
     };
+  }
+
+  /**
+   * Deterministically replays retained raw events to rebuild each projection and
+   * compares the result against the captured reference snapshot. A projection is
+   * deterministic only when the replayed state matches the expected state exactly.
+   */
+  replayProjections(
+    rawEvents: RetainedRawEvent[],
+    projectionSnapshots: ProjectionSnapshot[],
+    reducer: ProjectionReducer = defaultProjectionReducer
+  ): ReplayVerificationResult[] {
+    return projectionSnapshots.map((snapshot) => {
+      try {
+        const replayedState = reducer(snapshot.projectionName, rawEvents);
+        const deterministic =
+          stableStringify(replayedState) === stableStringify(snapshot.state);
+        const mismatchPaths: string[] = [];
+        if (!deterministic) {
+          collectMismatchPaths(snapshot.state, replayedState, '', mismatchPaths);
+        }
+        return {
+          projectionName: snapshot.projectionName,
+          schemaVersion: snapshot.schemaVersion,
+          deterministic,
+          replayedState,
+          expectedState: snapshot.state,
+          eventsReplayed: rawEvents.length,
+          mismatchPaths,
+        };
+      } catch (err: unknown) {
+        return {
+          projectionName: snapshot.projectionName,
+          schemaVersion: snapshot.schemaVersion,
+          deterministic: false,
+          replayedState: {},
+          expectedState: snapshot.state,
+          eventsReplayed: 0,
+          mismatchPaths: [],
+          error: (err as Error).message,
+        };
+      }
+    });
   }
 
   /**
@@ -293,7 +467,8 @@ export class BackupRestoreService {
     sourcePaths: string[],
     baseDir: string,
     passphrase: string = 'DrillPassphrase2026!Secure',
-    sandboxDir?: string
+    sandboxDir?: string,
+    replayInputs?: { rawEvents?: RetainedRawEvent[]; projectionSnapshots?: ProjectionSnapshot[] }
   ): Promise<RestoreDrillResult> {
     const isolatedDir =
       sandboxDir || path.join(baseDir, 'scratch', `restore_drill_${Date.now()}_${randomUUID().slice(0, 6)}`);
@@ -303,6 +478,8 @@ export class BackupRestoreService {
         sourcePaths,
         baseDir,
         passphrase,
+        rawEvents: replayInputs?.rawEvents,
+        projectionSnapshots: replayInputs?.projectionSnapshots,
       });
 
       return await this.restoreBackup({

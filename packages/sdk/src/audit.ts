@@ -19,7 +19,9 @@ export type AuditAction =
   | "rotate.credential"
   | "delete.personal_record"
   | "export.personal_data"
-  | "modify.retention_policy";
+  | "modify.retention_policy"
+  | "create.reviewer_comment"
+  | "resolve.reviewer_comment";
 
 export type ActorRole = "admin" | "operator" | "auditor" | "viewer";
 
@@ -81,7 +83,9 @@ export const DEFAULT_ACCESS_POLICY: AccessPolicy = {
         action === "deploy.contract" ||
         action === "initialize.contract" ||
         action === "rotate.credential" ||
-        action === "delete.personal_record"
+        action === "delete.personal_record" ||
+        action === "create.reviewer_comment" ||
+        action === "resolve.reviewer_comment"
       );
     }
     // auditor and viewer may not perform any privileged write action.

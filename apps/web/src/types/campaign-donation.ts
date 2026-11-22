@@ -37,6 +37,23 @@ export const MAX_DONATION_MESSAGE_LENGTH = 280;
 /** Quick-pick amounts shown in the donation UI. */
 export const DONATION_PRESET_AMOUNTS: readonly string[] = ["10", "25", "50", "100", "250"];
 
+/**
+ * Immutable snapshot of the donor-facing terms shown before a contribution is
+ * signed (issue #176). The snapshot is captured at contribution time so a
+ * contribution can always be verified against the exact terms the donor saw,
+ * even after the live terms document changes.
+ */
+export interface TermsSnapshot {
+  /** Monotonic terms document version, e.g. "2024-06-01" or "v3". */
+  version: string;
+  /** Full donor-facing terms text that was displayed. */
+  content: string;
+  /** Canonical SHA-256 hex digest of {@link canonicalizeTerms} output. */
+  hash: string;
+  /** Epoch milliseconds at which this terms version became effective. */
+  effectiveAt: number;
+}
+
 export interface CampaignDonation {
   id: string;
   campaignId: string;
@@ -51,6 +68,10 @@ export interface CampaignDonation {
   txHash?: string;
   /** Optional caller-supplied key used to make retries idempotent. */
   idempotencyKey?: string;
+  /** Version of the donor-facing terms accepted when the donation was signed. */
+  termsVersion?: string;
+  /** Canonical hash of the accepted terms snapshot (see {@link hashTermsSnapshot}). */
+  termsSnapshotHash?: string;
   createdAt: number;
   confirmedAt: number;
 }
@@ -132,4 +153,63 @@ export function donationReceiptReference(campaignId: string, donationId: string)
   const campaignPart = (campaignId ?? "").trim() || "campaign";
   const suffix = (donationId ?? "").replace(/[^a-z0-9]/gi, "").slice(-6).toUpperCase() || "000000";
   return `DON-${campaignPart}-${suffix}`;
+}
+
+/**
+ * Produce the canonical string form of a terms snapshot that is hashed.
+ *
+ * The canonical form is deterministic across client and server so the same
+ * snapshot always yields the same hash:
+ * - line endings are normalised to `\n`;
+ * - trailing whitespace on each line is stripped;
+ * - leading/trailing blank lines are removed;
+ * - the version and effectiveAt are included so a hash cannot be replayed
+ *   against a different terms version.
+ */
+export function canonicalizeTerms(
+  snapshot: Pick<TermsSnapshot, "version" | "content" | "effectiveAt">,
+): string {
+  const version = String(snapshot.version ?? "").trim();
+  const effectiveAt = Number.isFinite(snapshot.effectiveAt)
+    ? Math.trunc(snapshot.effectiveAt)
+    : 0;
+  const content = String(snapshot.content ?? "")
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+$/g, ""))
+    .join("\n")
+    .replace(/^\n+/, "")
+    .replace(/\n+$/, "");
+  return `version:${version}\neffectiveAt:${effectiveAt}\n---\n${content}`;
+}
+
+/**
+ * Compute the canonical SHA-256 hex digest of a terms snapshot.
+ *
+ * Uses the Web Crypto API (`crypto.subtle`) so the identical implementation
+ * runs in the browser and in Node 18+ runtimes. Callers must `await` the
+ * result; the hash is what gets persisted on the contribution.
+ */
+export async function hashTermsSnapshot(
+  snapshot: Pick<TermsSnapshot, "version" | "content" | "effectiveAt">,
+): Promise<string> {
+  const canonical = canonicalizeTerms(snapshot);
+  const bytes = new TextEncoder().encode(canonical);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Verify that a contribution's recorded terms hash matches a snapshot.
+ * Returns `false` when either side is missing so callers can fail closed.
+ */
+export async function verifyTermsSnapshot(
+  snapshot: Pick<TermsSnapshot, "version" | "content" | "effectiveAt">,
+  expectedHash: string | undefined,
+): Promise<boolean> {
+  if (!expectedHash) return false;
+  const actual = await hashTermsSnapshot(snapshot);
+  return actual === expectedHash;
 }

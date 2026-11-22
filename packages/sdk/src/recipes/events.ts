@@ -20,6 +20,133 @@ import {
 export type { ContractEventRaw };
 
 /**
+ * Canonical mapping of a single raw contract event to a projection.
+ *
+ * Every raw event produces exactly one mapping entry, so unknown or
+ * unsupported event versions are retained (with their raw payload)
+ * rather than silently dropped.
+ *
+ * - `kind: "parsed"` — the event matched a supported schema version and
+ *   `event` holds the typed projection.
+ * - `kind: "unknown"` — the event could not be mapped (unknown event
+ *   name, unsupported version, or malformed payload). `raw` holds the
+ *   original event so callers can persist, forward, or alert on it.
+ */
+export type ContractEventMapping =
+  | {
+      kind: "parsed";
+      /** Event name as reported by the contract (e.g. "StreamDeposit"). */
+      eventName: string;
+      /** Schema version reported by the contract, when present. */
+      version?: string;
+      /** Typed projection of the event. */
+      event: PaymentStreamContractEvent;
+      /** Original raw event, retained for auditability. */
+      raw: ContractEventRaw;
+    }
+  | {
+      kind: "unknown";
+      /** Event name as reported by the contract, when present. */
+      eventName?: string;
+      /** Schema version reported by the contract, when present. */
+      version?: string;
+      /** Reason the event could not be mapped. */
+      reason: "unsupported-event" | "unsupported-version" | "malformed-payload";
+      /** Original raw event, retained so nothing is lost. */
+      raw: ContractEventRaw;
+    };
+
+/**
+ * Reads the event name from a raw contract event, tolerating the
+ * different shapes the RPC may return.
+ */
+function readEventName(event: ContractEventRaw): string | undefined {
+  const candidate = event as unknown as {
+    eventName?: unknown;
+    name?: unknown;
+    type?: unknown;
+  };
+  for (const value of [candidate.eventName, candidate.name, candidate.type]) {
+    if (typeof value === "string" && value.length > 0) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Reads the schema version from a raw contract event, when present.
+ */
+function readEventVersion(event: ContractEventRaw): string | undefined {
+  const candidate = event as unknown as {
+    version?: unknown;
+    schemaVersion?: unknown;
+  };
+  for (const value of [candidate.version, candidate.schemaVersion]) {
+    if (typeof value === "string" && value.length > 0) {
+      return value;
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return String(value);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Maps a single raw contract event to its canonical projection.
+ *
+ * Supported event names/versions are projected into typed events.
+ * Anything else is returned as an `unknown` mapping that retains the
+ * raw payload, so consumers can persist or forward it without data loss.
+ *
+ * @param event - Raw contract event from the RPC.
+ * @returns Canonical mapping for the event.
+ */
+export function mapContractEvent(event: ContractEventRaw): ContractEventMapping {
+  const eventName = readEventName(event);
+  const version = readEventVersion(event);
+
+  const parsed = parsePaymentStreamContractEvent(event);
+  if (parsed) {
+    return {
+      kind: "parsed",
+      eventName: eventName ?? parsed.type,
+      version,
+      event: parsed,
+      raw: event,
+    };
+  }
+
+  let reason: "unsupported-event" | "unsupported-version" | "malformed-payload";
+  if (!eventName) {
+    reason = "malformed-payload";
+  } else if (version !== undefined) {
+    reason = "unsupported-version";
+  } else {
+    reason = "unsupported-event";
+  }
+
+  return { kind: "unknown", eventName, version, reason, raw: event };
+}
+
+/**
+ * Maps a batch of raw contract events to canonical projections.
+ *
+ * The returned array has the same length and ordering as the input;
+ * unknown events are retained rather than filtered out.
+ *
+ * @param events - Raw contract events from the RPC.
+ * @returns One mapping per input event, in input order.
+ */
+export function mapContractEvents(
+  events: readonly ContractEventRaw[] | undefined,
+): ContractEventMapping[] {
+  const rawList = Array.isArray(events) ? events : [];
+  return rawList.map((event) => mapContractEvent(event));
+}
+
+/**
  * Result of consuming events from a contract.
  */
 export interface EventConsumptionResult {
@@ -29,6 +156,11 @@ export interface EventConsumptionResult {
   parsedEvents: PaymentStreamContractEvent[];
   /** Events that could not be parsed (unknown or malformed). */
   unparsedEvents: ContractEventRaw[];
+  /**
+   * Canonical mapping for every retrieved event, in input order.
+   * Unknown events are retained here with their raw payloads.
+   */
+  mappings: ContractEventMapping[];
   /** Cursor/token for pagination (if supported by the RPC). */
   cursor?: string;
 }
@@ -38,8 +170,17 @@ export interface EventConsumptionResult {
  * Returns both successfully parsed events and any that could not be
  * parsed, so callers can decide how to handle unknown event types.
  *
+ * Compatibility guarantees:
+ * - Every retrieved event appears exactly once in `mappings`, in input
+ *   order, regardless of whether it is a supported version.
+ * - Unknown event names, unsupported schema versions, and malformed
+ *   payloads are retained in `unparsedEvents` and as `kind: "unknown"`
+ *   mappings with their original raw payload. Nothing is dropped.
+ * - `parsedEvents` contains only supported projections; its contents are
+ *   unchanged from previous releases.
+ *
  * @param events - Raw contract events from the RPC.
- * @returns Consumption result with parsed and unparsed events.
+ * @returns Consumption result with parsed, unparsed, and mapped events.
  *
  * @example
  * ```typescript
@@ -52,8 +193,13 @@ export interface EventConsumptionResult {
  *   console.log(`${event.type} on ${event.contractId}:`, event.payload);
  * }
  *
- * if (result.unparsedEvents.length > 0) {
- *   console.warn(`${result.unparsedEvents.length} events could not be parsed`);
+ * for (const mapping of result.mappings) {
+ *   if (mapping.kind === "unknown") {
+ *     console.warn(
+ *       `Unmapped event ${mapping.eventName ?? "<unnamed>"} ` +
+ *         `(version ${mapping.version ?? "n/a"}): ${mapping.reason}`,
+ *     );
+ *   }
  * }
  * ```
  */
@@ -64,11 +210,13 @@ export function consumeContractEvents(
 
   const parsedEvents: PaymentStreamContractEvent[] = [];
   const unparsedEvents: ContractEventRaw[] = [];
+  const mappings: ContractEventMapping[] = [];
 
   for (const event of rawList) {
-    const parsed = parsePaymentStreamContractEvent(event);
-    if (parsed) {
-      parsedEvents.push(parsed);
+    const mapping = mapContractEvent(event);
+    mappings.push(mapping);
+    if (mapping.kind === "parsed") {
+      parsedEvents.push(mapping.event);
     } else {
       unparsedEvents.push(event);
     }
@@ -78,6 +226,7 @@ export function consumeContractEvents(
     totalRetrieved: rawList.length,
     parsedEvents,
     unparsedEvents,
+    mappings,
   };
 }
 

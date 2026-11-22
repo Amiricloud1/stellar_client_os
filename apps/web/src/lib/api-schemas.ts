@@ -106,6 +106,24 @@ export const subscriptionIdParamsSchema = z
   })
   .strict();
 
+/** Donation id (positive integer). */
+export const donationIdSchema = idSchema;
+
+export const donationIdParamsSchema = z
+  .object({
+    donationId: donationIdSchema,
+  })
+  .strict();
+
+/** Reviewer comment id (positive integer). */
+export const commentIdSchema = idSchema;
+
+export const commentIdParamsSchema = z
+  .object({
+    commentId: commentIdSchema,
+  })
+  .strict();
+
 /* -------------------------------------------------------------------------- */
 /* Query params                                                               */
 /* -------------------------------------------------------------------------- */
@@ -167,250 +185,151 @@ export type RevokeWebhookSubscriptionInput = z.infer<
 >;
 
 /* -------------------------------------------------------------------------- */
-/* Request budgets (issue #233)                                               */
+/* Donations (issue #176)                                                     */
 /* -------------------------------------------------------------------------- */
 
-/** Default maximum request body size in bytes (1 MiB). */
-export const MAX_BODY_BYTES = 1_048_576;
-
-/** Default maximum nesting depth for list/array values. */
-export const MAX_LIST_DEPTH = 5;
-
-/** Default maximum number of filters accepted on a request. */
-export const MAX_FILTER_COUNT = 20;
-
-/** Hard upper bounds for configurable budgets. */
-export const ABSOLUTE_MAX_BODY_BYTES = 10_485_760;
-export const ABSOLUTE_MAX_LIST_DEPTH = 20;
-export const ABSOLUTE_MAX_FILTER_COUNT = 100;
+/** Lowercase or uppercase 64-character hex digest (sha256). */
+export const termsSnapshotHashSchema = z
+  .string()
+  .trim()
+  .regex(/^[0-9a-fA-F]{64}$/, 'must be a 64-character hex string');
 
 /**
- * Effective request budget. All fields are optional on input and default to
- * the documented limits above.
+ * A contribution MUST be bound to the exact terms the donor saw before
+ * signing. `termsSnapshotHash` is the content hash of those terms and
+ * `termsVersion` identifies the published version they came from.
  */
-export const requestBudgetSchema = z
+export const createDonationBodySchema = z
   .object({
-    maxBodyBytes: z.coerce
-      .number()
-      .int()
-      .min(1)
-      .max(ABSOLUTE_MAX_BODY_BYTES)
-      .default(MAX_BODY_BYTES),
-    maxListDepth: z.coerce
-      .number()
-      .int()
-      .min(1)
-      .max(ABSOLUTE_MAX_LIST_DEPTH)
-      .default(MAX_LIST_DEPTH),
-    maxFilterCount: z.coerce
-      .number()
-      .int()
-      .min(0)
-      .max(ABSOLUTE_MAX_FILTER_COUNT)
-      .default(MAX_FILTER_COUNT),
+    streamId: streamIdSchema,
+    amount: z.coerce.number().positive(),
+    termsSnapshotHash: termsSnapshotHashSchema,
+    termsVersion: nonEmptyString.max(100),
   })
   .strict();
 
-export type RequestBudget = z.infer<typeof requestBudgetSchema>;
+export type CreateDonationInput = z.infer<typeof createDonationBodySchema>;
 
-/** A single filter entry; shape is intentionally open for route-specific use. */
-export const filterEntrySchema = z.record(z.string(), z.unknown());
+/* -------------------------------------------------------------------------- */
+/* Reviewer comments (issue #178)                                             */
+/* -------------------------------------------------------------------------- */
 
-/**
- * Enforces a maximum filter count. Accepts either an array of filters or an
- * object whose `filters` property is the array.
- */
-export const filterBudgetSchema = z
-  .union([
-    z.array(filterEntrySchema),
-    z.object({ filters: z.array(filterEntrySchema) }).strict(),
-  ])
-  .superRefine((value, ctx) => {
-    const filters = Array.isArray(value) ? value : value.filters;
-    if (filters.length > MAX_FILTER_COUNT) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.too_big,
-        type: 'array',
-        maximum: MAX_FILTER_COUNT,
-        inclusive: true,
-        message: `Too many filters: ${filters.length} exceeds maximum of ${MAX_FILTER_COUNT}`,
-        path: Array.isArray(value) ? [] : ['filters'],
-      });
-    }
-  });
+export const commentResolutionStatusSchema = z.enum([
+  'open',
+  'resolved',
+  'dismissed',
+]);
 
-export type FilterBudgetInput = z.infer<typeof filterBudgetSchema>;
+export type CommentResolutionStatus = z.infer<
+  typeof commentResolutionStatusSchema
+>;
 
-export const REQUEST_TOO_LARGE_CODE = 'REQUEST_TOO_LARGE' as const;
-export const REQUEST_BUDGET_EXCEEDED_CODE = 'REQUEST_BUDGET_EXCEEDED' as const;
-
-export type RequestBudgetErrorCode =
-  | typeof REQUEST_TOO_LARGE_CODE
-  | typeof REQUEST_BUDGET_EXCEEDED_CODE;
-
-export type RequestBudgetReason =
-  | 'body_too_large'
-  | 'list_too_deep'
-  | 'too_many_filters';
-
-export interface RequestBudgetDetail {
-  path: string;
-  message: string;
-  reason: RequestBudgetReason;
-}
-
-export interface RequestBudgetErrorResponse {
-  error: string;
-  code: RequestBudgetErrorCode;
-  reason: RequestBudgetReason;
-  details: RequestBudgetDetail[];
-}
-
-export type ParseRequestBudgetResult =
-  | { success: true; budget: RequestBudget }
-  | { success: false; status: 413 | 422; body: RequestBudgetErrorResponse };
-
-/** Compute the byte length of a value when serialized as JSON. */
-export function measureBodyBytes(value: unknown): number {
-  if (value === undefined || value === null) return 0;
-  if (typeof value === 'string') {
-    return new TextEncoder().encode(value).length;
-  }
-  try {
-    return new TextEncoder().encode(JSON.stringify(value)).length;
-  } catch {
-    // Non-serializable values cannot be measured; treat as oversized.
-    return Number.POSITIVE_INFINITY;
-  }
-}
-
-/** Compute the maximum nesting depth of arrays/objects within `value`. */
-export function measureListDepth(value: unknown, depth = 0): number {
-  if (Array.isArray(value)) {
-    let max = depth + 1;
-    for (const item of value) {
-      max = Math.max(max, measureListDepth(item, depth + 1));
-    }
-    return max;
-  }
-  if (value && typeof value === 'object') {
-    let max = depth;
-    for (const item of Object.values(value as Record<string, unknown>)) {
-      max = Math.max(max, measureListDepth(item, depth + 1));
-    }
-    return max;
-  }
-  return depth;
-}
-
-function budgetFailure(
-  code: RequestBudgetErrorCode,
-  reason: RequestBudgetReason,
-  details: RequestBudgetDetail[],
-): ParseRequestBudgetResult {
-  return {
-    success: false,
-    status: code === REQUEST_TOO_LARGE_CODE ? 413 : 422,
-    body: {
-      error:
-        code === REQUEST_TOO_LARGE_CODE
-          ? 'Request body too large'
-          : 'Request budget exceeded',
-      code,
-      reason,
-      details,
-    },
-  };
-}
+export const COMMENT_BODY_MAX_LENGTH = 5_000;
 
 /**
- * Validate a request against the budget limits.
- *
- * `input` may include `budget` (partial overrides), `body` (the payload to
- * measure), and `filters` (an array or `{ filters }` object). Returns an
- * explicit 413/422 envelope on failure.
+ * A reviewer comment is anchored to a specific evidence version so that
+ * attribution and discussion remain reproducible.
  */
-export function parseRequestBudget(input: {
-  budget?: unknown;
-  body?: unknown;
-  filters?: unknown;
-}): ParseRequestBudgetResult {
-  const budgetResult = requestBudgetSchema.safeParse(input.budget ?? {});
-  if (!budgetResult.success) {
-    return budgetFailure(
-      REQUEST_BUDGET_EXCEEDED_CODE,
-      'body_too_large',
-      budgetResult.error.issues.map((issue) => ({
-        path: issue.path.length > 0 ? issue.path.join('.') : '(root)',
-        message: issue.message,
-        reason: 'body_too_large' as const,
-      })),
-    );
-  }
+export const createReviewerCommentBodySchema = z
+  .object({
+    evidenceId: nonEmptyString.max(200),
+    evidenceVersion: z.coerce.number().int().positive(),
+    body: nonEmptyString.max(COMMENT_BODY_MAX_LENGTH),
+  })
+  .strict();
 
-  const budget = budgetResult.data;
+export type CreateReviewerCommentInput = z.infer<
+  typeof createReviewerCommentBodySchema
+>;
 
-  if (input.body !== undefined) {
-    const bytes = measureBodyBytes(input.body);
-    if (bytes > budget.maxBodyBytes) {
-      return budgetFailure(REQUEST_TOO_LARGE_CODE, 'body_too_large', [
-        {
-          path: '(root)',
-          message: `Request body is ${bytes} bytes, exceeding the ${budget.maxBodyBytes} byte limit`,
-          reason: 'body_too_large',
-        },
-      ]);
-    }
+export const resolveReviewerCommentBodySchema = z
+  .object({
+    resolutionStatus: commentResolutionStatusSchema,
+    resolutionNote: nonEmptyString.max(COMMENT_BODY_MAX_LENGTH).optional(),
+  })
+  .strict();
 
-    const depth = measureListDepth(input.body);
-    if (depth > budget.maxListDepth) {
-      return budgetFailure(REQUEST_BUDGET_EXCEEDED_CODE, 'list_too_deep', [
-        {
-          path: '(root)',
-          message: `Request nesting depth is ${depth}, exceeding the ${budget.maxListDepth} level limit`,
-          reason: 'list_too_deep',
-        },
-      ]);
-    }
-  }
+export type ResolveReviewerCommentInput = z.infer<
+  typeof resolveReviewerCommentBodySchema
+>;
 
-  if (input.filters !== undefined) {
-    const filters = Array.isArray(input.filters)
-      ? input.filters
-      : (input.filters as { filters?: unknown }).filters;
-    const count = Array.isArray(filters) ? filters.length : 0;
-    if (count > budget.maxFilterCount) {
-      return budgetFailure(REQUEST_BUDGET_EXCEEDED_CODE, 'too_many_filters', [
-        {
-          path: 'filters',
-          message: `Request has ${count} filters, exceeding the ${budget.maxFilterCount} filter limit`,
-          reason: 'too_many_filters',
-        },
-      ]);
-    }
-  }
+/* -------------------------------------------------------------------------- */
+/* Pre-launch readiness checklist (issue #179)                                */
+/* -------------------------------------------------------------------------- */
 
-  return { success: true, budget };
-}
+export const readinessNetworkSchema = z.enum(['mainnet', 'testnet', 'futurenet']);
+
+export const readinessAssetSchema = z
+  .object({
+    code: nonEmptyString.max(12),
+    issuer: nonEmptyString.max(100).optional(),
+  })
+  .strict();
+
+export const readinessMilestoneSchema = z
+  .object({
+    title: nonEmptyString.max(200),
+    targetDate: isoDateTimeSchema,
+    amount: z.coerce.number().positive(),
+  })
+  .strict();
+
+export const readinessPayoutTermsSchema = z
+  .object({
+    currency: nonEmptyString.max(12),
+    schedule: nonEmptyString.max(200),
+    termsSnapshotHash: termsSnapshotHashSchema,
+  })
+  .strict();
 
 /**
- * Convenience wrapper that throws a `Response` with the 413/422 JSON payload
- * on failure. Intended for use inside route handlers.
+ * Request body for validating a campaign before deployment. All sections are
+ * required so that missing metadata, network, assets, milestones, or payout
+ * terms surface as explicit validation errors.
  */
-export function assertRequestBudget(input: {
-  budget?: unknown;
-  body?: unknown;
-  filters?: unknown;
-}): RequestBudget {
-  const result = parseRequestBudget(input);
-  if (!result.success) {
-    throw new Response(JSON.stringify(result.body), {
-      status: result.status,
-      headers: { 'content-type': 'application/json' },
-    });
-  }
-  return result.budget;
-}
+export const readinessChecklistBodySchema = z
+  .object({
+    metadata: z
+      .object({
+        title: nonEmptyString.max(200),
+        description: nonEmptyString.max(5_000),
+      })
+      .strict(),
+    network: readinessNetworkSchema,
+    assets: z.array(readinessAssetSchema).min(1),
+    milestones: z.array(readinessMilestoneSchema).min(1),
+    payoutTerms: readinessPayoutTermsSchema,
+  })
+  .strict();
+
+export type ReadinessChecklistInput = z.infer<
+  typeof readinessChecklistBodySchema
+>;
+
+export const readinessChecklistItemStatusSchema = z.enum([
+  'pass',
+  'fail',
+  'warning',
+]);
+
+export const readinessChecklistItemSchema = z
+  .object({
+    id: nonEmptyString,
+    status: readinessChecklistItemStatusSchema,
+    message: nonEmptyString,
+  })
+  .strict();
+
+export const readinessChecklistResponseSchema = z
+  .object({
+    ready: z.boolean(),
+    items: z.array(readinessChecklistItemSchema),
+  })
+  .strict();
+
+export type ReadinessChecklistResponse = z.infer<
+  typeof readinessChecklistResponseSchema
+>;
 
 /* -------------------------------------------------------------------------- */
 /* Parse helper                                                               */

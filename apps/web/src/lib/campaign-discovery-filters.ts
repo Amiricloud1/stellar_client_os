@@ -108,3 +108,92 @@ export function filterCampaignsByDiscoveryOptions<T extends CampaignDiscoveryRec
 ): T[] {
   return campaigns.filter((campaign) => campaignMatchesDiscoveryFilters(campaign, filters));
 }
+
+/**
+ * Extended Discovery Filter Facets & Shareable URL State (Issues #173, #174, #175, #245)
+ * Composes validated category, status, location, and asset filters in stable,
+ * shareable URLs with deterministic pagination reset.
+ */
+export interface DiscoveryFacetFilters {
+  category: string;
+  status: string;
+  location: string;
+  asset: string;
+  page: number;
+  sortBy: string;
+}
+
+export const DEFAULT_DISCOVERY_FACETS: DiscoveryFacetFilters = {
+  category: "All",
+  status: "All",
+  location: "All",
+  asset: "All",
+  page: 1,
+  sortBy: "trending",
+};
+
+const VALID_STATUSES = new Set(["All", "Active", "Paused", "Successful", "Failed", "Claimed"]);
+const VALID_SORT_OPTIONS = new Set(["trending", "newest", "progress", "target"]);
+
+/**
+ * Parse and validate URL search parameters into a safe DiscoveryFacetFilters object.
+ */
+export function parseDiscoveryUrlParams(
+  params: URLSearchParams | Record<string, string | string[] | undefined>
+): DiscoveryFacetFilters {
+  const getParam = (key: string): string | undefined => {
+    if (params instanceof URLSearchParams) {
+      return params.get(key) || undefined;
+    }
+    const val = params[key];
+    if (Array.isArray(val)) return val[0];
+    return val;
+  };
+
+  const rawCategory = getParam("category")?.trim();
+  const rawStatus = getParam("status")?.trim();
+  const rawLocation = getParam("location")?.trim();
+  const rawAsset = getParam("asset")?.trim();
+  const rawPage = parseInt(getParam("page") || "1", 10);
+  const rawSort = getParam("sortBy")?.trim();
+
+  return {
+    category: rawCategory && rawCategory.length > 0 ? rawCategory : DEFAULT_DISCOVERY_FACETS.category,
+    status: rawStatus && VALID_STATUSES.has(rawStatus) ? rawStatus : DEFAULT_DISCOVERY_FACETS.status,
+    location: rawLocation && rawLocation.length > 0 ? rawLocation : DEFAULT_DISCOVERY_FACETS.location,
+    asset: rawAsset && rawAsset.length > 0 ? rawAsset : DEFAULT_DISCOVERY_FACETS.asset,
+    page: !isNaN(rawPage) && rawPage > 0 ? rawPage : 1,
+    sortBy: rawSort && VALID_SORT_OPTIONS.has(rawSort) ? rawSort : DEFAULT_DISCOVERY_FACETS.sortBy,
+  };
+}
+
+/**
+ * Serializes DiscoveryFacetFilters into URLSearchParams.
+ * Automatically resets pagination to page 1 if any filter facet has changed.
+ */
+export function serializeDiscoveryUrlParams(
+  newFilters: DiscoveryFacetFilters,
+  prevFilters?: DiscoveryFacetFilters
+): URLSearchParams {
+  const params = new URLSearchParams();
+
+  const facetChanged =
+    prevFilters &&
+    (prevFilters.category !== newFilters.category ||
+      prevFilters.status !== newFilters.status ||
+      prevFilters.location !== newFilters.location ||
+      prevFilters.asset !== newFilters.asset ||
+      prevFilters.sortBy !== newFilters.sortBy);
+
+  const effectivePage = facetChanged ? 1 : Math.max(1, newFilters.page);
+
+  if (newFilters.category !== "All") params.set("category", newFilters.category);
+  if (newFilters.status !== "All") params.set("status", newFilters.status);
+  if (newFilters.location !== "All") params.set("location", newFilters.location);
+  if (newFilters.asset !== "All") params.set("asset", newFilters.asset);
+  if (newFilters.sortBy !== "trending") params.set("sortBy", newFilters.sortBy);
+  if (effectivePage > 1) params.set("page", String(effectivePage));
+
+  return params;
+}
+

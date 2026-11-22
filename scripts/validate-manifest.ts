@@ -12,6 +12,33 @@
  * Exit codes:
  *   0 – all manifests valid
  *   1 – one or more manifests invalid or file not found
+ *
+ * Registry fields
+ * ---------------
+ * Every contract entry in a manifest is part of the validated deployment
+ * registry. Each entry records the following fields:
+ *
+ *   network          – network the contract is deployed to. Must match the
+ *                      manifest-level `network` ("testnet" | "mainnet" |
+ *                      "custom"). Optional per entry; when present it must
+ *                      agree with the manifest.
+ *   address          – the contract's on-chain address (C…). May be supplied
+ *                      as `address` or as the legacy alias `contractId`; at
+ *                      least one must be present and both must agree when
+ *                      both are given.
+ *   deploymentLedger – ledger sequence at which the deployment was applied.
+ *                      May be supplied as `deploymentLedger` or as the legacy
+ *                      alias `ledger`; must be an integer >= 1.
+ *   specVersion      – version of the contract spec (semver). May be supplied
+ *                      as `specVersion` or as the legacy alias `version`.
+ *   lifecycleState   – required lifecycle state of the deployment. Must be one
+ *                      of: "pending", "deployed", "active", "paused",
+ *                      "deprecated", "retired", "failed". Missing or unknown
+ *                      states are rejected so operators always know whether a
+ *                      deployment is live, degraded, or retired.
+ *
+ * Legacy aliases (`contractId`, `ledger`, `version`) remain accepted for
+ * backwards compatibility; new manifests should use the canonical names.
  */
 
 import fs from "fs";
@@ -25,11 +52,40 @@ const __dirname = path.dirname(__filename);
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * Lifecycle states a deployment may be in. Kept in sync with
+ * docs/deployment-manifest.md and the registry consumers.
+ */
+export const LIFECYCLE_STATES = [
+  "pending",
+  "deployed",
+  "active",
+  "paused",
+  "deprecated",
+  "retired",
+  "failed",
+] as const;
+
+export type LifecycleState = (typeof LIFECYCLE_STATES)[number];
+
 export interface ContractEntry {
-  contractId: string;
+  /** Canonical contract address (C…). */
+  address: string;
+  /** @deprecated legacy alias for `address`; still accepted. */
+  contractId?: string;
   wasmHash: string;
-  version: string;
-  ledger: number;
+  /** Contract spec version (semver). */
+  specVersion: string;
+  /** @deprecated legacy alias for `specVersion`; still accepted. */
+  version?: string;
+  /** Ledger sequence of the deployment. */
+  deploymentLedger: number;
+  /** @deprecated legacy alias for `deploymentLedger`; still accepted. */
+  ledger?: number;
+  /** Network the contract is deployed to; must match the manifest. */
+  network?: "testnet" | "mainnet" | "custom";
+  /** Required lifecycle state of the deployment. */
+  lifecycleState: LifecycleState;
   txHash: string;
   initTxHash?: string;
   sourceCommit?: string;
@@ -210,13 +266,51 @@ export function validateManifest(
 
     const e = entry as Record<string, unknown>;
 
-    // contractId
-    if (!e.contractId || typeof e.contractId !== "string") {
-      errors.push(`contracts.${name}.contractId: missing or not a string`);
-    } else if (!CONTRACT_ID_RE.test(e.contractId)) {
+    // ── address (canonical) / contractId (legacy alias) ──
+    const address = e.address;
+    const contractId = e.contractId;
+    if (address === undefined && contractId === undefined) {
       errors.push(
-        `contracts.${name}.contractId: must match /^C[A-Z2-7]{55}$/, got '${e.contractId}'`
+        `contracts.${name}.address: missing (expected contract address C…)`
       );
+    } else {
+      for (const [field, value] of [
+        ["address", address],
+        ["contractId", contractId],
+      ] as const) {
+        if (value === undefined) continue;
+        if (typeof value !== "string") {
+          errors.push(`contracts.${name}.${field}: must be a string`);
+        } else if (!CONTRACT_ID_RE.test(value)) {
+          errors.push(
+            `contracts.${name}.${field}: must match /^C[A-Z2-7]{55}$/, got '${value}'`
+          );
+        }
+      }
+      if (
+        typeof address === "string" &&
+        typeof contractId === "string" &&
+        address !== contractId
+      ) {
+        errors.push(
+          `contracts.${name}: 'address' and legacy 'contractId' disagree ('${address}' vs '${contractId}')`
+        );
+      }
+    }
+
+    // ── network (optional per entry, must match manifest) ──
+    if (e.network !== undefined) {
+      if (typeof e.network !== "string") {
+        errors.push(`contracts.${name}.network: must be a string`);
+      } else if (!allowedNetworks.includes(e.network)) {
+        errors.push(
+          `contracts.${name}.network: '${e.network}' must be one of: ${allowedNetworks.join(", ")}`
+        );
+      } else if (typeof m.network === "string" && e.network !== m.network) {
+        errors.push(
+          `contracts.${name}.network: '${e.network}' does not match manifest network '${m.network}'`
+        );
+      }
     }
 
     // wasmHash
@@ -228,21 +322,78 @@ export function validateManifest(
       );
     }
 
-    // version
-    if (!e.version || typeof e.version !== "string") {
-      errors.push(`contracts.${name}.version: missing or not a string`);
-    } else if (!SEMVER_RE.test(e.version)) {
-      warnings.push(
-        `contracts.${name}.version: '${e.version}' does not look like a semver version`
+    // ── specVersion (canonical) / version (legacy alias) ──
+    const specVersion = e.specVersion;
+    const version = e.version;
+    if (specVersion === undefined && version === undefined) {
+      errors.push(
+        `contracts.${name}.specVersion: missing (expected semver spec version)`
       );
+    } else {
+      for (const [field, value] of [
+        ["specVersion", specVersion],
+        ["version", version],
+      ] as const) {
+        if (value === undefined) continue;
+        if (typeof value !== "string") {
+          errors.push(`contracts.${name}.${field}: must be a string`);
+        } else if (!SEMVER_RE.test(value)) {
+          warnings.push(
+            `contracts.${name}.${field}: '${value}' does not look like a semver version`
+          );
+        }
+      }
+      if (
+        typeof specVersion === "string" &&
+        typeof version === "string" &&
+        specVersion !== version
+      ) {
+        errors.push(
+          `contracts.${name}: 'specVersion' and legacy 'version' disagree ('${specVersion}' vs '${version}')`
+        );
+      }
     }
 
-    // ledger
-    if (e.ledger === undefined || e.ledger === null) {
-      errors.push(`contracts.${name}.ledger: missing`);
-    } else if (typeof e.ledger !== "number" || !Number.isInteger(e.ledger) || e.ledger < 1) {
+    // ── deploymentLedger (canonical) / ledger (legacy alias) ──
+    const deploymentLedger = e.deploymentLedger;
+    const ledger = e.ledger;
+    if (deploymentLedger === undefined && ledger === undefined) {
       errors.push(
-        `contracts.${name}.ledger: must be an integer >= 1, got '${e.ledger}'`
+        `contracts.${name}.deploymentLedger: missing (expected integer >= 1)`
+      );
+    } else {
+      for (const [field, value] of [
+        ["deploymentLedger", deploymentLedger],
+        ["ledger", ledger],
+      ] as const) {
+        if (value === undefined) continue;
+        if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+          errors.push(
+            `contracts.${name}.${field}: must be an integer >= 1, got '${value}'`
+          );
+        }
+      }
+      if (
+        typeof deploymentLedger === "number" &&
+        typeof ledger === "number" &&
+        deploymentLedger !== ledger
+      ) {
+        errors.push(
+          `contracts.${name}: 'deploymentLedger' and legacy 'ledger' disagree (${deploymentLedger} vs ${ledger})`
+        );
+      }
+    }
+
+    // ── lifecycleState (required) ──
+    if (e.lifecycleState === undefined || e.lifecycleState === null) {
+      errors.push(
+        `contracts.${name}.lifecycleState: missing (must be one of: ${LIFECYCLE_STATES.join(", ")})`
+      );
+    } else if (typeof e.lifecycleState !== "string") {
+      errors.push(`contracts.${name}.lifecycleState: must be a string`);
+    } else if (!(LIFECYCLE_STATES as readonly string[]).includes(e.lifecycleState)) {
+      errors.push(
+        `contracts.${name}.lifecycleState: '${e.lifecycleState}' is not a valid lifecycle state. Must be one of: ${LIFECYCLE_STATES.join(", ")}`
       );
     }
 
