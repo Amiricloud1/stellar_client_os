@@ -11,6 +11,18 @@ import {
   paginationQuerySchema,
   streamStatusSchema,
 } from './api-schemas'
+import {
+  requestBudgetSchema,
+  collectionBudgetSchema,
+  filterBudgetSchema,
+  requestBodyBudgetSchema,
+  REQUEST_BUDGET_LIMITS,
+  RequestBudgetError,
+  assertRequestBudget,
+  assertCollectionBudget,
+  assertFilterBudget,
+  assertRequestBodyBudget,
+} from './api-policy'
 
 // Re-export the shared API schemas so form and API validation share a single
 // source of truth (issue #55). Consumers should prefer importing from here.
@@ -27,6 +39,30 @@ export type {
   PaginationQuery,
   StreamStatus,
 } from './api-schemas'
+
+// Re-export the request/collection/filter budget schemas and helpers so that
+// client and form validation apply exactly the same limits as the API. The
+// authoritative enforcement (rejecting oversized bodies, nested lists, and
+// filters before any application or database work) lives in `api-policy.ts`;
+// import from there for server-side guards.
+export {
+  requestBudgetSchema,
+  collectionBudgetSchema,
+  filterBudgetSchema,
+  requestBodyBudgetSchema,
+  REQUEST_BUDGET_LIMITS,
+  RequestBudgetError,
+  assertRequestBudget,
+  assertCollectionBudget,
+  assertFilterBudget,
+  assertRequestBodyBudget,
+}
+export type {
+  RequestBudget,
+  CollectionBudget,
+  FilterBudget,
+  RequestBodyBudget,
+} from './api-policy'
 
 // Stream record type for display
 export interface StreamRecord {

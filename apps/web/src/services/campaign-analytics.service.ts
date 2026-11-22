@@ -23,6 +23,13 @@ export interface CampaignAnalytics {
   refunds: number;
   refundRate: number;
   updatedAt: number;
+  /**
+   * True when this aggregate was served from a cached entry that has exceeded
+   * its freshness budget but is still within `CAMPAIGN_ANALYTICS_MAX_STALE_MS`.
+   * Consumers should surface this to operators so degraded freshness is
+   * explicit rather than silent.
+   */
+  stale: boolean;
 }
 
 interface CampaignAnalyticsState {
@@ -39,11 +46,45 @@ interface CampaignAnalyticsState {
  * campaign has exactly one authoritative aggregate entry. Mutations and
  * chain corrections invalidate the single key for the affected campaign;
  * there is no cross-campaign fan-out.
+ *
+ * When a read is scoped by a principal and/or normalized filters, the scope
+ * is appended as a stable suffix (`:<scope>`). This guarantees that cached
+ * aggregates are never shared across permission scopes or filter sets, and
+ * that single-flight coalescing only merges truly identical reads.
  */
 export const CAMPAIGN_ANALYTICS_CACHE_NAMESPACE = "campaign-analytics";
 
-export function campaignAnalyticsCacheKey(campaignId: string): string {
-  return `${CAMPAIGN_ANALYTICS_CACHE_NAMESPACE}:${campaignId}`;
+export interface CampaignAnalyticsScope {
+  /** Principal (user/role) the read is authorized for. Omitted = unscoped. */
+  principalId?: string;
+  /** Arbitrary filter set; normalized to a stable, order-independent string. */
+  filters?: Record<string, string | number | boolean | null | undefined>;
+}
+
+function normalizeFilters(
+  filters: CampaignAnalyticsScope["filters"],
+): string {
+  if (!filters) return "";
+  const entries = Object.entries(filters)
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(([key, value]) => [key, String(value)] as const)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return entries.map(([key, value]) => `${key}=${value}`).join("&");
+}
+
+function scopeSuffix(scope: CampaignAnalyticsScope | undefined): string {
+  if (!scope) return "";
+  const principal = scope.principalId?.trim() ?? "";
+  const filters = normalizeFilters(scope.filters);
+  if (!principal && !filters) return "";
+  return `:${encodeURIComponent(principal)}:${encodeURIComponent(filters)}`;
+}
+
+export function campaignAnalyticsCacheKey(
+  campaignId: string,
+  scope?: CampaignAnalyticsScope,
+): string {
+  return `${CAMPAIGN_ANALYTICS_CACHE_NAMESPACE}:${campaignId}${scopeSuffix(scope)}`;
 }
 
 /**
@@ -66,6 +107,14 @@ interface CampaignAnalyticsCacheEntry {
 const states = new Map<string, CampaignAnalyticsState>();
 const cache = new Map<string, CampaignAnalyticsCacheEntry>();
 const invalidatedAt = new Map<string, number>();
+
+/**
+ * In-flight cold reads keyed by cache key. Identical concurrent reads share a
+ * single computation (single-flight) so a burst of dashboard polls cannot
+ * stampede the authoritative state. The map is keyed by the scoped cache key,
+ * so reads with different principals or filters never coalesce.
+ */
+const inFlight = new Map<string, Promise<CampaignAnalytics | null>>();
 
 function stateFor(campaignId: string): CampaignAnalyticsState {
   let state = states.get(campaignId);
@@ -91,9 +140,20 @@ function toRate(numerator: number, denominator: number): number {
  * Called by every mutation (view, contribution, refund) and by chain
  * corrections so that authoritative totals are never served stale. The
  * invalidation timestamp is recorded so callers can reason about freshness.
+ *
+ * Every scoped entry for the campaign is dropped (fresh and stale alike) and
+ * any in-flight read is detached so a subsequent read recomputes from
+ * authoritative state. This prevents permission or filter scopes from being
+ * mixed after a mutation.
  */
 export function invalidateCampaignAnalyticsCache(campaignId: string, now = Date.now()): void {
-  cache.delete(campaignAnalyticsCacheKey(campaignId));
+  const prefix = `${CAMPAIGN_ANALYTICS_CACHE_NAMESPACE}:${campaignId}`;
+  for (const key of Array.from(cache.keys())) {
+    if (key === prefix || key.startsWith(`${prefix}:`)) cache.delete(key);
+  }
+  for (const key of Array.from(inFlight.keys())) {
+    if (key === prefix || key.startsWith(`${prefix}:`)) inFlight.delete(key);
+  }
   invalidatedAt.set(campaignId, now);
 }
 
@@ -106,6 +166,16 @@ function isFresh(entry: CampaignAnalyticsCacheEntry, now: number, ttlMs: number)
   const budget = Math.min(ttlMs, CAMPAIGN_ANALYTICS_MAX_STALE_MS);
   const age = now - entry.cachedAt;
   return age >= 0 && age < budget;
+}
+
+/**
+ * Whether an entry may still be served as stale: past its freshness budget but
+ * within the hard `CAMPAIGN_ANALYTICS_MAX_STALE_MS` ceiling. Entries older than
+ * the ceiling are never served.
+ */
+function isServableStale(entry: CampaignAnalyticsCacheEntry, now: number): boolean {
+  const age = now - entry.cachedAt;
+  return age >= 0 && age < CAMPAIGN_ANALYTICS_MAX_STALE_MS;
 }
 
 export async function recordCampaignView(
@@ -169,6 +239,17 @@ export interface GetCampaignAnalyticsOptions {
   ttlMs?: number;
   /** When true, bypass the cache and recompute from authoritative state. */
   forceRefresh?: boolean;
+  /**
+   * When true (default), a cached entry past its freshness budget but within
+   * `CAMPAIGN_ANALYTICS_MAX_STALE_MS` is served with `stale: true` instead of
+   * blocking on a recompute. Set to false to require fresh data.
+   */
+  allowStale?: boolean;
+  /**
+   * Permission/filter scope for the read. Reads with different scopes never
+   * share a cache entry or an in-flight computation.
+   */
+  scope?: CampaignAnalyticsScope;
 }
 
 export type CampaignAnalyticsSortField =
@@ -256,22 +337,11 @@ export async function listCampaignAnalytics(
   return { items, pageInfo };
 }
 
-export async function getCampaignAnalytics(
+function computeCampaignAnalytics(
   campaignId: string,
-  dataSource = getCampaignDataSource(),
-  now = Date.now(),
-  options: GetCampaignAnalyticsOptions = {},
-): Promise<CampaignAnalytics | null> {
-  const campaign = await getCampaign(campaignId, dataSource);
-  if (!campaign) return null;
-
-  const cacheKey = campaignAnalyticsCacheKey(campaignId);
-  const ttlMs = options.ttlMs ?? CAMPAIGN_ANALYTICS_TTL_MS;
-  if (!options.forceRefresh) {
-    const cached = cache.get(cacheKey);
-    if (cached && isFresh(cached, now, ttlMs)) return cached.value;
-  }
-
+  campaign: CampaignRecord,
+  now: number,
+): CampaignAnalytics {
   const state = stateFor(campaignId);
   const sponsors = new Set([
     ...campaign.sponsors.map((sponsor) => sponsor.address),
@@ -284,7 +354,7 @@ export async function getCampaignAnalytics(
   const average = contributionCount === 0 ? 0n : fallbackTotal / BigInt(contributionCount);
   const pagesViewed = state.totalViews;
 
-  const analytics: CampaignAnalytics = {
+  return {
     campaignId,
     pagesViewed,
     uniqueViewers: state.views.size,
@@ -296,10 +366,50 @@ export async function getCampaignAnalytics(
     refunds: state.refunds,
     refundRate: toRate(state.refunds, contributionCount),
     updatedAt: now,
+    stale: false,
   };
+}
 
-  cache.set(cacheKey, { value: analytics, cachedAt: now });
-  return analytics;
+export async function getCampaignAnalytics(
+  campaignId: string,
+  dataSource = getCampaignDataSource(),
+  now = Date.now(),
+  options: GetCampaignAnalyticsOptions = {},
+): Promise<CampaignAnalytics | null> {
+  const campaign = await getCampaign(campaignId, dataSource);
+  if (!campaign) return null;
+
+  const cacheKey = campaignAnalyticsCacheKey(campaignId, options.scope);
+  const ttlMs = options.ttlMs ?? CAMPAIGN_ANALYTICS_TTL_MS;
+  const allowStale = options.allowStale ?? true;
+
+  if (!options.forceRefresh) {
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      if (isFresh(cached, now, ttlMs)) return cached.value;
+      if (allowStale && isServableStale(cached, now)) {
+        return { ...cached.value, stale: true };
+      }
+    }
+  }
+
+  // Single-flight: coalesce identical concurrent cold reads. The key includes
+  // the permission/filter scope so distinct scopes never share a computation.
+  const existing = inFlight.get(cacheKey);
+  if (existing) return existing;
+
+  const pending = (async () => {
+    try {
+      const analytics = computeCampaignAnalytics(campaignId, campaign, now);
+      cache.set(cacheKey, { value: analytics, cachedAt: now });
+      return analytics;
+    } finally {
+      inFlight.delete(cacheKey);
+    }
+  })();
+
+  inFlight.set(cacheKey, pending);
+  return pending;
 }
 
 export function seedCampaignAnalytics(campaignId: string, state: Partial<CampaignAnalyticsState>): void {
@@ -310,6 +420,16 @@ export function seedCampaignAnalytics(campaignId: string, state: Partial<Campaig
     refunds: state.refunds ?? 0,
   });
   invalidateCampaignAnalyticsCache(campaignId);
+}
+
+/** Number of in-flight cold reads currently coalescing for a campaign. */
+export function getCampaignAnalyticsInFlightCount(campaignId: string): number {
+  const prefix = `${CAMPAIGN_ANALYTICS_CACHE_NAMESPACE}:${campaignId}`;
+  let count = 0;
+  for (const key of inFlight.keys()) {
+    if (key === prefix || key.startsWith(`${prefix}:`)) count += 1;
+  }
+  return count;
 }
 
 export type { CampaignRecord, PageInfo };

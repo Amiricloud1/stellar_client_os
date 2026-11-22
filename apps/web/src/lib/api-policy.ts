@@ -50,6 +50,7 @@
  */
 
 import { NextResponse } from 'next/server';
+import { createHash } from 'crypto';
 import { timingSafeEqual } from 'crypto';
 
 /** The three supported policy levels. */
@@ -262,6 +263,718 @@ export function isAuthenticatedRoute(requestOrPath: Request | string): boolean {
 export function isPrivilegedRoute(requestOrPath: Request | string): boolean {
   const path = typeof requestOrPath === 'string' ? requestOrPath : getPathname(requestOrPath);
   return resolveRoutePolicy(path)?.policy === 'privileged';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Request hardening (issues #232–#235)
+//
+// The helpers below are the authoritative boundary for four cross-cutting
+// concerns that must be applied *before* expensive application/database work:
+//
+//   #232  Conditional reads  – strong ETags derived from representation +
+//                              authorization scope, so caches never leak data
+//                              across principals/tenants/roles.
+//   #233  Request budgets    – reject oversized bodies, deeply nested lists and
+//                              excessive filters up front (413 / 422).
+//   #234  Operation metering  – weighted per-tenant budgets (429 + Retry-After).
+//   #235  Analytics coalescing – single-flight cold reads with bounded
+//                              stale-while-revalidate, never mixing scopes.
+//
+// Every helper returns an explicit failure envelope so operators and clients
+// can distinguish "rejected" from "unavailable" and recover deterministically.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Machine-readable reason codes for request-budget rejections. */
+export type RequestBudgetReason =
+  | 'body_too_large'
+  | 'list_too_deep'
+  | 'too_many_filters';
+
+/** Options controlling `enforceRequestBudgets`. */
+export interface RequestBudgetOptions {
+  /** Maximum accepted request body size in bytes. */
+  readonly maxBodyBytes: number;
+  /** Maximum accepted nesting depth of list/array values. */
+  readonly maxListDepth: number;
+  /** Maximum accepted number of filter parameters. */
+  readonly maxFilterCount: number;
+}
+
+/** Default request budgets applied when a route does not override them. */
+export const DEFAULT_REQUEST_BUDGETS: RequestBudgetOptions = {
+  maxBodyBytes: 1_048_576, // 1 MiB
+  maxListDepth: 5,
+  maxFilterCount: 25,
+} as const;
+
+/** Result of a budget check: `ok` or an explicit rejection envelope. */
+export type RequestBudgetResult =
+  | { readonly ok: true }
+  | {
+      readonly ok: false;
+      readonly status: 413 | 422;
+      readonly code: 'REQUEST_TOO_LARGE' | 'REQUEST_BUDGET_EXCEEDED';
+      readonly reason: RequestBudgetReason;
+      readonly message: string;
+      readonly response: NextResponse;
+    };
+
+/** Builds a JSON error envelope with a machine-readable `reason`. */
+function budgetError(
+  status: 413 | 422,
+  code: 'REQUEST_TOO_LARGE' | 'REQUEST_BUDGET_EXCEEDED',
+  reason: RequestBudgetReason,
+  message: string,
+): NextResponse {
+  return NextResponse.json(
+    { error: { code, reason, message } },
+    { status },
+  );
+}
+
+/** Computes the maximum nesting depth of arrays within a parsed value. */
+function listDepth(value: unknown, depth = 0): number {
+  if (Array.isArray(value)) {
+    let max = depth + 1;
+    for (const item of value) {
+      const child = listDepth(item, depth + 1);
+      if (child > max) {
+        max = child;
+      }
+    }
+    return max;
+  }
+  if (value && typeof value === 'object') {
+    let max = depth;
+    for (const item of Object.values(value as Record<string, unknown>)) {
+      const child = listDepth(item, depth);
+      if (child > max) {
+        max = child;
+      }
+    }
+    return max;
+  }
+  return depth;
+}
+
+/** Counts filter-like query parameters (`filter`, `filter[...]`, `filters`). */
+function countFilters(url: URL): number {
+  let count = 0;
+  for (const key of url.searchParams.keys()) {
+    if (key === 'filter' || key === 'filters' || key.startsWith('filter[') || key.startsWith('filter.')) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+/**
+ * Enforces request size and collection budgets before any parsing or database
+ * work (issue #233).
+ *
+ * Checks, in order:
+ *   1. `Content-Length` (when present) against `maxBodyBytes` → 413
+ *      `REQUEST_TOO_LARGE` / `body_too_large`.
+ *   2. Filter count in the query string against `maxFilterCount` → 422
+ *      `REQUEST_BUDGET_EXCEEDED` / `too_many_filters`.
+ *   3. For JSON bodies, actual byte length and nested list depth → 413 / 422.
+ *
+ * The body is read at most once and re-attached to the request so downstream
+ * handlers can still consume it. Non-JSON bodies are only size-checked.
+ *
+ * @returns `{ ok: true }` when within budget, otherwise a rejection envelope
+ *          carrying the ready-to-return `response`.
+ */
+export async function enforceRequestBudgets(
+  request: Request,
+  options: RequestBudgetOptions = DEFAULT_REQUEST_BUDGETS,
+): Promise<RequestBudgetResult> {
+  const { maxBodyBytes, maxListDepth, maxFilterCount } = options;
+
+  // 1. Declared size check (cheap, before touching the body).
+  const declared = request.headers.get('content-length');
+  if (declared !== null) {
+    const declaredBytes = Number(declared);
+    if (Number.isFinite(declaredBytes) && declaredBytes > maxBodyBytes) {
+      return {
+        ok: false,
+        status: 413,
+        code: 'REQUEST_TOO_LARGE',
+        reason: 'body_too_large',
+        message: `Request body exceeds ${maxBodyBytes} bytes.`,
+        response: budgetError(
+          413,
+          'REQUEST_TOO_LARGE',
+          'body_too_large',
+          `Request body exceeds ${maxBodyBytes} bytes.`,
+        ),
+      };
+    }
+  }
+
+  // 2. Filter count check (query string only, no body parse needed).
+  let url: URL;
+  try {
+    url = new URL(request.url);
+  } catch {
+    url = new URL('http://localhost/');
+  }
+  if (countFilters(url) > maxFilterCount) {
+    return {
+      ok: false,
+      status: 422,
+      code: 'REQUEST_BUDGET_EXCEEDED',
+      reason: 'too_many_filters',
+      message: `At most ${maxFilterCount} filters are allowed.`,
+      response: budgetError(
+        422,
+        'REQUEST_BUDGET_EXCEEDED',
+        'too_many_filters',
+        `At most ${maxFilterCount} filters are allowed.`,
+      ),
+    };
+  }
+
+  // 3. Body checks. Only methods that can carry a body are inspected.
+  const method = request.method.toUpperCase();
+  if (method === 'GET' || method === 'HEAD' || method === 'DELETE') {
+    return { ok: true };
+  }
+
+  const contentType = request.headers.get('content-type') ?? '';
+  const isJson = contentType.includes('application/json');
+  let raw: string;
+  try {
+    raw = await request.clone().text();
+  } catch {
+    // Unreadable body: fail closed with an explicit envelope.
+    return {
+      ok: false,
+      status: 422,
+      code: 'REQUEST_BUDGET_EXCEEDED',
+      reason: 'body_too_large',
+      message: 'Request body could not be read.',
+      response: budgetError(
+        422,
+        'REQUEST_BUDGET_EXCEEDED',
+        'body_too_large',
+        'Request body could not be read.',
+      ),
+    };
+  }
+
+  const byteLength = Buffer.byteLength(raw, 'utf8');
+  if (byteLength > maxBodyBytes) {
+    return {
+      ok: false,
+      status: 413,
+      code: 'REQUEST_TOO_LARGE',
+      reason: 'body_too_large',
+      message: `Request body exceeds ${maxBodyBytes} bytes.`,
+      response: budgetError(
+        413,
+        'REQUEST_TOO_LARGE',
+        'body_too_large',
+        `Request body exceeds ${maxBodyBytes} bytes.`,
+      ),
+    };
+  }
+
+  if (isJson && raw.length > 0) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return {
+        ok: false,
+        status: 422,
+        code: 'REQUEST_BUDGET_EXCEEDED',
+        reason: 'list_too_deep',
+        message: 'Request body is not valid JSON.',
+        response: budgetError(
+          422,
+          'REQUEST_BUDGET_EXCEEDED',
+          'list_too_deep',
+          'Request body is not valid JSON.',
+        ),
+      };
+    }
+    if (listDepth(parsed) > maxListDepth) {
+      return {
+        ok: false,
+        status: 422,
+        code: 'REQUEST_BUDGET_EXCEEDED',
+        reason: 'list_too_deep',
+        message: `List nesting exceeds ${maxListDepth} levels.`,
+        response: budgetError(
+          422,
+          'REQUEST_BUDGET_EXCEEDED',
+          'list_too_deep',
+          `List nesting exceeds ${maxListDepth} levels.`,
+        ),
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
+// ── #232 Conditional reads ───────────────────────────────────────────────────
+
+/** Authorization scope mixed into representation validators. */
+export interface RepresentationScope {
+  /** Stable principal identifier (user id). */
+  readonly principalId: string;
+  /** Tenant identifier, when the deployment is multi-tenant. */
+  readonly tenantId?: string;
+  /** Roles granted to the principal, order-independent. */
+  readonly roles?: readonly string[];
+}
+
+/** Deterministic JSON serialization with sorted object keys. */
+function canonicalize(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value) ?? 'null';
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalize).join(',')}]`;
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalize(obj[k])}`).join(',')}}`;
+}
+
+/**
+ * Computes a strong ETag for a cacheable representation (issue #232).
+ *
+ * The validator is `"sha256-<hex>"` over the canonical (key-sorted) JSON of
+ * the body combined with the authorization scope. Because the scope is part of
+ * the hash, two principals/tenants/role sets can never share a validator even
+ * when their bodies are byte-identical — preventing cross-principal cache
+ * leakage through shared caches or CDNs.
+ *
+ * @param body  The representation to hash (any JSON-serializable value).
+ * @param scope Principal/tenant/role context the representation was computed
+ *              under. Roles are sorted so ordering does not affect the hash.
+ */
+export function computeRepresentationValidator(
+  body: unknown,
+  scope: RepresentationScope,
+): string {
+  const roles = [...(scope.roles ?? [])].sort();
+  const material = canonicalize({
+    body,
+    principalId: scope.principalId,
+    tenantId: scope.tenantId ?? null,
+    roles,
+  });
+  const digest = createHash('sha256').update(material, 'utf8').digest('hex');
+  return `"sha256-${digest}"`;
+}
+
+/** Parses an `If-None-Match` header into individual entity tags. */
+function parseIfNoneMatch(header: string): string[] {
+  return header
+    .split(',')
+    .map((tag) => tag.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Evaluates a conditional read against the current representation validator
+ * (issue #232).
+ *
+ * Supports `If-None-Match` with strong tags, weak tags (`W/"..."`) and `*`.
+ * When the header matches the current ETag the caller should respond `304`
+ * with no body; otherwise the caller proceeds and should send the ETag via
+ * `ETag` plus `Cache-Control: private` so shared caches never store it.
+ *
+ * @returns `null` when the request should proceed, or a `304` response.
+ */
+export function evaluateConditionalRead(
+  request: Request,
+  etag: string,
+): NextResponse | null {
+  const header = request.headers.get('if-none-match');
+  if (!header) {
+    return null;
+  }
+  const candidates = parseIfNoneMatch(header);
+  const normalized = etag.replace(/^W\//, '');
+  for (const candidate of candidates) {
+    if (candidate === '*') {
+      return new NextResponse(null, { status: 304, headers: { ETag: etag } });
+    }
+    if (candidate.replace(/^W\//, '') === normalized) {
+      return new NextResponse(null, { status: 304, headers: { ETag: etag } });
+    }
+  }
+  return null;
+}
+
+// ── #234 Operation metering ──────────────────────────────────────────────────
+
+/** Operation classes that consume weighted budget units. */
+export type OperationClass = 'read' | 'search' | 'analytics' | 'export';
+
+/** Weighted cost of each operation class. */
+export const OPERATION_COSTS: Readonly<Record<OperationClass, number>> = {
+  read: 1,
+  search: 2,
+  analytics: 5,
+  export: 10,
+} as const;
+
+/** Minimal Redis-like surface used for atomic budget deduction. */
+export interface BudgetStore {
+  /**
+   * Atomically deduct `cost` from `key` and return the remaining balance.
+   * Implementations MUST be atomic (e.g. a Lua script or `DECRBY`).
+   */
+  deduct(key: string, cost: number, ttlSeconds: number): Promise<number>;
+}
+
+/** Per-tenant budget configuration. */
+export interface TenantBudget {
+  /** Units available per window. */
+  readonly limit: number;
+  /** Window length in seconds. */
+  readonly windowSeconds: number;
+}
+
+/** Default per-tenant budget: 10,000 units per minute. */
+export const DEFAULT_TENANT_BUDGET: TenantBudget = {
+  limit: 10_000,
+  windowSeconds: 60,
+} as const;
+
+/**
+ * Failure mode for a metering operation when the budget store is unavailable.
+ *  - `fail-open`  : allow the request (used for lightweight reads so a Redis
+ *                   outage does not take the API down).
+ *  - `fail-closed`: reject with 503 (used for expensive operations where an
+ *                   unmetered burst could exhaust downstream capacity).
+ */
+export type MeteringFailureMode = 'fail-open' | 'fail-closed';
+
+/** Failure mode per operation class. */
+export const METERING_FAILURE_MODES: Readonly<Record<OperationClass, MeteringFailureMode>> = {
+  read: 'fail-open',
+  search: 'fail-open',
+  analytics: 'fail-closed',
+  export: 'fail-closed',
+} as const;
+
+/** Result of a metering attempt. */
+export type MeterResult =
+  | { readonly ok: true; readonly remaining: number; readonly cost: number }
+  | {
+      readonly ok: false;
+      readonly status: 429 | 503;
+      readonly code: 'BUDGET_EXHAUSTED' | 'METERING_UNAVAILABLE';
+      readonly response: NextResponse;
+    };
+
+let budgetStore: BudgetStore | null = null;
+
+/** Configures the budget store used by `meterOperation`. */
+export function setBudgetStore(store: BudgetStore | null): void {
+  budgetStore = store;
+}
+
+/** Returns the configured budget store, if any. */
+export function getBudgetStore(): BudgetStore | null {
+  return budgetStore;
+}
+
+/**
+ * Meters an operation against the tenant's weighted budget (issue #234).
+ *
+ * Exports and analytics cost more than lightweight reads (see
+ * `OPERATION_COSTS`), so a tenant cannot exhaust shared capacity with cheap
+ * calls. Units are deducted atomically from a per-tenant Redis key
+ * (`budget:<tenant>:<window>`), which expires after the window.
+ *
+ * On success the caller should surface `X-RateLimit-Remaining` and
+ * `X-RateLimit-Cost` headers. On exhaustion a `429` is returned with
+ * `Retry-After` (seconds until the window resets) and `X-RateLimit-Remaining: 0`.
+ * If the store is unavailable the behavior depends on the operation class
+ * (`METERING_FAILURE_MODES`): lightweight reads fail open, expensive
+ * operations fail closed with `503 METERING_UNAVAILABLE`.
+ *
+ * @param tenantId  Tenant whose budget is charged.
+ * @param operation Operation class being performed.
+ * @param budget    Optional per-tenant override of the default budget.
+ */
+export async function meterOperation(
+  tenantId: string,
+  operation: OperationClass,
+  budget: TenantBudget = DEFAULT_TENANT_BUDGET,
+): Promise<MeterResult> {
+  const cost = OPERATION_COSTS[operation];
+  const store = budgetStore;
+  if (!store) {
+    if (METERING_FAILURE_MODES[operation] === 'fail-open') {
+      return { ok: true, remaining: budget.limit, cost };
+    }
+    return {
+      ok: false,
+      status: 503,
+      code: 'METERING_UNAVAILABLE',
+      response: NextResponse.json(
+        { error: { code: 'METERING_UNAVAILABLE', message: 'Metering backend unavailable.' } },
+        { status: 503 },
+      ),
+    };
+  }
+
+  const window = Math.floor(Date.now() / 1000 / budget.windowSeconds);
+  const key = `budget:${tenantId}:${window}`;
+  let remaining: number;
+  try {
+    remaining = await store.deduct(key, cost, budget.windowSeconds);
+  } catch {
+    if (METERING_FAILURE_MODES[operation] === 'fail-open') {
+      return { ok: true, remaining: budget.limit, cost };
+    }
+    return {
+      ok: false,
+      status: 503,
+      code: 'METERING_UNAVAILABLE',
+      response: NextResponse.json(
+        { error: { code: 'METERING_UNAVAILABLE', message: 'Metering backend unavailable.' } },
+        { status: 503 },
+      ),
+    };
+  }
+
+  if (remaining < 0) {
+    const retryAfter = budget.windowSeconds - (Math.floor(Date.now() / 1000) % budget.windowSeconds);
+    return {
+      ok: false,
+      status: 429,
+      code: 'BUDGET_EXHAUSTED',
+      response: NextResponse.json(
+        { error: { code: 'BUDGET_EXHAUSTED', message: 'Tenant budget exhausted.' } },
+        {
+          status: 429,
+          headers: {
+            'Retry-After': String(Math.max(1, retryAfter)),
+            'X-RateLimit-Remaining': '0',
+            'X-RateLimit-Cost': String(cost),
+          },
+        },
+      ),
+    };
+  }
+
+  return { ok: true, remaining, cost };
+}
+
+// ── #235 Analytics coalescing ────────────────────────────────────────────────
+
+/** Minimal Redis-like surface used for single-flight locks and caching. */
+export interface AnalyticsCacheStore {
+  /** Attempts to acquire `key` for `ttlSeconds`; returns true on success. */
+  acquireLock(key: string, ttlSeconds: number): Promise<boolean>;
+  /** Releases a lock previously acquired with `acquireLock`. */
+  releaseLock(key: string): Promise<void>;
+  /** Reads a cached JSON value, or `null` when absent. */
+  get(key: string): Promise<string | null>;
+  /** Writes a JSON value with a TTL. */
+  set(key: string, value: string, ttlSeconds: number): Promise<void>;
+}
+
+/** Options controlling analytics coalescing. */
+export interface AnalyticsCoalesceOptions {
+  /** How long a computed value stays fresh, in seconds. */
+  readonly freshSeconds: number;
+  /** How long past freshness a value may still be served stale, in seconds. */
+  readonly staleSeconds: number;
+  /** Lock TTL in seconds (should exceed expected compute time). */
+  readonly lockSeconds: number;
+  /** Poll interval while waiting for another caller's result, in ms. */
+  readonly pollMs?: number;
+  /** Maximum time to wait for a coalesced result, in ms. */
+  readonly waitMs?: number;
+}
+
+/** Default coalescing options. */
+export const DEFAULT_ANALYTICS_COALESCE: AnalyticsCoalesceOptions = {
+  freshSeconds: 30,
+  staleSeconds: 120,
+  lockSeconds: 10,
+  pollMs: 50,
+  waitMs: 2_000,
+} as const;
+
+/** Result of a coalesced analytics read. */
+export interface AnalyticsResult<T> {
+  readonly value: T;
+  /** True when the value was served from the stale window. */
+  readonly stale: boolean;
+  /** True when this caller performed the computation. */
+  readonly computed: boolean;
+}
+
+let analyticsStore: AnalyticsCacheStore | null = null;
+
+/** Configures the analytics cache store used by `coalesceAnalytics`. */
+export function setAnalyticsCacheStore(store: AnalyticsCacheStore | null): void {
+  analyticsStore = store;
+}
+
+/** Returns the configured analytics cache store, if any. */
+export function getAnalyticsCacheStore(): AnalyticsCacheStore | null {
+  return analyticsStore;
+}
+
+/** Normalizes filters so equivalent filter sets share a cache key. */
+function normalizeFilters(filters: Record<string, unknown> | undefined): string {
+  return canonicalize(filters ?? {});
+}
+
+/**
+ * Builds the cache key for a coalesced analytics read. The key includes the
+ * tenant, the principal scope and the normalized filters, so entries are never
+ * reused across scopes (issue #235).
+ */
+export function analyticsCacheKey(
+  tenantId: string,
+  scope: RepresentationScope,
+  filters: Record<string, unknown> | undefined,
+): string {
+  const roles = [...(scope.roles ?? [])].sort();
+  const scopeHash = createHash('sha256')
+    .update(canonicalize({ principalId: scope.principalId, roles }), 'utf8')
+    .digest('hex');
+  const filterHash = createHash('sha256')
+    .update(normalizeFilters(filters), 'utf8')
+    .digest('hex');
+  return `analytics:${tenantId}:${scopeHash}:${filterHash}`;
+}
+
+/** Sleeps for `ms` milliseconds. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Coalesces identical cold analytics reads (issue #235).
+ *
+ * Behavior:
+ *  1. Serve a fresh cached value immediately (`stale: false`).
+ *  2. If the value is stale but within the stale window, serve it immediately
+ *     with `stale: true` and let a single caller refresh in the background.
+ *  3. On a cold miss, exactly one caller acquires a short Redis lock and
+ *     computes; concurrent callers poll for the result. If the lock holder
+ *     fails, the lock expires and the next caller retries (bounded by
+ *     `waitMs`).
+ *
+ * Entries are keyed by (tenant, principal scope, normalized filters) so
+ * permissions and filters are never mixed. If the cache store is unavailable
+ * the function fails open by computing directly — analytics must not take the
+ * API down, but the caller should surface `X-Analytics-Cache: bypass`.
+ *
+ * @param compute Callback that produces the value on a cache miss.
+ */
+export async function coalesceAnalytics<T>(
+  tenantId: string,
+  scope: RepresentationScope,
+  filters: Record<string, unknown> | undefined,
+  compute: () => Promise<T>,
+  options: AnalyticsCoalesceOptions = DEFAULT_ANALYTICS_COALESCE,
+): Promise<AnalyticsResult<T>> {
+  const store = analyticsStore;
+  if (!store) {
+    return { value: await compute(), stale: false, computed: true };
+  }
+
+  const key = analyticsCacheKey(tenantId, scope, filters);
+  const lockKey = `${key}:lock`;
+  const pollMs = options.pollMs ?? 50;
+  const waitMs = options.waitMs ?? 2_000;
+
+  // 1. Fresh hit.
+  try {
+    const cached = await store.get(key);
+    if (cached !== null) {
+      const parsed = JSON.parse(cached) as { value: T; storedAt: number };
+      const ageSeconds = (Date.now() - parsed.storedAt) / 1000;
+      if (ageSeconds <= options.freshSeconds) {
+        return { value: parsed.value, stale: false, computed: false };
+      }
+      if (ageSeconds <= options.freshSeconds + options.staleSeconds) {
+        // 2. Stale hit: serve immediately, refresh in the background if we win
+        //    the lock. Background failures are swallowed; the stale value
+        //    remains valid until it falls out of the stale window.
+        void (async () => {
+          try {
+            if (await store.acquireLock(lockKey, options.lockSeconds)) {
+              try {
+                const value = await compute();
+                await store.set(
+                  key,
+                  JSON.stringify({ value, storedAt: Date.now() }),
+                  options.freshSeconds + options.staleSeconds,
+                );
+              } finally {
+                await store.releaseLock(lockKey);
+              }
+            }
+          } catch {
+            /* keep serving stale */
+          }
+        })();
+        return { value: parsed.value, stale: true, computed: false };
+      }
+    }
+  } catch {
+    // Cache read failed: fail open by computing directly.
+    return { value: await compute(), stale: false, computed: true };
+  }
+
+  // 3. Cold miss: single-flight.
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    let acquired = false;
+    try {
+      acquired = await store.acquireLock(lockKey, options.lockSeconds);
+    } catch {
+      return { value: await compute(), stale: false, computed: true };
+    }
+    if (acquired) {
+      try {
+        const value = await compute();
+        await store.set(
+          key,
+          JSON.stringify({ value, storedAt: Date.now() }),
+          options.freshSeconds + options.staleSeconds,
+        );
+        return { value, stale: false, computed: true };
+      } finally {
+        try {
+          await store.releaseLock(lockKey);
+        } catch {
+          /* lock will expire */
+        }
+      }
+    }
+    // Another caller is computing: wait briefly and re-check the cache.
+    await sleep(pollMs);
+    try {
+      const cached = await store.get(key);
+      if (cached !== null) {
+        const parsed = JSON.parse(cached) as { value: T; storedAt: number };
+        return { value: parsed.value, stale: false, computed: false };
+      }
+    } catch {
+      return { value: await compute(), stale: false, computed: true };
+    }
+  }
+
+  // Timed out waiting: compute directly rather than failing the request.
+  return { value: await compute(), stale: false, computed: true };
 }
 
 /** Builds a JSON error response with the given status. */

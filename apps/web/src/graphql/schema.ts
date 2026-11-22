@@ -738,6 +738,12 @@ export const typeDefs = /* GraphQL */`
   type CampaignAnalyticsDashboard {
     campaignId: ID!
     updatedAt: Int!
+    """
+    Whether this payload was served from a bounded stale cache because a
+    fresh computation could not complete in time (issue #235). Clients should
+    treat stale data as advisory and may retry later.
+    """
+    stale: Boolean!
     trafficSources: [TrafficSourceStat!]!
     funnel: [FunnelStage!]!
     demographics: [BackerDemographic!]!
@@ -751,6 +757,19 @@ export const typeDefs = /* GraphQL */`
     contributions: Int!
     totalFunded: String!
     conversionRate: Float!
+  }
+
+  """
+  Remaining operation-cost budget for the calling tenant (issue #234).
+  Exposed so clients can back off before receiving a 429.
+  """
+  type OperationBudget {
+    """Weighted cost units remaining in the current window."""
+    remaining: Int!
+    """Total weighted cost units granted per window."""
+    limit: Int!
+    """Unix timestamp (seconds) when the window resets."""
+    resetAt: Int!
   }
 
   enum GrantProgramStatus {

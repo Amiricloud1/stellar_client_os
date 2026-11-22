@@ -11,6 +11,29 @@ import { z } from 'zod';
  * - Path/query values arrive as strings, so numeric ids are coerced.
  * - Use `parseRequest` to convert a schema result into a consistent
  *   `{ error, code: 'INVALID_INPUT', details }` 400 payload.
+ *
+ * Request budgets (issue #233)
+ * ----------------------------
+ * Oversized bodies, deeply nested lists, and excessive filters are rejected
+ * *before* expensive application or database work. Budgets are expressed as
+ * Zod schemas so the same limits are shared by API routes and forms:
+ *
+ * - `requestBudgetSchema` — the effective limits for a request:
+ *   - `maxBodyBytes` (default `MAX_BODY_BYTES` = 1 MiB)
+ *   - `maxListDepth` (default `MAX_LIST_DEPTH` = 5)
+ *   - `maxFilterCount` (default `MAX_FILTER_COUNT` = 20)
+ * - `filterBudgetSchema` — enforces a maximum number of filters.
+ *
+ * Use `parseRequestBudget` (or `assertRequestBudget`) to obtain the explicit
+ * failure envelope instead of the generic 400:
+ *   `{ error, code: 'REQUEST_TOO_LARGE' | 'REQUEST_BUDGET_EXCEEDED',
+ *      reason, details }`
+ * `REQUEST_TOO_LARGE` maps to HTTP 413, `REQUEST_BUDGET_EXCEEDED` to 422.
+ *
+ * Migration note: previously oversized payloads were either accepted or
+ * surfaced as generic `INVALID_INPUT` 400s. Callers that need to distinguish
+ * budget failures must switch to `parseRequestBudget`; the generic
+ * `parseRequest` behavior is unchanged for backward compatibility.
  */
 
 /* -------------------------------------------------------------------------- */
