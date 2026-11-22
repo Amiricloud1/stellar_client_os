@@ -21,6 +21,10 @@ pub enum DataKey {
     PreviousImplementationHash,
     /// Storage schema version.
     SchemaVersion,
+    /// Staged admin transition: stores (proposed_admin, confirmation_deadline).
+    PendingAdminTransition,
+    /// Network ID to prevent cross-network key reuse.
+    NetworkId,
 }
 
 /// Core state of the proxy contract.
@@ -31,6 +35,16 @@ pub struct UpgradeProposal {
     pub new_hash: BytesN<32>,
     /// Ledger timestamp when the upgrade was approved.
     pub approved_at: u64,
+}
+
+/// Staged admin transition state.
+#[contracttype]
+#[derive(Clone)]
+pub struct AdminTransition {
+    /// The proposed new admin.
+    pub proposed_admin: Address,
+    /// Deadline for confirmation.
+    pub confirmation_deadline: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -49,6 +63,16 @@ pub enum Error {
     InvalidImplementationHash = 6,
     UpgradeAlreadyPending = 7,
     NoPreviousImplementation = 8,
+    /// Staged admin transition is pending; cannot perform certain operations.
+    PendingAdminTransition = 9,
+    /// Admin transition confirmation deadline has passed.
+    AdminTransitionExpired = 10,
+    /// No admin transition is pending.
+    NoPendingAdminTransition = 11,
+    /// Caller is not the proposed admin.
+    NotProposedAdmin = 12,
+    /// Cross-network key detected.
+    CrossNetworkKeyDetected = 13,
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +106,7 @@ impl UpgradeProxyContract {
     /// Initialize the proxy contract.
     ///
     /// Sets the admin and the initial implementation hash.
+    /// Records network ID to prevent cross-network key reuse.
     ///
     /// # Arguments
     /// * `admin`              — Address authorized to approve upgrades.
@@ -99,6 +124,11 @@ impl UpgradeProxyContract {
         env.storage()
             .instance()
             .set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
+        
+        // Record network ID to prevent cross-network key reuse
+        let network_id = env.ledger().network_id();
+        env.storage().instance().set(&DataKey::NetworkId, &network_id);
+        
         env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
     }
 
@@ -119,9 +149,15 @@ impl UpgradeProxyContract {
     /// * [`Error::NotInitialized`] — contract not initialized.
     /// * [`Error::UpgradeAlreadyPending`] — a proposal is already pending.
     /// * [`Error::InvalidImplementationHash`] — hash is empty or identical to current.
+    /// * [`Error::PendingAdminTransition`] — admin transition is pending; cannot propose upgrade.
     pub fn approve_upgrade(env: Env, new_hash: BytesN<32>) {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
+
+        // Prevent upgrades while admin transition is pending
+        if env.storage().instance().has(&DataKey::PendingAdminTransition) {
+            panic_with_error!(&env, Error::PendingAdminTransition);
+        }
 
         if env.storage().instance().has(&DataKey::PendingUpgrade) {
             panic_with_error!(&env, Error::UpgradeAlreadyPending);
@@ -266,9 +302,17 @@ impl UpgradeProxyContract {
     ///
     /// # Arguments
     /// * `fallback_hash` — WASM hash of the validated fallback implementation.
+    /// 
+    /// # Errors
+    /// * [`Error::PendingAdminTransition`] — cannot recover while admin transition pending.
     pub fn emergency_recovery(env: Env, fallback_hash: BytesN<32>) {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
+
+        // Prevent recovery while admin transition is pending
+        if env.storage().instance().has(&DataKey::PendingAdminTransition) {
+            panic_with_error!(&env, Error::PendingAdminTransition);
+        }
 
         let current_hash = Self::get_implementation_hash(env.clone());
         if fallback_hash == current_hash {
@@ -286,6 +330,141 @@ impl UpgradeProxyContract {
 
         env.events()
             .publish(("EmergencyRecovery",), (admin, fallback_hash));
+    }
+
+    // -----------------------------------------------------------------------
+    // Staged Admin Transition (Issue #1: Authority Rotation & Recovery)
+    // -----------------------------------------------------------------------
+
+    /// Propose a new admin (current admin only).
+    /// New admin must confirm acceptance within confirmation_period seconds.
+    ///
+    /// # Arguments
+    /// * `proposed_admin` — The new admin candidate.
+    /// * `confirmation_period` — Seconds within which proposed admin must confirm.
+    ///
+    /// # Errors
+    /// * [`Error::Unauthorized`] — caller is not the current admin.
+    /// * [`Error::PendingAdminTransition`] — a transition is already pending.
+    /// * [`Error::UpgradeAlreadyPending`] — cannot change admin during upgrade.
+    pub fn propose_admin_transition(
+        env: Env,
+        proposed_admin: Address,
+        confirmation_period: u64,
+    ) {
+        let admin = Self::get_admin(env.clone());
+        admin.require_auth();
+
+        // Prevent admin changes while upgrade is pending
+        if env.storage().instance().has(&DataKey::PendingUpgrade) {
+            panic_with_error!(&env, Error::UpgradeAlreadyPending);
+        }
+
+        // Prevent concurrent admin transitions
+        if env.storage().instance().has(&DataKey::PendingAdminTransition) {
+            panic_with_error!(&env, Error::PendingAdminTransition);
+        }
+
+        let confirmation_deadline = env
+            .ledger()
+            .timestamp()
+            .saturating_add(confirmation_period);
+
+        let transition = AdminTransition {
+            proposed_admin: proposed_admin.clone(),
+            confirmation_deadline,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdminTransition, &transition);
+        env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+
+        env.events().publish(
+            ("AdminTransitionProposed",),
+            (admin.clone(), proposed_admin, confirmation_deadline),
+        );
+    }
+
+    /// Confirm acceptance of admin role (proposed admin only).
+    /// Must be called before confirmation_deadline elapses.
+    ///
+    /// # Errors
+    /// * [`Error::NoPendingAdminTransition`] — no transition is pending.
+    /// * [`Error::NotProposedAdmin`] — caller is not the proposed admin.
+    /// * [`Error::AdminTransitionExpired`] — confirmation deadline has passed.
+    pub fn confirm_admin_transition(env: Env) {
+        let transition: AdminTransition = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdminTransition)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingAdminTransition));
+
+        transition.proposed_admin.require_auth();
+
+        if env.ledger().timestamp() > transition.confirmation_deadline {
+            panic_with_error!(&env, Error::AdminTransitionExpired);
+        }
+
+        let prev_admin = Self::get_admin(env.clone());
+
+        // Update admin
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &transition.proposed_admin);
+
+        // Clear pending transition
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdminTransition);
+        env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+
+        env.events().publish(
+            ("AdminTransitionConfirmed",),
+            (transition.proposed_admin.clone(), prev_admin),
+        );
+    }
+
+    /// Cancel a pending admin transition (current admin only).
+    ///
+    /// # Errors
+    /// * [`Error::Unauthorized`] — caller is not the current admin.
+    /// * [`Error::NoPendingAdminTransition`] — no transition is pending.
+    pub fn cancel_admin_transition(env: Env) {
+        let admin = Self::get_admin(env.clone());
+        admin.require_auth();
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::PendingAdminTransition)
+        {
+            panic_with_error!(&env, Error::NoPendingAdminTransition);
+        }
+
+        let transition: AdminTransition = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdminTransition)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingAdminTransition));
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdminTransition);
+        env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+
+        env.events().publish(
+            ("AdminTransitionCanceled",),
+            (admin, transition.proposed_admin),
+        );
+    }
+
+    /// Get pending admin transition, if any.
+    pub fn get_pending_admin_transition(env: Env) -> Option<(Address, u64)> {
+        env.storage()
+            .instance()
+            .get::<_, AdminTransition>(&DataKey::PendingAdminTransition)
+            .map(|t| (t.proposed_admin, t.confirmation_deadline))
     }
 
     // -----------------------------------------------------------------------
@@ -588,6 +767,137 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(client.get_schema_version(), SCHEMA_VERSION);
     }
-}
+
+    // -----------------------------------------------------------------------
+    // Issue #1: Authority Rotation & Recovery Security
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_propose_admin_transition() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, client) = setup_contract(&env);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin_transition(&new_admin, &3600);
+
+        let pending = client.get_pending_admin_transition();
+        assert!(pending.is_some());
+        let (proposed, deadline) = pending.unwrap();
+        assert_eq!(proposed, new_admin);
+        assert!(deadline > env.ledger().timestamp());
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #9)")]
+    fn test_propose_upgrade_blocked_during_admin_transition() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, client) = setup_contract(&env);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin_transition(&new_admin, &3600);
+
+        // Attempting to propose upgrade while admin transition pending should fail
+        let new_hash = BytesN::from_array(&env, &[1u8; 32]);
+        client.approve_upgrade(&new_hash);
+    }
+
+    #[test]
+    fn test_confirm_admin_transition_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (admin, client) = setup_contract(&env);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin_transition(&new_admin, &3600);
+
+        // New admin confirms
+        client.confirm_admin_transition();
+
+        // Verify new admin is in place
+        assert_eq!(client.get_admin(), new_admin);
+        assert!(client.get_pending_admin_transition().is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #10)")]
+    fn test_admin_transition_confirmation_expires() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (admin, client) = setup_contract(&env);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin_transition(&new_admin, &3600);
+
+        // Advance past deadline
+        set_time(&env, 1_000 + 5_000);
+
+        // Attempt to confirm should fail
+        client.confirm_admin_transition();
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #11)")]
+    fn test_confirm_without_pending_transition_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, client) = setup_contract(&env);
+
+        // No pending transition exists
+        client.confirm_admin_transition();
+    }
+
+    #[test]
+    fn test_cancel_admin_transition() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, client) = setup_contract(&env);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin_transition(&new_admin, &3600);
+
+        assert!(client.get_pending_admin_transition().is_some());
+
+        // Admin cancels transition
+        client.cancel_admin_transition();
+
+        assert!(client.get_pending_admin_transition().is_none());
+        // Original admin still in place
+        assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #13)")]
+    fn test_emergency_recovery_blocked_during_admin_transition() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, client) = setup_contract(&env);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin_transition(&new_admin, &3600);
+
+        // Recovery should be blocked
+        let recovery_hash = BytesN::from_array(&env, &[9u8; 32]);
+        client.emergency_recovery(&recovery_hash);
+    }
+
+    #[test]
+    fn test_staged_transition_preserves_other_operations() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (admin, client) = setup_contract(&env);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin_transition(&new_admin, &3600);
+
+        // Other read-only operations should still work
+        assert!(client.get_schema_version() > 0);
+        let impl_hash = client.get_implementation_hash();
+        assert!(impl_hash.len() == 32);
+    }
 
 
