@@ -13,6 +13,19 @@ import {
 
 export type CampaignStatus = "DRAFT" | "PENDING_VERIFICATION" | "ACTIVE" | "PAUSED" | "COMPLETED" | "FAILED";
 
+export type {
+  CampaignReadinessCategory,
+  CampaignReadinessCheck,
+  CampaignReadinessReport,
+  CampaignReadinessInput,
+} from "./campaign-readiness.service";
+import {
+  evaluateCampaignReadiness,
+  assertCampaignReady,
+  type CampaignReadinessReport,
+  type CampaignReadinessInput,
+} from "./campaign-readiness.service";
+
 export type CampaignSortField =
   | "createdAt"
   | "updatedAt"
@@ -911,7 +924,7 @@ export async function recordCampaignContribution(
   return { campaign: updated, milestones: newlyReached };
 }
 
-export async function createCampaign(input: {
+export interface CreateCampaignInput {
   id?: string;
   creator: string;
   creatorEmail?: string;
@@ -942,7 +955,30 @@ export async function createCampaign(input: {
   sponsors?: SponsorRecord[];
   network?: "testnet" | "mainnet";
   nonprofitPartner?: Omit<CampaignNonprofitPartner, "verificationStatus" | "verifiedAt" | "verifiedBy">;
-}, dataSource = getCampaignDataSource(), now = Date.now()): Promise<CampaignRecord> {
+  /** Optional payout terms validated by the pre-launch readiness checklist. */
+  payoutTerms?: CampaignReadinessInput["payoutTerms"];
+  /** Optional milestone plan validated by the pre-launch readiness checklist. */
+  milestones?: CampaignReadinessInput["milestones"];
+  /** Optional asset support declaration validated by the readiness checklist. */
+  assetSupport?: CampaignReadinessInput["assetSupport"];
+  /** When true, creation fails if the readiness checklist has blocking issues. */
+  enforceReadiness?: boolean;
+}
+
+/**
+ * Evaluate the pre-launch readiness checklist for a campaign record.
+ *
+ * The checklist validates required metadata, network, asset support,
+ * milestones, and payout terms. It is a pure read: it never mutates the
+ * campaign and is safe to call from UI, API, and deployment paths.
+ */
+export function getCampaignReadiness(
+  campaign: Partial<CampaignRecord> & Partial<CampaignReadinessInput>,
+): CampaignReadinessReport {
+  return evaluateCampaignReadiness(campaign);
+}
+
+export async function createCampaign(input: CreateCampaignInput, dataSource = getCampaignDataSource(), now = Date.now()): Promise<CampaignRecord> {
   if (input.coordinates !== undefined) {
     const { latitude, longitude } = input.coordinates;
     if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
@@ -997,6 +1033,19 @@ gpsLocations: input.gpsLocations,
   };
   campaign.statusHistory[0].campaignId = campaign.id;
   campaign.statusHistory[0].id = `${campaign.id}:${now}:0`;
+
+  // Surface readiness failures at the authoritative creation boundary. When
+  // enforcement is requested, blocking issues abort the write with an explicit
+  // error so operators can recover by fixing the metadata and retrying.
+  if (input.enforceReadiness) {
+    assertCampaignReady({
+      ...campaign,
+      payoutTerms: input.payoutTerms,
+      milestones: input.milestones,
+      assetSupport: input.assetSupport,
+    });
+  }
+
   return persistCampaign(dataSource, campaign);
 }
 
@@ -1207,6 +1256,13 @@ export async function transitionCampaignStatus(
   if (campaign.status === toStatus) return campaign;
   if (!allowedTransitions[campaign.status].includes(toStatus)) {
     throw new Error(`Invalid campaign status transition: ${campaign.status} -> ${toStatus}`);
+  }
+
+  // Launching a campaign (DRAFT -> PENDING_VERIFICATION) requires the
+  // pre-launch readiness checklist to pass. Failures are surfaced explicitly
+  // so the creator/operator can fix the metadata and retry.
+  if (campaign.status === "DRAFT" && toStatus === "PENDING_VERIFICATION") {
+    assertCampaignReady(campaign);
   }
 
   // The status change and its history entry are committed atomically.
@@ -1923,4 +1979,54 @@ export async function applyCampaignChainCorrection(
     updatedAt: now,
   };
   return persistCampaign(dataSource, corrected);
+}
+
+/**
+ * Update mutable campaign metadata and re-run the readiness checklist.
+ *
+ * When `enforceReadiness` is set, blocking readiness issues abort the update
+ * before any write occurs, leaving the committed record untouched so the
+ * caller can correct the input and retry. Returns `null` when the campaign is
+ * unknown.
+ */
+export async function updateCampaignMetadata(
+  campaignId: string,
+  patch: Partial<CreateCampaignInput>,
+  dataSource: CampaignDataSource = getCampaignDataSource(),
+  now = Date.now(),
+): Promise<{ campaign: CampaignRecord; readiness: CampaignReadinessReport } | null> {
+  const campaign = await getCampaign(campaignId, dataSource);
+  if (!campaign) return null;
+  const next: CampaignRecord = {
+    ...campaign,
+    name: patch.name ?? campaign.name,
+    description: patch.description ?? campaign.description,
+    location: patch.location ?? campaign.location,
+    countries: patch.countries ?? campaign.countries,
+    speciesTags: patch.speciesTags ?? campaign.speciesTags,
+    region: patch.region ?? campaign.region,
+    treeSpecies: patch.treeSpecies ?? campaign.treeSpecies,
+    species: patch.species ?? campaign.species,
+    treeCount: patch.treeCount ?? campaign.treeCount,
+    co2SequestrationKg: patch.co2SequestrationKg ?? campaign.co2SequestrationKg,
+    goalAmount: patch.goalAmount ?? campaign.goalAmount,
+    network: patch.network ?? campaign.network,
+    updatedAt: now,
+  };
+  const readiness = evaluateCampaignReadiness({
+    ...next,
+    payoutTerms: patch.payoutTerms,
+    milestones: patch.milestones,
+    assetSupport: patch.assetSupport,
+  });
+  if (patch.enforceReadiness && !readiness.ready) {
+    assertCampaignReady({
+      ...next,
+      payoutTerms: patch.payoutTerms,
+      milestones: patch.milestones,
+      assetSupport: patch.assetSupport,
+    });
+  }
+  const saved = await persistCampaign(dataSource, next);
+  return { campaign: saved, readiness };
 }

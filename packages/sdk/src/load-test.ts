@@ -9,7 +9,7 @@
  * Companion operator guidance lives in docs/load-testing.md.
  */
 
-export type LoadProfile = "burst" | "soak";
+export type LoadProfile = "burst" | "soak" | "outage-recovery";
 
 export interface BurstProfile {
   type: "burst";
@@ -29,7 +29,21 @@ export interface SoakProfile {
   durationMs: number;
 }
 
-export type LoadProfileSpec = BurstProfile | SoakProfile;
+export interface OutageRecoveryProfile {
+  type: "outage-recovery";
+  /** Concurrency of producers/consumers during the healthy phase. */
+  concurrency: number;
+  /** Duration of the healthy phase before the outage, in ms. */
+  healthyDurationMs: number;
+  /** Duration of the simulated outage, in ms. */
+  outageDurationMs: number;
+  /** Duration of the recovery phase after the outage, in ms. */
+  recoveryDurationMs: number;
+  /** Maximum number of events the consumer may buffer during the outage. */
+  maxBufferedEvents: number;
+}
+
+export type LoadProfileSpec = BurstProfile | SoakProfile | OutageRecoveryProfile;
 
 export interface Thresholds {
   /** Maximum allowed average latency (ms). */
@@ -47,6 +61,16 @@ export interface LoadTarget {
   name: string;
   /** Execute one operation. Returns latency and whether it succeeded. */
   execute(): Promise<{ ok: boolean; latencyMs: number }>;
+  /**
+   * Optional: number of events currently buffered by the consumer. Used by the
+   * outage-recovery profile to prove bounded memory under backpressure.
+   */
+  bufferedEvents?(): number;
+  /**
+   * Optional: simulate an outage (RPC or consumer). While active, `execute`
+   * should fail. Used by the outage-recovery profile.
+   */
+  setOutage?(active: boolean): void;
 }
 
 export interface LoadTestResult {
@@ -65,6 +89,12 @@ export interface LoadTestResult {
   passed: boolean;
   /** Human-readable list of any breached thresholds. */
   breaches: string[];
+  /** Peak number of buffered events observed (outage-recovery only). */
+  peakBufferedEvents?: number;
+  /** Operations completed during the recovery phase (outage-recovery only). */
+  recoveredOperations?: number;
+  /** True when the target was observed to recover after the outage. */
+  recovered?: boolean;
 }
 
 function nowMs(): number {
@@ -139,6 +169,101 @@ export async function runLoadProfile(
     while (nowMs() < deadline) {
       await runBatch(spec.concurrency);
     }
+  } else if (spec.type === "outage-recovery") {
+    let peakBuffered = 0;
+    const sampleBuffered = (): void => {
+      if (typeof target.bufferedEvents === "function") {
+        peakBuffered = Math.max(peakBuffered, target.bufferedEvents());
+      }
+    };
+
+    // Healthy phase.
+    const healthyDeadline = start + spec.healthyDurationMs;
+    while (nowMs() < healthyDeadline) {
+      await runBatch(spec.concurrency);
+      sampleBuffered();
+    }
+
+    // Outage phase: target should fail; buffering must stay bounded.
+    target.setOutage?.(true);
+    const outageDeadline = nowMs() + spec.outageDurationMs;
+    while (nowMs() < outageDeadline) {
+      await runBatch(spec.concurrency);
+      sampleBuffered();
+    }
+
+    // Recovery phase: target should succeed again.
+    target.setOutage?.(false);
+    const recoveryStart = nowMs();
+    const recoveryDeadline = recoveryStart + spec.recoveryDurationMs;
+    const successesBeforeRecovery = successes;
+    while (nowMs() < recoveryDeadline) {
+      await runBatch(spec.concurrency);
+      sampleBuffered();
+    }
+    const recoveredOperations = successes - successesBeforeRecovery;
+    const recovered = recoveredOperations > 0;
+
+    const durationMs = nowMs() - start;
+    const operations = successes + failures;
+    const sorted = [...latencies].sort((a, b) => a - b);
+    const avgLatencyMs = mean(latencies);
+    const p95LatencyMs = p95(sorted);
+    const maxLatencyMs = sorted.length > 0 ? sorted[sorted.length - 1] : 0;
+    const errorRate = operations > 0 ? failures / operations : 0;
+    peakMemory = Math.max(peakMemory, memoryMb());
+
+    const breaches: string[] = [];
+    if (avgLatencyMs > thresholds.maxAvgLatencyMs) {
+      breaches.push(
+        `avg latency ${avgLatencyMs.toFixed(1)}ms > ${thresholds.maxAvgLatencyMs}ms`
+      );
+    }
+    if (p95LatencyMs > thresholds.maxP95LatencyMs) {
+      breaches.push(
+        `p95 latency ${p95LatencyMs.toFixed(1)}ms > ${thresholds.maxP95LatencyMs}ms`
+      );
+    }
+    if (errorRate > thresholds.maxErrorRate) {
+      breaches.push(
+        `error rate ${(errorRate * 100).toFixed(1)}% > ${(thresholds.maxErrorRate * 100).toFixed(1)}%`
+      );
+    }
+    if (
+      thresholds.maxMemoryMb !== undefined &&
+      peakMemory > thresholds.maxMemoryMb
+    ) {
+      breaches.push(
+        `peak memory ${peakMemory.toFixed(1)}MB > ${thresholds.maxMemoryMb}MB`
+      );
+    }
+    if (peakBuffered > spec.maxBufferedEvents) {
+      breaches.push(
+        `peak buffered events ${peakBuffered} > ${spec.maxBufferedEvents}`
+      );
+    }
+    if (!recovered) {
+      breaches.push("target did not recover after outage");
+    }
+
+    return {
+      profile: spec.type,
+      target: target.name,
+      operations,
+      successes,
+      failures,
+      avgLatencyMs,
+      p95LatencyMs,
+      maxLatencyMs,
+      errorRate,
+      peakMemoryMb: peakMemory,
+      durationMs,
+      passed: breaches.length === 0,
+      breaches,
+      peakBufferedEvents: peakBuffered,
+      recoveredOperations,
+      recovered,
+    };
   } else {
     // burst: ramp concurrency 1 -> concurrency over rampUpMs, then hold.
     const burstStart = start;
@@ -203,6 +328,55 @@ export async function runLoadProfile(
     passed: breaches.length === 0,
     breaches,
   };
+}
+
+/**
+ * Recovery throughput check: after an outage, measure how many operations the
+ * target can complete per second until it responds successfully `checks` times
+ * in a row, or `maxAttempts` is reached. Returns the observed throughput and
+ * whether the target recovered.
+ */
+export async function recoveryThroughput(
+  target: LoadTarget,
+  options: {
+    /** Number of consecutive successful probes required. Default 3. */
+    checks?: number;
+    /** Delay between probes in ms. Default 50. */
+    delayMs?: number;
+    /** Maximum number of probe attempts. Default 20. */
+    maxAttempts?: number;
+  } = {}
+): Promise<{ recovered: boolean; operationsPerSecond: number }> {
+  const checks = options.checks ?? 3;
+  const delayMs = options.delayMs ?? 50;
+  const maxAttempts = options.maxAttempts ?? 20;
+
+  const start = nowMs();
+  let consecutive = 0;
+  let completed = 0;
+  let recovered = false;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    let ok = false;
+    try {
+      const result = await target.execute();
+      ok = result.ok;
+    } catch {
+      ok = false;
+    }
+    if (ok) {
+      completed += 1;
+      consecutive += 1;
+      if (consecutive >= checks) {
+        recovered = true;
+        break;
+      }
+    } else {
+      consecutive = 0;
+    }
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  const elapsedMs = Math.max(1, nowMs() - start);
+  return { recovered, operationsPerSecond: (completed * 1000) / elapsedMs };
 }
 
 /**

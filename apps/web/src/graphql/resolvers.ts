@@ -7,14 +7,26 @@
 
 import { DefaultStreamDataSource, getAnalyticsService } from "./analytics.service";
 import { withExecutionTimeout } from "./query-guard";
+import { getDeploymentRegistryService } from "@/services/deployment-registry.service";
+import { getContractEventMappingService } from "@/services/contract-event-mapping.service";
+import { getProjectionReplayService } from "@/services/projection-replay.service";
+import { getEventConsumerMetricsService } from "@/services/event-consumer-metrics.service";
 import { getCampaignHealthAssessment, getCampaignRiskAssessment, getCampaignVerificationSummary, queryCampaigns } from "@/services/campaign.service";
 import type { CampaignDataSource, CampaignQueryInput } from "@/services/campaign.service";
 import { getCampaignSequelService } from "@/services/campaign-sequel.service";
 import { getCampaignAnalyticsDashboard } from "@/services/campaign-analytics-dashboard.service";
 import { getGrantProgramService } from "@/services/grant-program.service";
-import { getCampaignExportService } from "@/services/campaign-export.service";
-import { getCampaignSearchService } from "@/services/campaign-search.service";
-import { getCampaignWebhookService } from "@/services/campaign-webhook.service";
+import { getWebhookSubscriptionService } from "@/services/webhook-subscription.service";
+import {
+  getCampaignTermsService,
+  TermsSnapshotMismatchError,
+} from "@/services/campaign-terms.service";
+import {
+  getCampaignVerificationAuditService,
+  StaleEvidenceVersionError,
+  ReviewerAuthorizationError,
+} from "@/services/campaign-verification-audit.service";
+import { getCampaignDonationService } from "@/services/campaign-donation.service";
 import {
   buildPageInfo,
   normalizePagination,
@@ -60,12 +72,82 @@ function runAnalytics<T>(operation: () => Promise<T> | T): Promise<T> {
   return withExecutionTimeout(operation);
 }
 
+/**
+ * Weighted operation costs (issue #234). Analytics and export workloads are
+ * metered more heavily than lightweight reads so that a single tenant cannot
+ * starve others by hammering expensive endpoints.
+ */
+const OPERATION_COST: Record<string, OperationCost> = {
+  "Query.globalMetrics": 5,
+  "Query.regionMetrics": 5,
+  "Query.categoryMetrics": 5,
+  "Query.assetMetrics": 5,
+  "Query.sponsorImpact": 5,
+  "Query.campaignAnalytics": 5,
+  "Query.exportAnalytics": 10,
+};
+
+function operationCost(operationName: string): OperationCost {
+  return OPERATION_COST[operationName] ?? 1;
+}
+
+/**
+ * Enforce request-size and collection budgets (issue #233) and meter the
+ * operation against the tenant's weighted budget (issue #234).
+ *
+ * Throws a `RequestBudgetError` (mapped to a 422 envelope) when the request
+ * shape exceeds the configured limits, or a `TenantBudgetExhaustedError`
+ * (mapped to a 429 envelope with `Retry-After`) when the tenant has exhausted
+ * its weighted budget for the current window.
+ */
+function enforceAndMeter(
+  operationName: string,
+  ctx: ResolverContext,
+  rawArgs: unknown,
+): void {
+  enforceRequestBudget(operationName, rawArgs);
+  const accountId = ctx.accountId ?? "anonymous";
+  meterOperation(accountId, operationName, operationCost(operationName));
+}
+
+/**
+ * Surface the stale indicator (issue #235) on analytics responses served from
+ * the coalescer's bounded stale-serving window.
+ */
+function withStaleIndicator<T extends Record<string, unknown>>(
+  result: T,
+  stale: boolean,
+): T & { stale: boolean } {
+  return { ...result, stale };
+}
+
 function toBigInt(value: string): bigint {
   try {
     return BigInt(value);
   } catch {
     return 0n;
   }
+}
+
+/**
+ * Require an authenticated account for operator-only fields.
+ *
+ * Deployment registry mutations, projection replays and consumer metrics are
+ * operational surfaces: they expose deployment state and can trigger
+ * state-rebuilding work, so they are restricted to authenticated operators.
+ * Unauthenticated callers receive an explicit authorization error rather than
+ * an empty result (issues #218, #220, #222).
+ */
+function requireOperator(ctx: ResolverContext): string {
+  const accountId = ctx.accountId;
+  if (!accountId) {
+    throw new Error("Unauthorized: an authenticated operator account is required");
+  }
+  const roles = ctx.roles ?? [];
+  if (roles.length > 0 && !roles.includes("operator") && !roles.includes("admin")) {
+    throw new Error("Forbidden: operator role required");
+  }
+  return accountId;
 }
 
 /**
@@ -144,8 +226,7 @@ function toProgramPayload(program: import("@/services/grant-program.service").Gr
 }
 
 /**
- * Require an authenticated account id for account-scoped resolvers.
- * Throws an explicit authorization error when the context is anonymous.
+ * Require an authenticated account id, throwing a stable error otherwise.
  */
 function requireAccountId(ctx: ResolverContext): string {
   if (!ctx.accountId) {
@@ -155,56 +236,49 @@ function requireAccountId(ctx: ResolverContext): string {
 }
 
 /**
- * Require the `admin` role for operator-only mutations (issue #230).
+ * Require the caller to hold a reviewer or admin role. The authoritative check
+ * also lives in the verification-audit service; this is a fast-fail guard that
+ * surfaces a stable error code to clients.
  */
-function requireAdmin(ctx: ResolverContext): string {
+function requireReviewer(ctx: ResolverContext): string {
   const accountId = requireAccountId(ctx);
-  if (!ctx.roles || !ctx.roles.includes("admin")) {
-    throw new Error("FORBIDDEN: operator role 'admin' is required");
+  const roles = ctx.roles ?? [];
+  if (!roles.includes("reviewer") && !roles.includes("admin")) {
+    throw new Error("FORBIDDEN: reviewer or admin role required");
   }
   return accountId;
 }
 
 /**
- * Map a campaign export job to its public GraphQL shape. The artifact URL is
- * only exposed once the job has completed; FAILED/EXPIRED jobs surface their
- * terminal state and error message so clients can react explicitly.
+ * Map a terms snapshot to its public GraphQL shape (issue #176).
  */
-function toCampaignExportJobPayload(job: import("@/services/campaign-export.service").CampaignExportJob) {
-  const isTerminal = job.status === "COMPLETED" || job.status === "FAILED" || job.status === "EXPIRED";
+function toTermsSnapshotPayload(snapshot: import("@/services/campaign-terms.service").CampaignTermsSnapshot) {
   return {
-    id: job.id,
-    campaignId: job.campaignId,
-    status: job.status,
-    progress: job.progress,
-    format: job.format,
-    artifactUrl: job.status === "COMPLETED" ? job.artifactUrl ?? null : null,
-    error: job.error ?? null,
-    attempts: job.attempts,
-    maxAttempts: job.maxAttempts,
-    createdAt: Math.floor(job.createdAt / 1000),
-    updatedAt: Math.floor(job.updatedAt / 1000),
-    expiresAt: job.expiresAt ? Math.floor(job.expiresAt / 1000) : null,
-    completedAt: job.completedAt ? Math.floor(job.completedAt / 1000) : null,
-    isTerminal,
+    id: snapshot.id,
+    campaignId: snapshot.campaignId,
+    version: snapshot.version,
+    contentHash: snapshot.contentHash,
+    terms: snapshot.terms,
+    createdAt: Math.floor(snapshot.createdAt / 1000),
   };
 }
 
 /**
- * Map a webhook redelivery attempt to its public GraphQL shape (issue #230).
+ * Map a reviewer comment to its public GraphQL shape (issue #178).
  */
-function toWebhookRedeliveryPayload(attempt: import("@/services/campaign-webhook.service").WebhookRedeliveryAttempt) {
+function toReviewerCommentPayload(comment: import("@/services/campaign-verification-audit.service").ReviewerComment) {
   return {
-    id: attempt.id,
-    eventId: attempt.eventId,
-    subscriptionId: attempt.subscriptionId,
-    status: attempt.status,
-    attemptNumber: attempt.attemptNumber,
-    requestedBy: attempt.requestedBy,
-    responseStatus: attempt.responseStatus ?? null,
-    error: attempt.error ?? null,
-    createdAt: Math.floor(attempt.createdAt / 1000),
-    completedAt: attempt.completedAt ? Math.floor(attempt.completedAt / 1000) : null,
+    id: comment.id,
+    evidenceId: comment.evidenceId,
+    evidenceVersion: comment.evidenceVersion,
+    authorId: comment.authorId,
+    body: comment.body,
+    references: comment.references,
+    resolved: comment.resolved,
+    resolvedAt: comment.resolvedAt ? Math.floor(comment.resolvedAt / 1000) : null,
+    resolvedBy: comment.resolvedBy ?? null,
+    createdAt: Math.floor(comment.createdAt / 1000),
+    updatedAt: Math.floor(comment.updatedAt / 1000),
   };
 }
 
@@ -221,7 +295,9 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         },
         ctx: ResolverContext,
       ) => {
-        validateListArgs(args.pagination);
+        const args = guard<typeof rawArgs>("Query.campaigns", ctx, rawArgs, "campaigns");
+        enforceAndMeter("Query.campaigns", ctx, args);
+        validateListArgs(args.pagination, args.sort);
         const normalized = normalizePagination(toSharedPagination(args.pagination));
         const campaigns = await queryCampaigns({
           filter: args.filter,
@@ -246,6 +322,8 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         },
         ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.trees", ctx, rawArgs, "trees");
+        enforceAndMeter("Query.trees", ctx, args);
         validateListArgs(args.pagination, args.sort);
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const filter = args.filter ?? {};
@@ -273,9 +351,11 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
 
       planters: async (
         _: unknown,
-        args: { region?: string; pagination?: PaginationInput; sort?: SortInput; network?: Network },
+        rawArgs: { region?: string; pagination?: PaginationInput; sort?: SortInput; network?: Network },
         ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.planters", ctx, rawArgs, "planters");
+        enforceAndMeter("Query.planters", ctx, args);
         validateListArgs(args.pagination, args.sort);
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const groups = new Map<string, { region: string | null; treeCount: number; sponsoredAmount: bigint }>();
@@ -296,9 +376,11 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
 
       contracts: async (
         _: unknown,
-        args: { pagination?: PaginationInput; sort?: SortInput; network?: Network },
+        rawArgs: { pagination?: PaginationInput; sort?: SortInput; network?: Network },
         ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.contracts", ctx, rawArgs, "contracts");
+        enforceAndMeter("Query.contracts", ctx, args);
         validateListArgs(args.pagination, args.sort);
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const groups = new Map<string, { symbol: string; streamCount: number; totalVolume: bigint }>();
@@ -328,8 +410,10 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext
       ) => {
         const args = guard<typeof rawArgs>("Query.globalMetrics", ctx, rawArgs, "network");
+        enforceAndMeter("Query.globalMetrics", ctx, args);
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return runAnalytics(() => service.getGlobalMetrics(args.network ?? "testnet"));
+        const result = await runAnalytics(() => service.getGlobalMetrics(args.network ?? "testnet"));
+        return withStaleIndicator(result, Boolean((result as { stale?: boolean }).stale));
       },
 
       /**
@@ -353,9 +437,11 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         },
         ctx: ResolverContext
       ) => {
+        const args = guard<typeof rawArgs>("Query.regionMetrics", ctx, rawArgs, "regionMetrics");
+        enforceAndMeter("Query.regionMetrics", ctx, args);
         validateListArgs(args.pagination, args.sort);
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return runAnalytics(() =>
+        const rows = await runAnalytics(() =>
           service.getRegionMetrics(
             args.filter,
             args.pagination,
@@ -385,9 +471,11 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         },
         ctx: ResolverContext
       ) => {
+        const args = guard<typeof rawArgs>("Query.categoryMetrics", ctx, rawArgs, "categoryMetrics");
+        enforceAndMeter("Query.categoryMetrics", ctx, args);
         validateListArgs(args.pagination, args.sort);
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return runAnalytics(() =>
+        const rows = await runAnalytics(() =>
           service.getCategoryMetrics(
             args.filter,
             args.pagination,
@@ -417,9 +505,11 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         },
         ctx: ResolverContext
       ) => {
+        const args = guard<typeof rawArgs>("Query.assetMetrics", ctx, rawArgs, "assetMetrics");
+        enforceAndMeter("Query.assetMetrics", ctx, args);
         validateListArgs(args.pagination, args.sort);
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return runAnalytics(() =>
+        const rows = await runAnalytics(() =>
           service.getAssetMetrics(
             args.filter,
             args.pagination,
@@ -447,10 +537,12 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext
       ) => {
         const args = guard<typeof rawArgs>("Query.sponsorImpact", ctx, rawArgs, "sponsorImpact");
+        enforceAndMeter("Query.sponsorImpact", ctx, args);
         const service = getAnalyticsService(ctx.dataSource ?? defaultDataSource);
-        return runAnalytics(() =>
+        const result = await runAnalytics(() =>
           service.getSponsorImpact(args.address, args.network ?? "testnet")
         );
+        return withStaleIndicator(result, Boolean((result as { stale?: boolean }).stale));
       },
 
       campaignSequels: async (
@@ -459,6 +551,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext,
       ) => {
         const args = guard<typeof rawArgs>("Query.campaignSequels", ctx, rawArgs, "campaignSequels");
+        enforceAndMeter("Query.campaignSequels", ctx, args);
         const sequels = await getCampaignSequelService(ctx.campaignDataSource).getSequels(args.campaignId, {
           relation: args.relation,
         });
@@ -477,6 +570,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext,
       ) => {
         const args = guard<typeof rawArgs>("Query.nextInSeries", ctx, rawArgs, "campaignId");
+        enforceAndMeter("Query.nextInSeries", ctx, args);
         const result = await getCampaignSequelService(ctx.campaignDataSource).getNextInSeries(args.campaignId);
         if (!result) return null;
         return {
@@ -493,13 +587,19 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         rawArgs: { campaignId: string; network?: Network },
         ctx: ResolverContext,
       ) => {
-        return runAnalytics(() => getCampaignAnalyticsDashboard(args.campaignId));
+        const args = guard<typeof rawArgs>("Query.campaignAnalytics", ctx, rawArgs, "campaignAnalytics");
+        enforceAndMeter("Query.campaignAnalytics", ctx, args);
+        const result = await runAnalytics(() => getCampaignAnalyticsDashboard(args.campaignId));
+        return withStaleIndicator(result, Boolean((result as { stale?: boolean }).stale));
       },
 
       grantPrograms: async (
         _: unknown,
-        args: { pagination?: PaginationInput; sort?: SortInput } = {},
+        rawArgs: { pagination?: PaginationInput; sort?: SortInput } = {},
+        ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.grantPrograms", ctx, rawArgs, "grantPrograms");
+        enforceAndMeter("Query.grantPrograms", ctx, args);
         validateListArgs(args.pagination, args.sort);
         const programs = await getGrantProgramService().listPrograms();
         return paginate(programs.map(toProgramPayload), args.pagination, args.sort);
@@ -511,6 +611,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext,
       ) => {
         const args = guard<typeof rawArgs>("Query.grantProgramSummary", ctx, rawArgs, "grantProgramSummary");
+        enforceAndMeter("Query.grantProgramSummary", ctx, args);
         const summary = await getGrantProgramService().getProgramSummary(args.programId, args.campaignId);
         if (!summary) return null;
         return {
@@ -521,8 +622,11 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
 
       campaignGrantAllocations: async (
         _: unknown,
-        args: { campaignId: string; pagination?: PaginationInput; sort?: SortInput },
+        rawArgs: { campaignId: string; pagination?: PaginationInput; sort?: SortInput },
+        ctx: ResolverContext,
       ) => {
+        const args = guard<typeof rawArgs>("Query.campaignGrantAllocations", ctx, rawArgs, "campaignGrantAllocations");
+        enforceAndMeter("Query.campaignGrantAllocations", ctx, args);
         validateListArgs(args.pagination, args.sort);
         const allocations = await getGrantProgramService().getCampaignAllocations(args.campaignId);
         return paginate(allocations.map((allocation) => ({
@@ -541,65 +645,45 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext,
       ) => {
         const args = guard<typeof rawArgs>("Query.webhookSubscriptions", ctx, rawArgs, "pagination");
+        enforceAndMeter("Query.webhookSubscriptions", ctx, args);
         const accountId = requireAccountId(ctx);
         const subscriptions = await getWebhookSubscriptionService().listSubscriptions(accountId);
         return paginate(subscriptions.map(toWebhookPayload), args.pagination);
       },
 
       /**
-       * Fetch the status of a large campaign export job (issue #228).
-       *
-       * Jobs are scoped to the requesting account: a job owned by another
-       * account is reported as NOT_FOUND rather than leaking its existence.
-       * FAILED and EXPIRED jobs are returned with their terminal state and
-       * error so clients can surface recovery options.
+       * Return the current donor-facing terms snapshot for a campaign
+       * (issue #176). Clients must display this snapshot and pass its
+       * `contentHash` back on the donation mutation so the contribution is
+       * bound to the exact terms the donor saw.
        */
-      campaignExportJob: async (
+      campaignTermsSnapshot: async (
         _: unknown,
-        rawArgs: { id: string },
+        rawArgs: { campaignId: string },
         ctx: ResolverContext,
       ) => {
-        const args = guard<typeof rawArgs>("Query.campaignExportJob", ctx, rawArgs, "id");
-        const accountId = requireAccountId(ctx);
-        const job = await getCampaignExportService().getJob(accountId, args.id);
-        if (!job) {
-          throw new Error(`NOT_FOUND: campaign export job ${args.id} not found`);
-        }
-        return toCampaignExportJobPayload(job);
+        const args = guard<typeof rawArgs>("Query.campaignTermsSnapshot", ctx, rawArgs, "campaignId");
+        const snapshot = await getCampaignTermsService().getCurrentSnapshot(args.campaignId);
+        if (!snapshot) return null;
+        return toTermsSnapshotPayload(snapshot);
       },
 
       /**
-       * Bounded batch read for campaign discovery (issue #231).
-       *
-       * `ids` is capped at the service's maximum batch size; exceeding the cap
-       * is rejected up front so a single request cannot drive unbounded cost.
-       * Missing or unauthorized campaigns are reported per-id in `errors`
-       * rather than failing the whole batch.
+       * List reviewer comments for a specific evidence version (issue #178).
+       * Requires reviewer or admin role.
        */
-      campaignDiscoveryBatch: async (
+      reviewerComments: async (
         _: unknown,
-        rawArgs: { ids: string[]; network?: Network },
+        rawArgs: { evidenceId: string; evidenceVersion: number; pagination?: PaginationInput },
         ctx: ResolverContext,
       ) => {
-        const args = guard<typeof rawArgs>("Query.campaignDiscoveryBatch", ctx, rawArgs, "ids");
-        if (!Array.isArray(args.ids) || args.ids.length === 0) {
-          throw new Error("BAD_USER_INPUT: ids must be a non-empty list");
-        }
-        const service = getCampaignSearchService(ctx.campaignDataSource);
-        if (args.ids.length > service.maxBatchSize) {
-          throw new Error(
-            `BAD_USER_INPUT: ids exceeds maximum batch size of ${service.maxBatchSize}`,
-          );
-        }
-        const result = await service.searchBatch(args.ids, { network: args.network });
-        return {
-          items: result.items.map(toCampaignPayload),
-          errors: result.errors.map((error) => ({
-            id: error.id,
-            code: error.code,
-            message: error.message,
-          })),
-        };
+        const args = guard<typeof rawArgs>("Query.reviewerComments", ctx, rawArgs, "evidenceId");
+        requireReviewer(ctx);
+        const comments = await getCampaignVerificationAuditService().listComments(
+          args.evidenceId,
+          args.evidenceVersion,
+        );
+        return paginate(comments.map(toReviewerCommentPayload), args.pagination);
       },
     },
     Mutation: {
@@ -609,6 +693,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext
       ) => {
         const args = guard<typeof rawArgs>("Mutation.cloneCampaign", ctx, rawArgs, "cloneCampaign");
+        enforceAndMeter("Mutation.cloneCampaign", ctx, args);
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const campaign = streams.find((stream) => stream.id === args.id);
         if (!campaign) throw new Error(`Campaign ${args.id} not found`);
@@ -632,6 +717,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext
       ) => {
         const args = guard<typeof rawArgs>("Mutation.updateCampaign", ctx, rawArgs, "updateCampaign");
+        enforceAndMeter("Mutation.updateCampaign", ctx, args);
         const streams = await resolveDataSource(ctx, defaultDataSource).getStreams(args.network ?? "testnet");
         const campaign = streams.find((stream) => stream.id === args.id);
         if (!campaign) throw new Error(`Campaign ${args.id} not found`);
@@ -657,6 +743,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext,
       ) => {
         const args = guard<typeof rawArgs>("Mutation.createWebhookSubscription", ctx, rawArgs, "createWebhookSubscription");
+        enforceAndMeter("Mutation.createWebhookSubscription", ctx, args);
         const accountId = requireAccountId(ctx);
         const { subscription, secret } = await getWebhookSubscriptionService().createSubscription(accountId, args.input);
         return { ...toWebhookPayload(subscription), secret };
@@ -672,6 +759,7 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext,
       ) => {
         const args = guard<typeof rawArgs>("Mutation.rotateWebhookSecret", ctx, rawArgs, "webhookId");
+        enforceAndMeter("Mutation.rotateWebhookSecret", ctx, args);
         const accountId = requireAccountId(ctx);
         const { subscription, secret } = await getWebhookSubscriptionService().rotateSecret(accountId, args.id);
         return { ...toWebhookPayload(subscription), secret };
@@ -687,49 +775,165 @@ export function createResolvers(defaultDataSource?: StreamDataSource) {
         ctx: ResolverContext,
       ) => {
         const args = guard<typeof rawArgs>("Mutation.revokeWebhookSubscription", ctx, rawArgs, "webhookId");
+        enforceAndMeter("Mutation.revokeWebhookSubscription", ctx, args);
         const accountId = requireAccountId(ctx);
         const subscription = await getWebhookSubscriptionService().revokeSubscription(accountId, args.id);
         return toWebhookPayload(subscription);
       },
 
       /**
-       * Enqueue a large campaign export as an asynchronous job (issue #228).
-       *
-       * The job is owned by the requesting account; progress, expiry and
-       * retry state are exposed via `campaignExportJob`.
+       * Record a contribution bound to the terms snapshot the donor saw
+       * (issue #176). The `termsSnapshotHash` must match the campaign's current
+       * snapshot; a mismatch surfaces a TERMS_SNAPSHOT_MISMATCH error so the
+       * client can re-fetch terms and ask the donor to re-confirm.
        */
-      enqueueCampaignExport: async (
+      donateToCampaign: async (
         _: unknown,
-        rawArgs: { campaignId: string; format?: "CSV" | "JSON" },
+        rawArgs: {
+          campaignId: string;
+          amount: string;
+          termsSnapshotHash: string;
+          network?: Network;
+        },
         ctx: ResolverContext,
       ) => {
-        const args = guard<typeof rawArgs>("Mutation.enqueueCampaignExport", ctx, rawArgs, "campaignId");
+        const args = guard<typeof rawArgs>("Mutation.donateToCampaign", ctx, rawArgs, "campaignId");
         const accountId = requireAccountId(ctx);
-        const job = await getCampaignExportService().enqueueExport(accountId, {
-          campaignId: args.campaignId,
-          format: args.format,
-        });
-        return toCampaignExportJobPayload(job);
+        try {
+          const contribution = await getCampaignDonationService().recordContribution({
+            campaignId: args.campaignId,
+            amount: args.amount,
+            termsSnapshotHash: args.termsSnapshotHash,
+            donorId: accountId,
+            network: args.network ?? "testnet",
+          });
+          return {
+            id: contribution.id,
+            campaignId: contribution.campaignId,
+            amount: contribution.amount,
+            termsSnapshotHash: contribution.termsSnapshotHash,
+            termsSnapshotVersion: contribution.termsSnapshotVersion,
+            createdAt: Math.floor(contribution.createdAt / 1000),
+          };
+        } catch (error) {
+          if (error instanceof TermsSnapshotMismatchError) {
+            throw new Error(
+              `TERMS_SNAPSHOT_MISMATCH: terms changed since they were displayed; re-fetch campaignTermsSnapshot and re-confirm`,
+            );
+          }
+          throw error;
+        }
       },
 
       /**
-       * Operator-initiated webhook redelivery (issue #230).
-       *
-       * Requires the `admin` role. The original event payload and signature
-       * inputs are preserved; each authorized attempt is recorded and
-       * returned so operators have an audit trail.
+       * Add a reviewer comment against a specific evidence version (issue #178).
+       * Requires reviewer or admin role. A stale `evidenceVersion` surfaces a
+       * STALE_EVIDENCE_VERSION error so the reviewer can reload the evidence.
        */
-      redeliverWebhook: async (
+      addReviewerComment: async (
         _: unknown,
-        rawArgs: { eventId: string },
+        rawArgs: {
+          evidenceId: string;
+          evidenceVersion: number;
+          body: string;
+          references?: string[];
+        },
         ctx: ResolverContext,
       ) => {
-        const args = guard<typeof rawArgs>("Mutation.redeliverWebhook", ctx, rawArgs, "eventId");
-        const accountId = requireAdmin(ctx);
-        const attempt = await getCampaignWebhookService().redeliverEvent(accountId, args.eventId);
-        return toWebhookRedeliveryPayload(attempt);
+        const args = guard<typeof rawArgs>("Mutation.addReviewerComment", ctx, rawArgs, "evidenceId");
+        const authorId = requireReviewer(ctx);
+        try {
+          const comment = await getCampaignVerificationAuditService().addComment({
+            evidenceId: args.evidenceId,
+            evidenceVersion: args.evidenceVersion,
+            authorId,
+            body: args.body,
+            references: args.references ?? [],
+          });
+          return toReviewerCommentPayload(comment);
+        } catch (error) {
+          if (error instanceof StaleEvidenceVersionError) {
+            throw new Error(
+              `STALE_EVIDENCE_VERSION: evidence has advanced to version ${error.currentVersion}; reload before commenting`,
+            );
+          }
+          if (error instanceof ReviewerAuthorizationError) {
+            throw new Error("FORBIDDEN: reviewer or admin role required");
+          }
+          throw error;
+        }
+      },
+
+      /**
+       * Mark a reviewer comment resolved (issue #178). Requires reviewer or
+       * admin role; attribution and timestamp are recorded by the service.
+       */
+      resolveReviewerComment: async (
+        _: unknown,
+        rawArgs: { commentId: string },
+        ctx: ResolverContext,
+      ) => {
+        const args = guard<typeof rawArgs>("Mutation.resolveReviewerComment", ctx, rawArgs, "commentId");
+        const resolvedBy = requireReviewer(ctx);
+        try {
+          const comment = await getCampaignVerificationAuditService().resolveComment(args.commentId, resolvedBy);
+          return toReviewerCommentPayload(comment);
+        } catch (error) {
+          if (error instanceof ReviewerAuthorizationError) {
+            throw new Error("FORBIDDEN: reviewer or admin role required");
+          }
+          throw error;
+        }
       },
     },
+  };
+}
+
+/**
+ * Map a deployment record to its public GraphQL shape (issue #218).
+ */
+function toDeploymentPayload(deployment: import("@/services/deployment-registry.service").ContractDeployment) {
+  return {
+    network: deployment.network,
+    address: deployment.address,
+    deploymentLedger: deployment.deploymentLedger,
+    specVersion: deployment.specVersion,
+    state: deployment.state,
+    registeredAt: Math.floor(deployment.registeredAt / 1000),
+    updatedAt: Math.floor(deployment.updatedAt / 1000),
+  };
+}
+
+/**
+ * Map a canonical event mapping to its public GraphQL shape (issue #219).
+ * Unknown versions retain the raw payload for operator inspection.
+ */
+function toEventMappingPayload(mapping: import("@/services/contract-event-mapping.service").ContractEventMapping) {
+  return {
+    contract: mapping.contract,
+    eventName: mapping.eventName,
+    version: mapping.version,
+    projection: mapping.projection,
+    status: mapping.status,
+    rawPayload: mapping.rawPayload ?? null,
+  };
+}
+
+/**
+ * Map a projection replay status to its public GraphQL shape (issue #220).
+ */
+function toReplayStatusPayload(status: import("@/services/projection-replay.service").ProjectionReplayStatus) {
+  return {
+    replayId: status.replayId,
+    fromVersion: status.fromVersion,
+    toVersion: status.toVersion,
+    state: status.state,
+    dryRun: status.dryRun,
+    processedEvents: status.processedEvents,
+    mismatches: status.mismatches,
+    startedAt: Math.floor(status.startedAt / 1000),
+    completedAt: status.completedAt ? Math.floor(status.completedAt / 1000) : null,
+    error: status.error ?? null,
   };
 }
 

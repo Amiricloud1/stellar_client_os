@@ -8,6 +8,22 @@
  * Query safety (issue #60): the schema is served with depth-limit and
  * complexity-limit validation rules plus a per-request execution timeout.
  * See `./limits` for the exported rules, budgets, and timeout helper.
+ *
+ * Operational surfaces (issues #218–#222):
+ *   - `contractDeployments` / `contractDeployment` — validated deployment
+ *     registry (network, address, ledger, spec version, lifecycle state).
+ *   - `contractEventMappings` — canonical event-version → projection mappings;
+ *     unknown versions are retained with `known: false`.
+ *   - `projectionReplays` — replay runs across event-schema versions; cutover
+ *     is blocked unless the run is MATCHED.
+ *   - `consumerQueueMetrics` — bounded-queue/concurrency metrics; consumers
+ *     apply backpressure and never drop events (`droppedCount` is always 0).
+ *
+ * Compatibility: all additions are additive. Existing queries (`contracts`,
+ * `campaigns`, etc.) are unchanged, so no migration is required for current
+ * clients. New fields are nullable or list-returning so partial rollouts are
+ * safe; operators should treat `FAILED`/`MISMATCH`/`degraded` states as
+ * actionable alerts rather than transient errors.
  */
 
 import type { GraphQLSchema } from 'graphql';
@@ -297,6 +313,111 @@ export const typeDefs = /* GraphQL */`
     sponsoredAt: Int!
   }
 
+  """
+  Immutable snapshot of the donor-facing terms shown before a contribution was
+  signed (issue #176).
+
+  The snapshot is captured at contribution time and bound to the contribution
+  by `contentHash`. Clients should display `terms` and recompute the hash to
+  verify it matches `contentHash` before signing.
+  """
+  type TermsSnapshot {
+    """Monotonic version of the terms document that was shown."""
+    version: Int!
+    """The exact donor-facing terms text shown before signing."""
+    terms: String!
+    """
+    SHA-256 (hex) content hash of `terms`. Bound to the contribution so the
+    displayed terms can be verified after the fact.
+    """
+    contentHash: String!
+    """Unix timestamp (seconds) when the snapshot was captured."""
+    capturedAt: Int!
+  }
+
+  """
+  A contribution (donation) bound to the terms snapshot shown before signing
+  (issue #176).
+  """
+  type CampaignDonation {
+    id: ID!
+    campaignId: ID!
+    donor: String!
+    amount: String!
+    token: String!
+    createdAt: Int!
+    """The terms snapshot captured when this contribution was signed."""
+    termsSnapshot: TermsSnapshot!
+    """Convenience accessor for `termsSnapshot.contentHash`."""
+    termsSnapshotHash: String!
+    """Convenience accessor for `termsSnapshot.version`."""
+    termsVersion: Int!
+  }
+
+  """
+  Receipt for a contribution, including the terms snapshot it was bound to
+  (issue #176). Receipts remain verifiable even if the current terms change.
+  """
+  type DonationReceipt {
+    id: ID!
+    donationId: ID!
+    campaignId: ID!
+    donor: String!
+    amount: String!
+    token: String!
+    issuedAt: Int!
+    """The terms snapshot bound to the underlying contribution."""
+    termsSnapshot: TermsSnapshot!
+    """Convenience accessor for `termsSnapshot.contentHash`."""
+    termsSnapshotHash: String!
+    """Convenience accessor for `termsSnapshot.version`."""
+    termsVersion: Int!
+  }
+
+  """
+  Resolution status of a reviewer comment (issue #178).
+  """
+  enum ReviewerCommentStatus {
+    """Comment is open and awaiting resolution."""
+    OPEN
+    """Comment has been resolved by a reviewer."""
+    RESOLVED
+  }
+
+  """
+  A reviewer comment attached to a specific evidence version (issue #178).
+
+  Attribution (`author`), `createdAt`, and `status` are preserved. Comments are
+  immutable except for their resolution status.
+  """
+  type ReviewerComment {
+    id: ID!
+    """The evidence item the comment refers to."""
+    evidenceId: ID!
+    """The specific evidence version the comment refers to."""
+    evidenceVersion: Int!
+    """Author (reviewer) address or account identifier."""
+    author: String!
+    """Comment body."""
+    body: String!
+    """Current resolution status."""
+    status: ReviewerCommentStatus!
+    """Unix timestamp (seconds) when the comment was created."""
+    createdAt: Int!
+    """Unix timestamp (seconds) when the comment was resolved, if ever."""
+    resolvedAt: Int
+    """Author who resolved the comment, if ever."""
+    resolvedBy: String
+  }
+
+  """
+  A page of reviewer comments plus shared pagination metadata (issue #178).
+  """
+  type ReviewerCommentPage {
+    items: [ReviewerComment!]!
+    pageInfo: PageInfo!
+  }
+
   type CampaignStatusHistory {
     id: ID!
     campaignId: ID!
@@ -399,6 +520,139 @@ export const typeDefs = /* GraphQL */`
     totalVolume: String!
   }
 
+  """
+  Lifecycle state of a contract deployment (issue #218).
+
+  Transitions: PENDING -> ACTIVE -> DEPRECATED -> RETIRED. A deployment may
+  move to FAILED from any non-RETIRED state; FAILED deployments are retained
+  for audit and never silently dropped.
+  """
+  enum DeploymentStatus {
+    PENDING
+    ACTIVE
+    DEPRECATED
+    RETIRED
+    FAILED
+  }
+
+  """
+  A validated contract deployment record (issue #218).
+
+  Every environment (network + ledger) has exactly one record per contract
+  address. Records are append-only for audit purposes: lifecycle changes are
+  recorded, not overwritten.
+  """
+  type ContractDeployment {
+    """Stable identifier for this deployment record."""
+    id: ID!
+    """Network the contract is deployed to."""
+    network: Network!
+    """Contract address (C… Stellar address)."""
+    address: String!
+    """Ledger sequence the deployment was recorded at."""
+    ledger: Int!
+    """Contract spec version deployed (e.g. '1.2.0')."""
+    specVersion: String!
+    """Current lifecycle state."""
+    status: DeploymentStatus!
+    """Unix timestamp (seconds) the deployment was first recorded."""
+    deployedAt: Int!
+    """Unix timestamp (seconds) of the last lifecycle transition."""
+    updatedAt: Int!
+    """Human-readable reason for the last lifecycle transition, if any."""
+    statusReason: String
+  }
+
+  """
+  A canonical contract-event domain mapping (issue #219).
+
+  Supported event versions map to a named projection. Unknown event versions
+  are retained with `known: false` and a null `projection` rather than being
+  dropped, so operators can inspect and backfill them.
+  """
+  type ContractEventMapping {
+    """Event type name (e.g. 'stream_created')."""
+    eventType: String!
+    """Event schema version (e.g. 'v1', 'v2')."""
+    version: String!
+    """Projection the event maps to. Null for unknown versions."""
+    projection: String
+    """Whether this version has a canonical mapping."""
+    known: Boolean!
+    """Unix timestamp (seconds) the mapping was registered."""
+    registeredAt: Int!
+  }
+
+  """
+  Status of a projection replay run across event-schema versions (issue #220).
+
+  Replays rebuild state deterministically from retained raw events and compare
+  the output against the live projection before cutover. A run in
+  `MISMATCH` or `FAILED` state blocks cutover and must be investigated.
+  """
+  enum ReplayStatus {
+    PENDING
+    RUNNING
+    MATCHED
+    MISMATCH
+    FAILED
+  }
+
+  """
+  A projection replay run (issue #220).
+
+  `mismatchCount` is the number of events whose replayed projection differs
+  from the live projection. Cutover is only permitted when status is MATCHED.
+  """
+  type ProjectionReplay {
+    """Stable identifier for this replay run."""
+    id: ID!
+    """Projection being replayed (e.g. 'streams')."""
+    projection: String!
+    """Source event-schema version replayed from."""
+    fromVersion: String!
+    """Target event-schema version replayed to."""
+    toVersion: String!
+    """Current replay status."""
+    status: ReplayStatus!
+    """Number of events replayed so far."""
+    processedCount: Int!
+    """Number of events whose replayed output differed."""
+    mismatchCount: Int!
+    """Unix timestamp (seconds) the replay started."""
+    startedAt: Int!
+    """Unix timestamp (seconds) the replay finished, if it has."""
+    finishedAt: Int
+    """Human-readable failure or mismatch detail, if any."""
+    error: String
+  }
+
+  """
+  Bounded-queue and concurrency metrics for an event consumer (issue #222).
+
+  `droppedCount` is always 0: consumers apply backpressure instead of dropping
+  events. `degraded` is true when the consumer is applying backpressure or
+  recovering from an outage.
+  """
+  type ConsumerQueueMetrics {
+    """Consumer identifier (e.g. 'stream-indexer')."""
+    consumer: String!
+    """Maximum queue capacity (bounded)."""
+    capacity: Int!
+    """Current queue depth."""
+    depth: Int!
+    """Maximum concurrent in-flight events."""
+    concurrency: Int!
+    """Events currently in flight."""
+    inFlight: Int!
+    """Events dropped due to overflow. Always 0 (backpressure applied)."""
+    droppedCount: Int!
+    """Whether the consumer is applying backpressure or recovering."""
+    degraded: Boolean!
+    """Unix timestamp (seconds) the metrics were sampled."""
+    sampledAt: Int!
+  }
+
   enum SequelRelation {
     SEQUEL
     PREQUEL
@@ -484,6 +738,12 @@ export const typeDefs = /* GraphQL */`
   type CampaignAnalyticsDashboard {
     campaignId: ID!
     updatedAt: Int!
+    """
+    Whether this payload was served from a bounded stale cache because a
+    fresh computation could not complete in time (issue #235). Clients should
+    treat stale data as advisory and may retry later.
+    """
+    stale: Boolean!
     trafficSources: [TrafficSourceStat!]!
     funnel: [FunnelStage!]!
     demographics: [BackerDemographic!]!
@@ -497,6 +757,19 @@ export const typeDefs = /* GraphQL */`
     contributions: Int!
     totalFunded: String!
     conversionRate: Float!
+  }
+
+  """
+  Remaining operation-cost budget for the calling tenant (issue #234).
+  Exposed so clients can back off before receiving a 429.
+  """
+  type OperationBudget {
+    """Weighted cost units remaining in the current window."""
+    remaining: Int!
+    """Total weighted cost units granted per window."""
+    limit: Int!
+    """Unix timestamp (seconds) when the window resets."""
+    resetAt: Int!
   }
 
   enum GrantProgramStatus {
@@ -625,6 +898,54 @@ export const typeDefs = /* GraphQL */`
     contracts(pagination: PaginationInput, network: Network): [Contract!]!
 
     """
+    List validated contract deployment records (issue #218).
+
+    Omit `network` to return deployments across all networks. Omit `status` to
+    return deployments in every lifecycle state, including FAILED.
+    """
+    contractDeployments(
+      network: Network
+      status: DeploymentStatus
+      pagination: PaginationInput
+    ): [ContractDeployment!]!
+
+    """
+    A single contract deployment record by network and address (issue #218).
+    Returns null when no record exists.
+    """
+    contractDeployment(network: Network!, address: String!): ContractDeployment
+
+    """
+    Canonical contract-event domain mappings (issue #219).
+
+    Unknown event versions are included with `known: false` and a null
+    `projection`; they are retained rather than dropped.
+    """
+    contractEventMappings(
+      eventType: String
+      version: String
+      pagination: PaginationInput
+    ): [ContractEventMapping!]!
+
+    """
+    Projection replay runs across event-schema versions (issue #220).
+
+    Omit `status` to return runs in every state, including MISMATCH and FAILED.
+    """
+    projectionReplays(
+      projection: String
+      status: ReplayStatus
+      pagination: PaginationInput
+    ): [ProjectionReplay!]!
+
+    """
+    Bounded-queue and concurrency metrics for event consumers (issue #222).
+
+    Omit `consumer` to return metrics for all consumers.
+    """
+    consumerQueueMetrics(consumer: String): [ConsumerQueueMetrics!]!
+
+    """
     Global aggregate metrics across all streams on the specified network.
     """
     globalMetrics(network: Network): GlobalMetrics!
@@ -709,6 +1030,42 @@ export const typeDefs = /* GraphQL */`
     The grant allocations awarded to a campaign across all programs.
     """
     campaignGrantAllocations(campaignId: ID!): [GrantAllocation!]!
+
+    """
+    The current donor-facing terms snapshot for a campaign (issue #176).
+
+    Clients must display this snapshot and verify its `contentHash` before
+    signing a contribution. The snapshot returned here is the one that will be
+    bound to the next contribution.
+    """
+    campaignTermsSnapshot(campaignId: ID!): TermsSnapshot!
+
+    """
+    A contribution with its bound terms snapshot (issue #176).
+    """
+    campaignDonation(donationId: ID!): CampaignDonation
+
+    """
+    The receipt for a contribution, including its bound terms snapshot
+    (issue #176).
+    """
+    donationReceipt(donationId: ID!): DonationReceipt
+
+    """
+    Reviewer comments for a specific evidence version (issue #178).
+
+    Default sort: createdAt DESC, tiebroken by id ASC. Limit defaults to 20 and
+    is capped at 100.
+
+    Auth policy: privileged (requires an authenticated reviewer account).
+    """
+    reviewerComments(
+      evidenceId: ID!
+      evidenceVersion: Int!
+      status: ReviewerCommentStatus
+      sort: SortInput
+      pagination: PaginationInput
+    ): ReviewerCommentPage!
   }
 
   """
@@ -934,26 +1291,28 @@ export const typeDefs = /* GraphQL */`
     revokeWebhookSubscription(id: ID!): WebhookSubscription!
 
     """
-    Enqueues an asynchronous export job for a campaign owned by the
-    authenticated account (issue #228). Returns the bounded job record; poll
-    `campaignExportJob` for status and progress.
+    Creates a reviewer comment on a specific evidence version (issue #178).
 
-    Auth policy: privileged (owner only; non-owners receive NOT_FOUND).
+    The author is always the authenticated reviewer; attribution is taken from
+    the session and cannot be spoofed by the client.
+
+    Auth policy: privileged (authenticated reviewer; unauthenticated callers
+    receive UNAUTHENTICATED).
     """
-    enqueueCampaignExport(campaignId: ID!): ExportJob!
+    createReviewerComment(
+      evidenceId: ID!
+      evidenceVersion: Int!
+      body: String!
+    ): ReviewerComment!
 
     """
-    Requests an audited manual redelivery of a webhook event (issue #230).
-    The original event payload and signature inputs are preserved; each
-    authorized attempt is recorded.
+    Resolves a reviewer comment (issue #178). Idempotent: resolving an already
+    resolved comment returns it unchanged.
 
-    Auth policy: privileged (owner only; non-owners receive NOT_FOUND).
+    Auth policy: privileged (authenticated reviewer; non-reviewers receive
+    FORBIDDEN).
     """
-    redeliverWebhook(
-      subscriptionId: ID!
-      eventId: ID!
-      reason: String!
-    ): WebhookRedelivery!
+    resolveReviewerComment(id: ID!): ReviewerComment!
   }
 
   extend type Query {

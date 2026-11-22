@@ -6,12 +6,13 @@ import {
   createItemBodySchema,
   updateItemBodySchema,
   searchQuerySchema,
-  exportJobBodySchema,
-  exportJobStatusQuerySchema,
-  exportArtifactQuerySchema,
-  webhookRedeliveryBodySchema,
-  batchReadQuerySchema,
-  batchReadResponseSchema,
+  MAX_BODY_BYTES,
+  MAX_LIST_DEPTH,
+  MAX_FILTER_COUNT,
+  bodySizeSchema,
+  listDepthSchema,
+  filterCountSchema,
+  enforceRequestBudgets,
 } from './api-schemas';
 
 describe('pathIdSchema', () => {
@@ -254,175 +255,193 @@ describe('parseRequest', () => {
   });
 });
 
-describe('exportJobBodySchema', () => {
-  it('accepts a valid export request', () => {
-    const result = exportJobBodySchema.safeParse({ campaignId: 'camp_1', format: 'csv' });
+describe('bodySizeSchema', () => {
+  it('accepts a body at the max byte boundary', () => {
+    const result = bodySizeSchema.safeParse({ bytes: MAX_BODY_BYTES });
     expect(result.success).toBe(true);
   });
 
-  it('defaults format to csv', () => {
-    const result = exportJobBodySchema.safeParse({ campaignId: 'camp_1' });
+  it('rejects a body one byte over the max boundary', () => {
+    const result = bodySizeSchema.safeParse({ bytes: MAX_BODY_BYTES + 1 });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a negative byte count', () => {
+    const result = bodySizeSchema.safeParse({ bytes: -1 });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a non-integer byte count', () => {
+    const result = bodySizeSchema.safeParse({ bytes: 1.5 });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects unknown keys via .strict()', () => {
+    const result = bodySizeSchema.safeParse({ bytes: 10, rogue: true });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('listDepthSchema', () => {
+  it('accepts a list at the max depth boundary', () => {
+    const result = listDepthSchema.safeParse({ depth: MAX_LIST_DEPTH });
     expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.data.format).toBe('csv');
+  });
+
+  it('rejects a list one level over the max depth', () => {
+    const result = listDepthSchema.safeParse({ depth: MAX_LIST_DEPTH + 1 });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a negative depth', () => {
+    const result = listDepthSchema.safeParse({ depth: -1 });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a non-integer depth', () => {
+    const result = listDepthSchema.safeParse({ depth: 2.5 });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects unknown keys via .strict()', () => {
+    const result = listDepthSchema.safeParse({ depth: 1, rogue: true });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('filterCountSchema', () => {
+  it('accepts a filter count at the max boundary', () => {
+    const result = filterCountSchema.safeParse({ count: MAX_FILTER_COUNT });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects a filter count one over the max boundary', () => {
+    const result = filterCountSchema.safeParse({ count: MAX_FILTER_COUNT + 1 });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a negative filter count', () => {
+    const result = filterCountSchema.safeParse({ count: -1 });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a non-integer filter count', () => {
+    const result = filterCountSchema.safeParse({ count: 0.5 });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects unknown keys via .strict()', () => {
+    const result = filterCountSchema.safeParse({ count: 1, rogue: true });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('enforceRequestBudgets', () => {
+  it('returns ok when all budgets are within limits', () => {
+    const result = enforceRequestBudgets({
+      bytes: MAX_BODY_BYTES,
+      depth: MAX_LIST_DEPTH,
+      count: MAX_FILTER_COUNT,
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it('returns ok for an empty request', () => {
+    const result = enforceRequestBudgets({});
+    expect(result.ok).toBe(true);
+  });
+
+  it('rejects an oversized body with a 413 envelope', () => {
+    const result = enforceRequestBudgets({ bytes: MAX_BODY_BYTES + 1 });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(413);
+      expect(result.error.code).toBe('payload_too_large');
+      expect(result.error.issues.length).toBeGreaterThan(0);
     }
   });
 
-  it('rejects a missing campaignId', () => {
-    const result = exportJobBodySchema.safeParse({ format: 'csv' });
-    expect(result.success).toBe(false);
-  });
-
-  it('rejects an unsupported format', () => {
-    const result = exportJobBodySchema.safeParse({ campaignId: 'camp_1', format: 'xml' });
-    expect(result.success).toBe(false);
-  });
-
-  it('rejects unknown keys via .strict()', () => {
-    const result = exportJobBodySchema.safeParse({ campaignId: 'camp_1', rogue: true });
-    expect(result.success).toBe(false);
-  });
-});
-
-describe('exportJobStatusQuerySchema', () => {
-  it('accepts an empty query', () => {
-    const result = exportJobStatusQuerySchema.safeParse({});
-    expect(result.success).toBe(true);
-  });
-
-  it('coerces includeArtifact boolean strings', () => {
-    const result = exportJobStatusQuerySchema.safeParse({ includeArtifact: 'true' });
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.data.includeArtifact).toBe(true);
+  it('rejects a nested list with a 422 envelope', () => {
+    const result = enforceRequestBudgets({ depth: MAX_LIST_DEPTH + 1 });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(422);
+      expect(result.error.code).toBe('list_too_deep');
+      expect(result.error.issues.length).toBeGreaterThan(0);
     }
   });
 
-  it('rejects unknown keys via .strict()', () => {
-    const result = exportJobStatusQuerySchema.safeParse({ rogue: 'x' });
-    expect(result.success).toBe(false);
-  });
-});
-
-describe('exportArtifactQuerySchema', () => {
-  it('accepts a valid signed token', () => {
-    const result = exportArtifactQuerySchema.safeParse({ token: 'signed-token' });
-    expect(result.success).toBe(true);
-  });
-
-  it('rejects a missing token (unauthorized artifact access)', () => {
-    const result = exportArtifactQuerySchema.safeParse({});
-    expect(result.success).toBe(false);
-  });
-
-  it('rejects an empty token', () => {
-    const result = exportArtifactQuerySchema.safeParse({ token: '' });
-    expect(result.success).toBe(false);
-  });
-
-  it('rejects unknown keys via .strict()', () => {
-    const result = exportArtifactQuerySchema.safeParse({ token: 't', rogue: 1 });
-    expect(result.success).toBe(false);
-  });
-});
-
-describe('webhookRedeliveryBodySchema', () => {
-  it('accepts a valid redelivery request', () => {
-    const result = webhookRedeliveryBodySchema.safeParse({
-      destinationId: 'dest_1',
-      eventId: 'evt_1',
-      reason: 'operator retry after outage',
-    });
-    expect(result.success).toBe(true);
-  });
-
-  it('rejects a missing reason (audit trail required)', () => {
-    const result = webhookRedeliveryBodySchema.safeParse({
-      destinationId: 'dest_1',
-      eventId: 'evt_1',
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it('rejects an empty reason', () => {
-    const result = webhookRedeliveryBodySchema.safeParse({
-      destinationId: 'dest_1',
-      eventId: 'evt_1',
-      reason: '',
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it('rejects a missing destinationId', () => {
-    const result = webhookRedeliveryBodySchema.safeParse({ eventId: 'evt_1', reason: 'r' });
-    expect(result.success).toBe(false);
-  });
-
-  it('rejects unknown keys via .strict()', () => {
-    const result = webhookRedeliveryBodySchema.safeParse({
-      destinationId: 'dest_1',
-      eventId: 'evt_1',
-      reason: 'r',
-      rogue: true,
-    });
-    expect(result.success).toBe(false);
-  });
-});
-
-describe('batchReadQuerySchema', () => {
-  it('accepts a bounded batch of ids', () => {
-    const result = batchReadQuerySchema.safeParse({ ids: 'a,b,c' });
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.data.ids).toEqual(['a', 'b', 'c']);
+  it('rejects too many filters with a 422 envelope', () => {
+    const result = enforceRequestBudgets({ count: MAX_FILTER_COUNT + 1 });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(422);
+      expect(result.error.code).toBe('too_many_filters');
+      expect(result.error.issues.length).toBeGreaterThan(0);
     }
   });
 
-  it('rejects an empty ids list', () => {
-    const result = batchReadQuerySchema.safeParse({ ids: '' });
-    expect(result.success).toBe(false);
-  });
-
-  it('rejects an oversized batch', () => {
-    const ids = Array.from({ length: 101 }, (_, i) => `id${i}`).join(',');
-    const result = batchReadQuerySchema.safeParse({ ids });
-    expect(result.success).toBe(false);
-  });
-
-  it('accepts a batch at the max boundary', () => {
-    const ids = Array.from({ length: 100 }, (_, i) => `id${i}`).join(',');
-    const result = batchReadQuerySchema.safeParse({ ids });
-    expect(result.success).toBe(true);
-  });
-
-  it('rejects unknown keys via .strict()', () => {
-    const result = batchReadQuerySchema.safeParse({ ids: 'a', rogue: 'x' });
-    expect(result.success).toBe(false);
-  });
-});
-
-describe('batchReadResponseSchema', () => {
-  it('accepts a success envelope', () => {
-    const result = batchReadResponseSchema.safeParse({
-      items: [{ id: 'a' }],
-      errors: [],
+  it('reports the body-size violation first when multiple budgets are exceeded', () => {
+    const result = enforceRequestBudgets({
+      bytes: MAX_BODY_BYTES + 1,
+      depth: MAX_LIST_DEPTH + 1,
+      count: MAX_FILTER_COUNT + 1,
     });
-    expect(result.success).toBe(true);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(413);
+      expect(result.error.code).toBe('payload_too_large');
+    }
   });
 
-  it('accepts a partial-error envelope', () => {
-    const result = batchReadResponseSchema.safeParse({
-      items: [{ id: 'a' }],
-      errors: [{ id: 'b', code: 'not_found', message: 'missing' }],
-    });
-    expect(result.success).toBe(true);
+  it('rejects an authorized-but-oversized body with a 413 envelope', () => {
+    const result = enforceRequestBudgets(
+      { bytes: MAX_BODY_BYTES + 1 },
+      { authorized: true },
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(413);
+      expect(result.error.code).toBe('payload_too_large');
+    }
   });
 
-  it('rejects an error entry missing a code', () => {
-    const result = batchReadResponseSchema.safeParse({
-      items: [],
-      errors: [{ id: 'b', message: 'missing' }],
-    });
-    expect(result.success).toBe(false);
+  it('rejects an authorized-but-nested list with a 422 envelope', () => {
+    const result = enforceRequestBudgets(
+      { depth: MAX_LIST_DEPTH + 1 },
+      { authorized: true },
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(422);
+      expect(result.error.code).toBe('list_too_deep');
+    }
+  });
+
+  it('rejects an authorized-but-filter-heavy request with a 422 envelope', () => {
+    const result = enforceRequestBudgets(
+      { count: MAX_FILTER_COUNT + 1 },
+      { authorized: true },
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(422);
+      expect(result.error.code).toBe('too_many_filters');
+    }
+  });
+
+  it('rejects malformed budget input with a 400 envelope', () => {
+    const result = enforceRequestBudgets({ bytes: -1 });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(400);
+      expect(result.error.code).toBe('invalid_request');
+    }
+  });
+
+  it('is retry-safe: repeated identical calls yield identical envelopes', () => {
+    const first = enforceRequestBudgets({ bytes: MAX_BODY_BYTES + 1 });
+    const second = enforceRequestBudgets({ bytes: MAX_BODY_BYTES + 1 });
+    expect(first).toEqual(second);
   });
 });

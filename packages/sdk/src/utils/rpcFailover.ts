@@ -25,6 +25,75 @@ export interface RetryPolicy {
   endpointCooldownMs?: number;
 }
 
+/**
+ * Configuration for a bounded, backpressure-aware work queue.
+ *
+ * The queue bounds in-flight memory by capping both the number of queued items
+ * (`capacity`) and the number of concurrently executing items (`concurrency`).
+ */
+export interface BoundedQueueOptions {
+  /** Maximum number of items that may be queued (not yet started). Defaults to 100. */
+  capacity?: number;
+  /** Maximum number of items executing concurrently. Defaults to 4. */
+  concurrency?: number;
+  /** Retry policy applied to individual queued tasks. Defaults to the client policy. */
+  retryPolicy?: RetryPolicy;
+  /**
+   * Backpressure strategy when the queue is full.
+   * - 'reject' (default): fail fast with a `QueueBackpressureError`.
+   * - 'wait': await capacity, applying backpressure to the producer.
+   */
+  overflowStrategy?: 'reject' | 'wait';
+  /** Maximum time in ms to wait for capacity under the 'wait' strategy. Defaults to 30,000ms. */
+  maxWaitMs?: number;
+}
+
+export interface QueueMetrics {
+  /** Current number of queued (not started) items. */
+  queued: number;
+  /** Current number of in-flight items. */
+  inFlight: number;
+  /** Configured capacity. */
+  capacity: number;
+  /** Configured concurrency. */
+  concurrency: number;
+  /** Total items enqueued since creation. */
+  enqueued: number;
+  /** Total items completed successfully. */
+  completed: number;
+  /** Total items that failed permanently. */
+  failed: number;
+  /** Total items rejected due to backpressure. */
+  rejected: number;
+  /** Total retry attempts performed. */
+  retries: number;
+  /** Peak observed queued depth (bounded memory proof). */
+  peakQueued: number;
+  /** Peak observed in-flight count. */
+  peakInFlight: number;
+}
+
+export class QueueBackpressureError extends Error {
+  readonly capacity: number;
+  readonly queued: number;
+
+  constructor(capacity: number, queued: number) {
+    super(
+      `Bounded queue is full (capacity=${capacity}, queued=${queued}); producer must apply backpressure`
+    );
+    this.name = 'QueueBackpressureError';
+    this.capacity = capacity;
+    this.queued = queued;
+  }
+}
+
+export class QueueClosedError extends Error {
+  constructor() {
+    super('Bounded queue is closed and no longer accepts work');
+    this.name = 'QueueClosedError';
+  }
+}
+
 export interface RpcEndpointState {
   url: string;
   failures: number;
@@ -188,6 +257,18 @@ export class RpcFailoverClient {
   }
 
   /**
+   * Creates a bounded queue whose tasks are executed through this failover
+   * client. Event consumers should enqueue work here so that RPC outages apply
+   * backpressure instead of unbounded memory growth.
+   */
+  createBoundedQueue(options: BoundedQueueOptions = {}): BoundedQueue {
+    return new BoundedQueue({
+      ...options,
+      retryPolicy: options.retryPolicy ?? this.policy,
+    });
+  }
+
+  /**
    * Executes an asynchronous RPC operation against the healthiest endpoint,
    * falling over to alternative endpoints on transient failure.
    */
@@ -298,4 +379,218 @@ export class RpcFailoverClient {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+interface QueueEntry<T> {
+  task: () => Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason: unknown) => void;
+  attempts: number;
+}
+
+/**
+ * A bounded, concurrency-limited work queue with explicit backpressure.
+ *
+ * Memory is bounded by `capacity` (queued) + `concurrency` (in-flight). When the
+ * queue is full, producers either receive a `QueueBackpressureError` ('reject')
+ * or are suspended until capacity frees up ('wait'). Failed tasks are retried
+ * with jittered exponential backoff, and metrics expose recovery throughput.
+ */
+export class BoundedQueue {
+  private readonly capacity: number;
+  private readonly concurrency: number;
+  private readonly retryPolicy: Required<RetryPolicy>;
+  private readonly overflowStrategy: 'reject' | 'wait';
+  private readonly maxWaitMs: number;
+
+  private readonly pending: QueueEntry<unknown>[] = [];
+  private inFlight = 0;
+  private closed = false;
+  private waiters: Array<() => void> = [];
+
+  private enqueued = 0;
+  private completed = 0;
+  private failed = 0;
+  private rejected = 0;
+  private retries = 0;
+  private peakQueued = 0;
+  private peakInFlight = 0;
+
+  constructor(options: BoundedQueueOptions = {}) {
+    const capacity = options.capacity ?? 100;
+    const concurrency = options.concurrency ?? 4;
+
+    if (!Number.isInteger(capacity) || capacity <= 0) {
+      throw new Error('BoundedQueue capacity must be a positive integer');
+    }
+    if (!Number.isInteger(concurrency) || concurrency <= 0) {
+      throw new Error('BoundedQueue concurrency must be a positive integer');
+    }
+
+    this.capacity = capacity;
+    this.concurrency = concurrency;
+    this.overflowStrategy = options.overflowStrategy ?? 'reject';
+    this.maxWaitMs = options.maxWaitMs ?? 30_000;
+    this.retryPolicy = {
+      maxRetries: options.retryPolicy?.maxRetries ?? 3,
+      initialBackoffMs: options.retryPolicy?.initialBackoffMs ?? 200,
+      maxBackoffMs: options.retryPolicy?.maxBackoffMs ?? 3000,
+      backoffMultiplier: options.retryPolicy?.backoffMultiplier ?? 2,
+      jitter: options.retryPolicy?.jitter ?? true,
+      endpointCooldownMs: options.retryPolicy?.endpointCooldownMs ?? 30_000,
+    };
+  }
+
+  getMetrics(): QueueMetrics {
+    return {
+      queued: this.pending.length,
+      inFlight: this.inFlight,
+      capacity: this.capacity,
+      concurrency: this.concurrency,
+      enqueued: this.enqueued,
+      completed: this.completed,
+      failed: this.failed,
+      rejected: this.rejected,
+      retries: this.retries,
+      peakQueued: this.peakQueued,
+      peakInFlight: this.peakInFlight,
+    };
+  }
+
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  /** True when the queue cannot accept more work without backpressure. */
+  get isSaturated(): boolean {
+    return this.pending.length >= this.capacity;
+  }
+
+  /**
+   * Enqueues a task. Resolves with the task result once it executes (and any
+   * retries succeed). Rejects with `QueueBackpressureError` when full under the
+   * 'reject' strategy, or `QueueClosedError` after `close()`.
+   */
+  async enqueue<T>(task: () => Promise<T>): Promise<T> {
+    if (this.closed) {
+      throw new QueueClosedError();
+    }
+
+    if (this.isSaturated) {
+      if (this.overflowStrategy === 'reject') {
+        this.rejected++;
+        throw new QueueBackpressureError(this.capacity, this.pending.length);
+      }
+      await this.waitForCapacity();
+      if (this.closed) {
+        throw new QueueClosedError();
+      }
+    }
+
+    this.enqueued++;
+
+    return new Promise<T>((resolve, reject) => {
+      const entry: QueueEntry<T> = {
+        task,
+        resolve,
+        reject,
+        attempts: 0,
+      };
+      this.pending.push(entry as QueueEntry<unknown>);
+      this.peakQueued = Math.max(this.peakQueued, this.pending.length);
+      this.drain();
+    });
+  }
+
+  /**
+   * Stops accepting new work. Already-queued work continues to drain.
+   */
+  close(): void {
+    this.closed = true;
+    const waiters = this.waiters;
+    this.waiters = [];
+    for (const wake of waiters) {
+      wake();
+    }
+  }
+
+  /**
+   * Waits until all queued and in-flight work has settled. Useful for
+   * deterministic shutdown and for tests proving recovery throughput.
+   */
+  async onIdle(): Promise<void> {
+    while (this.pending.length > 0 || this.inFlight > 0) {
+      await new Promise<void>(resolve => setTimeout(resolve, 5));
+    }
+  }
+
+  private waitForCapacity(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.waiters = this.waiters.filter(w => w !== wake);
+        this.rejected++;
+        reject(new QueueBackpressureError(this.capacity, this.pending.length));
+      }, this.maxWaitMs);
+
+      const wake = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      this.waiters.push(wake);
+    });
+  }
+
+  private drain(): void {
+    while (!this.closed && this.inFlight < this.concurrency && this.pending.length > 0) {
+      const entry = this.pending.shift()!;
+      this.inFlight++;
+      this.peakInFlight = Math.max(this.peakInFlight, this.inFlight);
+      void this.runEntry(entry);
+    }
+  }
+
+  private async runEntry<T>(entry: QueueEntry<T>): Promise<void> {
+    try {
+      const result = await entry.task();
+      this.completed++;
+      entry.resolve(result);
+    } catch (err) {
+      const classification = classifyRpcError(err);
+      const canRetry =
+        classification !== 'deterministic' && entry.attempts < this.retryPolicy.maxRetries;
+
+      if (canRetry) {
+        entry.attempts++;
+        this.retries++;
+        const delay = this.calculateBackoff(entry.attempts);
+        await sleep(delay);
+        // Re-queue at the front so retried work is prioritised.
+        this.pending.unshift(entry as QueueEntry<unknown>);
+        this.peakQueued = Math.max(this.peakQueued, this.pending.length);
+      } else {
+        this.failed++;
+        entry.reject(err);
+      }
+    } finally {
+      this.inFlight--;
+      const waiters = this.waiters;
+      this.waiters = [];
+      for (const wake of waiters) {
+        wake();
+      }
+      this.drain();
+    }
+  }
+
+  private calculateBackoff(attempt: number): number {
+    const base =
+      this.retryPolicy.initialBackoffMs *
+      Math.pow(this.retryPolicy.backoffMultiplier, attempt - 1);
+    const capped = Math.min(base, this.retryPolicy.maxBackoffMs);
+
+    if (this.retryPolicy.jitter) {
+      return Math.floor(capped * (0.5 + Math.random() * 0.5));
+    }
+    return Math.floor(capped);
+  }
 }
