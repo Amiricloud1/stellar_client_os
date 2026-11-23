@@ -38,6 +38,20 @@ export interface ProjectionSnapshot {
   schemaVersion: string;
   state: Record<string, unknown>;
   lastEventSequence: number;
+  /** Authoritative Stellar ledger sequence represented by this projection. */
+  ledgerSequence?: number;
+}
+
+export interface AuthoritativeLedgerSnapshot {
+  ledgerSequence: number;
+  state: Record<string, unknown>;
+}
+
+export interface AuthoritativeLedgerReader {
+  readProjectionAtLedger(
+    projectionName: string,
+    ledgerSequence: number
+  ): Promise<AuthoritativeLedgerSnapshot>;
 }
 
 export interface ReplayVerificationResult {
@@ -47,6 +61,14 @@ export interface ReplayVerificationResult {
   replayedState: Record<string, unknown>;
   expectedState: Record<string, unknown>;
   eventsReplayed: number;
+  mismatchPaths: string[];
+  error?: string;
+}
+
+export interface LedgerReconciliationResult {
+  projectionName: string;
+  ledgerSequence?: number;
+  status: "MATCHED" | "MISMATCH" | "UNAVAILABLE";
   mismatchPaths: string[];
   error?: string;
 }
@@ -92,10 +114,21 @@ export interface RestoreDrillResult {
   elapsedMs: number;
   rtoTargetMs: number;
   rtoSlaMet: boolean;
+  rpoAgeMs: number;
+  rpoTargetMs: number;
+  rpoSlaMet: boolean;
   fileChecks: RestoreFileCheck[];
-  status: 'SUCCESS' | 'INTEGRITY_FAILURE' | 'DECRYPTION_FAILURE' | 'ERROR';
+  status:
+    | 'SUCCESS'
+    | 'INTEGRITY_FAILURE'
+    | 'DECRYPTION_FAILURE'
+    | 'LEDGER_RECONCILIATION_FAILURE'
+    | 'RECOVERY_OBJECTIVE_FAILURE'
+    | 'ERROR';
   replayVerifications: ReplayVerificationResult[];
   allReplaysDeterministic: boolean;
+  ledgerReconciliations: LedgerReconciliationResult[];
+  allLedgerReconciled: boolean;
 }
 
 export interface CreateBackupOptions {
@@ -114,6 +147,8 @@ export interface RestoreOptions {
   passphrase: string;
   isolatedDir: string;
   rtoTargetMs?: number;
+  ledgerReader?: AuthoritativeLedgerReader;
+  now?: () => number;
 }
 
 const PBKDF2_ITERATIONS = 100_000;
@@ -291,10 +326,16 @@ export class BackupRestoreService {
       isolatedDir,
       rtoTargetMs = 30 * 60 * 1000, // 30 min RTO target
     } = options;
+    const now = options.now ?? Date.now;
+    const restoreStartedAt = now();
+    let rpoTargetMs = 0;
+    let rpoAgeMs = Number.MAX_SAFE_INTEGER;
+    let rpoSlaMet = false;
 
-    const drillId = `drill_${Date.now()}_${randomUUID().slice(0, 8)}`;
+    const drillId = `drill_${restoreStartedAt}_${randomUUID().slice(0, 8)}`;
     await fs.mkdir(isolatedDir, { recursive: true });
 
+    let archiveMetadataMismatch = false;
     let decryptedPayload: {
       manifest: BackupManifest;
       files: Record<string, string>;
@@ -315,6 +356,26 @@ export class BackupRestoreService {
       decrypted += decipher.final('utf8');
 
       decryptedPayload = JSON.parse(decrypted);
+      if (
+        archive.backupId !== decryptedPayload.manifest?.backupId ||
+        stableStringify(archive.manifest) !== stableStringify(decryptedPayload.manifest)
+      ) {
+        archiveMetadataMismatch = true;
+        throw new Error("Unencrypted archive metadata does not match authenticated metadata");
+      }
+
+      const { createdAt, rpoWindowMinutes } = decryptedPayload.manifest;
+      const archivedAt = Date.parse(createdAt);
+      rpoTargetMs =
+        Number.isFinite(rpoWindowMinutes) && rpoWindowMinutes > 0
+          ? rpoWindowMinutes * 60 * 1000
+          : 0;
+      rpoAgeMs =
+        Number.isFinite(archivedAt) && archivedAt <= restoreStartedAt
+          ? restoreStartedAt - archivedAt
+          : Number.MAX_SAFE_INTEGER;
+      rpoSlaMet =
+        Number.isFinite(rpoTargetMs) && rpoTargetMs > 0 && rpoAgeMs <= rpoTargetMs;
     } catch (err: unknown) {
       const elapsedMs = Number((performance.now() - start).toFixed(2));
       return {
@@ -328,10 +389,15 @@ export class BackupRestoreService {
         elapsedMs,
         rtoTargetMs,
         rtoSlaMet: elapsedMs <= rtoTargetMs,
+        rpoAgeMs,
+        rpoTargetMs,
+        rpoSlaMet,
         fileChecks: [],
-        status: 'DECRYPTION_FAILURE',
+        status: archiveMetadataMismatch ? 'INTEGRITY_FAILURE' : 'DECRYPTION_FAILURE',
         replayVerifications: [],
         allReplaysDeterministic: false,
+        ledgerReconciliations: [],
+        allLedgerReconciled: false,
       };
     }
 
@@ -343,7 +409,7 @@ export class BackupRestoreService {
 
     for (const item of manifest.items) {
       const b64 = files[item.relativePath];
-      if (!b64) {
+      if (b64 === undefined) {
         fileChecks.push({
           relativePath: item.relativePath,
           bytes: 0,
@@ -375,7 +441,21 @@ export class BackupRestoreService {
       }
 
       // Write to isolated target directory
-      const targetFilePath = path.join(isolatedDir, item.relativePath);
+      const targetRoot = path.resolve(isolatedDir);
+      const targetFilePath = path.resolve(targetRoot, item.relativePath);
+      if (!targetFilePath.startsWith(`${targetRoot}${path.sep}`)) {
+        fileChecks.push({
+          relativePath: item.relativePath,
+          bytes: 0,
+          sha256Match: false,
+          jsonSyntaxValid: false,
+          status: 'FAILED',
+          error: 'Archive path escapes the isolated restore directory',
+        });
+        allChecksumsMatch = false;
+        allJsonValid = false;
+        continue;
+      }
       await fs.mkdir(path.dirname(targetFilePath), { recursive: true });
       await fs.writeFile(targetFilePath, fileData);
 
@@ -394,10 +474,30 @@ export class BackupRestoreService {
     // the captured reference snapshots before cutover.
     const replayVerifications = this.replayProjections(rawEvents, projectionSnapshots);
     const allReplaysDeterministic = replayVerifications.every((r) => r.deterministic);
+    const ledgerReconciliations = await this.reconcileProjections(
+      projectionSnapshots,
+      options.ledgerReader
+    );
+    const allLedgerReconciled = ledgerReconciliations.every(
+      (result) => result.status === "MATCHED"
+    );
 
     const elapsedMs = Number((performance.now() - start).toFixed(2));
     const rtoSlaMet = elapsedMs <= rtoTargetMs;
-    const overallSuccess = allChecksumsMatch && allJsonValid && allReplaysDeterministic;
+    const overallSuccess =
+      allChecksumsMatch &&
+      allJsonValid &&
+      allReplaysDeterministic &&
+      allLedgerReconciled &&
+      rtoSlaMet &&
+      rpoSlaMet;
+    const status = overallSuccess
+      ? "SUCCESS"
+      : !allLedgerReconciled
+        ? "LEDGER_RECONCILIATION_FAILURE"
+        : !rtoSlaMet || !rpoSlaMet
+          ? "RECOVERY_OBJECTIVE_FAILURE"
+          : "INTEGRITY_FAILURE";
 
     return {
       drillId,
@@ -410,11 +510,70 @@ export class BackupRestoreService {
       elapsedMs,
       rtoTargetMs,
       rtoSlaMet,
+      rpoAgeMs,
+      rpoTargetMs,
+      rpoSlaMet,
       fileChecks,
-      status: overallSuccess ? 'SUCCESS' : 'INTEGRITY_FAILURE',
+      status,
       replayVerifications,
       allReplaysDeterministic,
+      ledgerReconciliations,
+      allLedgerReconciled,
     };
+  }
+
+  private async reconcileProjections(
+    snapshots: ProjectionSnapshot[],
+    ledgerReader?: AuthoritativeLedgerReader
+  ): Promise<LedgerReconciliationResult[]> {
+    return Promise.all(
+      snapshots.map(async (snapshot): Promise<LedgerReconciliationResult> => {
+        if (!ledgerReader || snapshot.ledgerSequence === undefined) {
+          return {
+            projectionName: snapshot.projectionName,
+            ledgerSequence: snapshot.ledgerSequence,
+            status: "UNAVAILABLE",
+            mismatchPaths: [],
+            error: !ledgerReader
+              ? "No authoritative ledger reader is configured"
+              : "Projection snapshot has no ledger sequence",
+          };
+        }
+
+        try {
+          const authoritative = await ledgerReader.readProjectionAtLedger(
+            snapshot.projectionName,
+            snapshot.ledgerSequence
+          );
+          const ledgerMatches = authoritative.ledgerSequence === snapshot.ledgerSequence;
+          const mismatchPaths: string[] = [];
+          if (!ledgerMatches) mismatchPaths.push("ledgerSequence");
+          if (stableStringify(snapshot.state) !== stableStringify(authoritative.state)) {
+            collectMismatchPaths(
+              snapshot.state,
+              authoritative.state,
+              "",
+              mismatchPaths
+            );
+          }
+          return {
+            projectionName: snapshot.projectionName,
+            ledgerSequence: snapshot.ledgerSequence,
+            status: mismatchPaths.length === 0 ? "MATCHED" : "MISMATCH",
+            mismatchPaths,
+            error: ledgerMatches ? undefined : "Ledger reader returned a different sequence",
+          };
+        } catch (error) {
+          return {
+            projectionName: snapshot.projectionName,
+            ledgerSequence: snapshot.ledgerSequence,
+            status: "UNAVAILABLE",
+            mismatchPaths: [],
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      })
+    );
   }
 
   /**
@@ -468,7 +627,11 @@ export class BackupRestoreService {
     baseDir: string,
     passphrase: string = 'DrillPassphrase2026!Secure',
     sandboxDir?: string,
-    replayInputs?: { rawEvents?: RetainedRawEvent[]; projectionSnapshots?: ProjectionSnapshot[] }
+    replayInputs?: {
+      rawEvents?: RetainedRawEvent[];
+      projectionSnapshots?: ProjectionSnapshot[];
+      ledgerReader?: AuthoritativeLedgerReader;
+    }
   ): Promise<RestoreDrillResult> {
     const isolatedDir =
       sandboxDir || path.join(baseDir, 'scratch', `restore_drill_${Date.now()}_${randomUUID().slice(0, 6)}`);
@@ -486,6 +649,7 @@ export class BackupRestoreService {
         archive,
         passphrase,
         isolatedDir,
+        ledgerReader: replayInputs?.ledgerReader,
       });
     } finally {
       // Ensure isolated drill sandbox is cleaned up if created automatically

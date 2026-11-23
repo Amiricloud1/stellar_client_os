@@ -121,6 +121,7 @@ describe('Operational Data Backup & Isolated Restore Drill Service', () => {
       expect(result.allChecksumsMatch).toBe(true);
       expect(result.allJsonValid).toBe(true);
       expect(result.rtoSlaMet).toBe(true);
+      expect(result.rpoSlaMet).toBe(true);
       expect(result.filesProcessed).toBe(2);
 
       // Verify files actually exist in isolated directory
@@ -201,6 +202,121 @@ describe('Operational Data Backup & Isolated Restore Drill Service', () => {
       });
 
       expect(result.status).toBe('DECRYPTION_FAILURE');
+    });
+
+    it('measures an RPO breach instead of reporting restore success', async () => {
+      const archive = await service.createBackup({
+        sourcePaths: [path.join(dataDir, 'empty_file.json')],
+        baseDir: testBaseDir,
+        passphrase,
+        rpoWindowMinutes: 1,
+      });
+
+      const result = await service.restoreBackup({
+        archive,
+        passphrase,
+        isolatedDir: isolatedRestoreDir,
+        rtoTargetMs: 30 * 60 * 1000,
+        now: () => Date.parse(archive.manifest.createdAt) + 60_001,
+      });
+
+      expect(result.rpoAgeMs).toBe(60_001);
+      expect(result.rpoTargetMs).toBe(60_000);
+      expect(result.rpoSlaMet).toBe(false);
+      expect(result.status).toBe('RECOVERY_OBJECTIVE_FAILURE');
+    });
+
+    it('does not trust an unauthenticated manifest when measuring RPO', async () => {
+      const archive = await service.createBackup({
+        sourcePaths: [path.join(dataDir, 'empty_file.json')],
+        baseDir: testBaseDir,
+        passphrase,
+        rpoWindowMinutes: 1,
+      });
+      const tamperedArchive = {
+        ...archive,
+        manifest: {
+          ...archive.manifest,
+          createdAt: 'tampered',
+        },
+      };
+
+      const result = await service.restoreBackup({
+        archive: tamperedArchive,
+        passphrase,
+        isolatedDir: isolatedRestoreDir,
+      });
+
+      expect(result.status).toBe('INTEGRITY_FAILURE');
+      expect(result.rpoSlaMet).toBe(false);
+    });
+
+    it('reconciles replay snapshots against the authoritative ledger checkpoint', async () => {
+      const rawEvents = [{
+        eventId: 'event-1',
+        eventType: 'campaign.updated',
+        schemaVersion: '1',
+        aggregateId: 'campaign-1',
+        sequence: 1,
+        occurredAt: '2026-10-01T12:00:00.000Z',
+        payload: {},
+      }];
+      const projectionSnapshots = [{
+        projectionName: 'campaigns',
+        schemaVersion: '1',
+        state: { 'campaign-1': { lastSequence: 1, eventCount: 1 } },
+        lastEventSequence: 1,
+        ledgerSequence: 1234,
+      }];
+      const archive = await service.createBackup({
+        sourcePaths: [path.join(dataDir, 'empty_file.json')],
+        baseDir: testBaseDir,
+        passphrase,
+        rawEvents,
+        projectionSnapshots,
+      });
+
+      const result = await service.restoreBackup({
+        archive,
+        passphrase,
+        isolatedDir: isolatedRestoreDir,
+        ledgerReader: {
+          async readProjectionAtLedger(projectionName, ledgerSequence) {
+            expect(projectionName).toBe('campaigns');
+            return { ledgerSequence, state: projectionSnapshots[0].state };
+          },
+        },
+      });
+
+      expect(result.allReplaysDeterministic).toBe(true);
+      expect(result.allLedgerReconciled).toBe(true);
+      expect(result.ledgerReconciliations[0].status).toBe('MATCHED');
+      expect(result.status).toBe('SUCCESS');
+    });
+
+    it('fails closed when a projection snapshot cannot be checked against the ledger', async () => {
+      const archive = await service.createBackup({
+        sourcePaths: [path.join(dataDir, 'empty_file.json')],
+        baseDir: testBaseDir,
+        passphrase,
+        projectionSnapshots: [{
+          projectionName: 'campaigns',
+          schemaVersion: '1',
+          state: {},
+          lastEventSequence: 0,
+          ledgerSequence: 1234,
+        }],
+      });
+
+      const result = await service.restoreBackup({
+        archive,
+        passphrase,
+        isolatedDir: isolatedRestoreDir,
+      });
+
+      expect(result.allLedgerReconciled).toBe(false);
+      expect(result.ledgerReconciliations[0].status).toBe('UNAVAILABLE');
+      expect(result.status).toBe('LEDGER_RECONCILIATION_FAILURE');
     });
   });
 
