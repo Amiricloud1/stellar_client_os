@@ -21,6 +21,11 @@ Every privileged operation is recorded with:
 
 Secrets (secret keys, tokens, passwords, passphrases, and Stellar secret-key
 values) are redacted to `[REDACTED]` by `sanitizeMetadata` before storage.
+Nested values are sanitized recursively. High-impact configuration changes use
+`AuditLogger.recordConfigurationChange()` and require a non-empty reason; the
+entry records the setting name and redacted before/after values. Only admins
+are authorized for the `modify.configuration` action by the default access
+policy.
 
 The implementation lives in `packages/sdk/src/audit.ts`:
 

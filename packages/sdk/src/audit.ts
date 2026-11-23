@@ -17,6 +17,7 @@ export type AuditAction =
   | "deploy.contract"
   | "initialize.contract"
   | "rotate.credential"
+  | "modify.configuration"
   | "delete.personal_record"
   | "export.personal_data"
   | "modify.retention_policy"
@@ -93,12 +94,8 @@ export const DEFAULT_ACCESS_POLICY: AccessPolicy = {
   },
 };
 
-const SECRET_KEY_PATTERNS = [
-  // Standalone secret/credential/token/password key names.
-  /(secret|token|password|passphrase|credential)$/i,
-  // *-key forms such as secretKey, apiKey, privateKey, credentialKey.
-  /(private|api|secret|credential).?key$/i,
-];
+const SECRET_KEY_PATTERN =
+  /(secret|token|password|passphrase|credential|private.?key|api.?key|authorization|dsn)/i;
 
 const STELLAR_SECRET_KEY_PREFIX = "S";
 
@@ -110,22 +107,40 @@ export function sanitizeMetadata(
   metadata: Record<string, unknown> | undefined
 ): Record<string, unknown> {
   if (!metadata) return {};
-  const sanitized: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(metadata)) {
-    if (SECRET_KEY_PATTERNS.some((pattern) => pattern.test(key))) {
-      sanitized[key] = "[REDACTED]";
-    } else if (
+  const ancestors = new WeakSet<object>();
+
+  const sanitizeValue = (value: unknown, key?: string): unknown => {
+    if (key && SECRET_KEY_PATTERN.test(key)) return "[REDACTED]";
+    if (
       typeof value === "string" &&
       value.startsWith(STELLAR_SECRET_KEY_PREFIX) &&
       value.length === 56
     ) {
-      // Looks like a Stellar secret key (starts with 'S', 56 chars).
-      sanitized[key] = "[REDACTED]";
-    } else {
-      sanitized[key] = value;
+      return "[REDACTED]";
     }
-  }
-  return sanitized;
+    if (Array.isArray(value)) {
+      if (ancestors.has(value)) return "[CIRCULAR]";
+      ancestors.add(value);
+      const sanitized = value.map((item) => sanitizeValue(item));
+      ancestors.delete(value);
+      return sanitized;
+    }
+    if (value !== null && typeof value === "object") {
+      if (ancestors.has(value)) return "[CIRCULAR]";
+      ancestors.add(value);
+      const sanitized = Object.fromEntries(
+        Object.entries(value as Record<string, unknown>).map(([childKey, childValue]) => [
+          childKey,
+          sanitizeValue(childValue, childKey),
+        ]),
+      );
+      ancestors.delete(value);
+      return sanitized;
+    }
+    return value;
+  };
+
+  return sanitizeValue(metadata) as Record<string, unknown>;
 }
 
 /** Error raised by the audit subsystem. */
@@ -547,6 +562,12 @@ export class AuditLogger {
 
   /** Record an audit event and return the stored record. */
   record(input: AuditRecordParams): AuditRecord {
+    if (input.action === "modify.configuration" && !input.reason?.trim()) {
+      throw new AuditError(
+        "Configuration changes require a non-empty audit reason",
+        "REASON_REQUIRED"
+      );
+    }
     const record: AuditRecord = {
       ...input,
       id: this.idGenerator.next(),
@@ -556,6 +577,35 @@ export class AuditLogger {
     };
     this.entries.push(record);
     return record;
+  }
+
+  /** Records a configuration change with redacted before/after evidence. */
+  recordConfigurationChange(
+    input: Omit<AuditRecordParams, "action" | "metadata"> & {
+      target: string;
+      setting: string;
+      before: unknown;
+      after: unknown;
+      reason: string;
+    }
+  ): AuditRecord {
+    if (!input.setting.trim()) {
+      throw new AuditError(
+        "Configuration changes require a setting name",
+        "SETTING_REQUIRED"
+      );
+    }
+    const { setting, before, after, ...recordInput } = input;
+    const sensitiveSetting = SECRET_KEY_PATTERN.test(setting);
+    return this.record({
+      ...recordInput,
+      action: "modify.configuration",
+      metadata: {
+        setting,
+        before: sensitiveSetting ? "[REDACTED]" : before,
+        after: sensitiveSetting ? "[REDACTED]" : after,
+      },
+    });
   }
 
   /** Returns a copy of all stored audit records (newest first). */

@@ -8,6 +8,7 @@ This operational runbook details the procedures for executing and auditing perio
 
 - Prove the integrity and recoverability of operational data without impacting production traffic.
 - Validate that the **RTO SLA (<= 30 minutes)** and **RPO SLA (<= 15 minutes)** are achieved.
+- Reconcile every retained projection snapshot against an authoritative Stellar ledger read at the snapshot's recorded ledger sequence.
 - Verify that **AES-256-GCM authenticated encryption** correctly identifies any tampered or corrupted archives.
 - Validate 100% SHA-256 manifest matching and JSON structural syntax integrity.
 
@@ -36,6 +37,8 @@ import { BackupRestoreService } from '@/services/backup-restore.service';
 import fs from 'fs/promises';
 
 const service = new BackupRestoreService();
+// Adapter reads the requested projection from Stellar at the given ledger.
+const authoritativeLedgerReader = makeLedgerSnapshotReader();
 const archiveData = JSON.parse(await fs.readFile(`${SANDBOX_DIR}/archive.json`, 'utf8'));
 
 const drillResult = await service.restoreBackup({
@@ -43,12 +46,24 @@ const drillResult = await service.restoreBackup({
   passphrase: process.env.BACKUP_PASSPHRASE!,
   isolatedDir: `${SANDBOX_DIR}/restored_data`,
   rtoTargetMs: 30 * 60 * 1000, // 30 minutes
+  // Required when the backup contains projection snapshots.
+  ledgerReader: authoritativeLedgerReader,
 });
 
 console.log('Drill Result Status:', drillResult.status);
 console.log('All Checksums Match:', drillResult.allChecksumsMatch);
 console.log('Elapsed Duration (ms):', drillResult.elapsedMs);
+console.log('RPO Age / Target (ms):', drillResult.rpoAgeMs, drillResult.rpoTargetMs);
+console.log('Ledger Reconciliation:', drillResult.allLedgerReconciled);
 ```
+
+`rpoAgeMs` measures the time between the authenticated backup's creation time
+and drill start. `rpoSlaMet` is false when that age exceeds the manifest's RPO
+window. A projection-bearing backup without a ledger reader, or without a
+ledger sequence in a projection snapshot, fails with
+`LEDGER_RECONCILIATION_FAILURE`; do not treat it as safe for cutover.
+`RECOVERY_OBJECTIVE_FAILURE` means integrity checks passed but an RPO or RTO
+target was missed.
 
 ### Step 4: Verify Integrity Checks
 1. **Decryption & Auth Tag Check:** GCM auth tag must validate cleanly. Any corrupted or tampered bit returns `DECRYPTION_FAILURE`.

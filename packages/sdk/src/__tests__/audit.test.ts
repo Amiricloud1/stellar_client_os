@@ -86,6 +86,61 @@ describe("sanitizeMetadata", () => {
     expect(sanitizeMetadata(undefined)).toEqual({});
   });
 
+  it("redacts nested secrets in configuration change snapshots", () => {
+    const logger = makeLogger();
+    const record = logger.recordConfigurationChange({
+      actor: "operator-1",
+      actorRole: "admin",
+      target: "runtime-config",
+      setting: "webhook",
+      before: { enabled: false, credentials: { token: "old-token" } },
+      after: { enabled: true, credentials: { token: "new-token" } },
+      requestId: "req-config-1",
+      reason: "Rotate the webhook endpoint after provider migration",
+    });
+
+    expect(record.action).toBe("modify.configuration");
+    expect(record.timestamp).toBe("2025-01-01T00:00:00.000Z");
+    expect(record.reason).toBe("Rotate the webhook endpoint after provider migration");
+    expect(record.metadata).toEqual({
+      setting: "webhook",
+      before: { enabled: false, credentials: { token: "[REDACTED]" } },
+      after: { enabled: true, credentials: { token: "[REDACTED]" } },
+    });
+    expect(record).not.toHaveProperty("before");
+    expect(record).not.toHaveProperty("after");
+  });
+
+  it("requires a reason for configuration changes", () => {
+    const logger = makeLogger();
+    expect(() =>
+      logger.record({
+        ...baseInput(),
+        action: "modify.configuration",
+        reason: "  ",
+      })
+    ).toThrowError(AuditError);
+  });
+
+  it("redacts whole before/after snapshots for a secret setting", () => {
+    const record = makeLogger().recordConfigurationChange({
+      actor: "admin-1",
+      actorRole: "admin",
+      target: "runtime-secrets",
+      setting: "WEBHOOK_SIGNING_SECRET",
+      before: "old-signing-secret",
+      after: "new-signing-secret",
+      requestId: "req-secret-config",
+      reason: "Rotate the webhook signing key",
+    });
+
+    expect(record.metadata).toEqual({
+      setting: "WEBHOOK_SIGNING_SECRET",
+      before: "[REDACTED]",
+      after: "[REDACTED]",
+    });
+  });
+
   // ── DEFAULT_ACCESS_POLICY / AccessController ──────────────────────────────
 
   describe("DEFAULT_ACCESS_POLICY", () => {
@@ -94,6 +149,7 @@ describe("sanitizeMetadata", () => {
         "deploy.contract",
         "initialize.contract",
         "rotate.credential",
+        "modify.configuration",
         "delete.personal_record",
         "export.personal_data",
         "modify.retention_policy",
@@ -123,6 +179,7 @@ describe("sanitizeMetadata", () => {
         for (const action of [
           "deploy.contract",
           "delete.personal_record",
+          "modify.configuration",
         ] as AuditAction[]) {
           expect(DEFAULT_ACCESS_POLICY.can(role, action)).toBe(false);
         }

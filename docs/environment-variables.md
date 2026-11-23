@@ -9,6 +9,11 @@ Conventions:
 
 - **Scope `client`** (`NEXT_PUBLIC_*`) is inlined into the browser bundle at
   build time - never put secrets there. Everything else is **server-only**.
+- Startup rejects secret-bearing `NEXT_PUBLIC_*` names and unresolved webhook
+  or external secret-manager references. Secret managers must inject resolved
+  values before startup. Diagnostics identify invalid variable names/rules
+  only; configured values are never included in validation errors. Production
+  requires a resolved webhook signing secret of at least 32 characters.
 - **Secret = yes** means the value is a credential and must never be committed,
   logged, or pasted into issues/PRs.
 - Unless stated otherwise, an unset optional variable falls back to the default
@@ -19,21 +24,21 @@ Conventions:
 
 | Name | Required / default | Secret | Validation rule |
 | ---- | ------------------ | ------ | --------------- |
-| `NEXT_PUBLIC_PAYMENT_STREAM_CONTRACT_ID` | required | no | non-empty, starts with `C` |
-| `NEXT_PUBLIC_DISTRIBUTOR_CONTRACT_ID` | required | no | non-empty, starts with `C` |
-| `NEXT_PUBLIC_PLANTER_CONTRACT_ID` | optional | no | starts with `C` when set |
-| `NEXT_PUBLIC_SOROBAN_RPC_URL` | default `https://soroban-testnet.stellar.org` | no | valid URL |
-| `NEXT_PUBLIC_NETWORK_PASSPHRASE` | default `Test SDF Network ; September 2015` | no | non-empty |
-| `NEXT_PUBLIC_STELLAR_NETWORK` | default `testnet` | no | `testnet` \| `mainnet` |
-| `NEXT_PUBLIC_STELLAR_HORIZON_URL` | optional (`""` allowed) | no | valid URL when set |
-| `NEXT_PUBLIC_USDT_CONTRACT_ID` | optional (`""` allowed) | no | starts with `C` when set |
-| `NEXT_PUBLIC_EURC_CONTRACT_ID` | optional (`""` allowed) | no | starts with `C` when set |
-| `NEXT_PUBLIC_URL` | optional | no | valid URL when set |
+| `NEXT_PUBLIC_PAYMENT_STREAM_CONTRACT_ID` | required | no | valid Stellar contract StrKey and checksum |
+| `NEXT_PUBLIC_DISTRIBUTOR_CONTRACT_ID` | required | no | valid Stellar contract StrKey and checksum |
+| `NEXT_PUBLIC_PLANTER_CONTRACT_ID` | optional | no | valid Stellar contract StrKey when set |
+| `NEXT_PUBLIC_SOROBAN_RPC_URL` | default `https://soroban-testnet.stellar.org` | no | HTTPS (local HTTP only outside production), no embedded credentials/query secrets, network-compatible origin |
+| `NEXT_PUBLIC_NETWORK_PASSPHRASE` | default `Test SDF Network ; September 2015` | no | must match `NEXT_PUBLIC_STELLAR_NETWORK` |
+| `NEXT_PUBLIC_STELLAR_NETWORK` | default `testnet` | no | `testnet` \| `mainnet`; must match the network passphrase |
+| `NEXT_PUBLIC_STELLAR_HORIZON_URL` | optional (`""` allowed) | no | HTTPS (local HTTP only outside production), no embedded credentials/query secrets |
+| `NEXT_PUBLIC_USDT_CONTRACT_ID` | optional (`""` allowed) | no | valid Stellar contract StrKey when set |
+| `NEXT_PUBLIC_EURC_CONTRACT_ID` | optional (`""` allowed) | no | valid Stellar contract StrKey when set |
+| `NEXT_PUBLIC_URL` | optional | no | credential-free HTTPS origin (not a path or query URL) |
 | `NEXT_PUBLIC_APP_NAME` | optional | no | any string |
 | `NEXT_PUBLIC_APP_DESCRIPTION` | optional | no | any string |
-| `NEXT_PUBLIC_API_URL` | optional (`""` allowed) | no | valid URL when set |
-| `NEXT_PUBLIC_BACKEND_BASE_URL` | optional (`""` allowed) | no | valid URL when set |
-| `NEXT_PUBLIC_POLYGON_RPC_URL` | optional | no | valid URL when set |
+| `NEXT_PUBLIC_API_URL` | optional (`""` allowed) | no | credential-free HTTPS URL (local HTTP only outside production), no query secrets |
+| `NEXT_PUBLIC_BACKEND_BASE_URL` | optional (`""` allowed) | no | credential-free HTTPS URL (local HTTP only outside production), no query secrets |
+| `NEXT_PUBLIC_POLYGON_RPC_URL` | optional | no | credential-free HTTPS URL (local HTTP only outside production), no query secrets |
 | `NEXT_PUBLIC_OFFRAMP_MOCK` | optional | no | `"true"` enables the off-ramp mock |
 | `NEXT_PUBLIC_OFFRAMP_MOCK_DELAYS` | optional | no | comma-separated ms (offramp mock) |
 | `NEXT_PUBLIC_OFFRAMP_MOCK_FAIL_RATE` | optional, default `"0"` | no | numeric failure probability |

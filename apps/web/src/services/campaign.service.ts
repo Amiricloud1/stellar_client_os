@@ -1511,8 +1511,19 @@ export type CampaignExportFormat = "csv" | "json";
 
 export type CampaignExportJobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "EXPIRED";
 
+export interface CampaignExportPayloadV1 {
+  campaignId: string;
+  format: CampaignExportFormat;
+}
+
 export interface CampaignExportJob {
   id: string;
+  /**
+   * Optional for legacy jobs. The top-level campaignId and format remain
+   * readable by older workers during rolling deploys and rollback.
+   */
+  payloadVersion?: number;
+  payload?: CampaignExportPayloadV1;
   campaignId: string;
   requesterId: string;
   format: CampaignExportFormat;
@@ -1521,6 +1532,8 @@ export interface CampaignExportJob {
   progress: number;
   /** Number of processing attempts started so far. */
   attempts: number;
+  /** Number of sponsors processed across bounded work units. */
+  processedSponsors?: number;
   maxAttempts: number;
   createdAt: number;
   updatedAt: number;
@@ -1596,11 +1609,56 @@ export class CampaignExportJobError extends Error {
       | "NOT_READY"
       | "FAILED"
       | "ATTEMPTS_EXHAUSTED"
+      | "INCOMPATIBLE_PAYLOAD"
       | "INVALID_STATE",
   ) {
     super(message);
     this.name = "CampaignExportJobError";
   }
+}
+
+/**
+ * Reads both legacy flattened job records and the versioned payload envelope.
+ * New fields are additive so pre-existing workers can keep consuming v1 jobs.
+ */
+export function decodeCampaignExportPayload(
+  job: CampaignExportJob
+): CampaignExportPayloadV1 {
+  if (job.payloadVersion === undefined) {
+    if (
+      typeof job.campaignId !== "string" ||
+      !job.campaignId.trim() ||
+      (job.format !== "csv" && job.format !== "json")
+    ) {
+      throw new CampaignExportJobError(
+        "Legacy export job payload is invalid",
+        "INVALID_STATE"
+      );
+    }
+    return { campaignId: job.campaignId, format: job.format };
+  }
+  if (job.payloadVersion !== 1) {
+    throw new CampaignExportJobError(
+      `Unsupported export payload version ${job.payloadVersion}`,
+      "INCOMPATIBLE_PAYLOAD"
+    );
+  }
+
+  const payload = job.payload;
+  if (
+    !payload ||
+    typeof payload.campaignId !== "string" ||
+    !payload.campaignId.trim() ||
+    (payload.format !== "csv" && payload.format !== "json") ||
+    payload.campaignId !== job.campaignId ||
+    payload.format !== job.format
+  ) {
+    throw new CampaignExportJobError(
+      "Export job v1 payload is invalid or conflicts with legacy fields",
+      "INVALID_STATE"
+    );
+  }
+  return payload;
 }
 
 function isExportJobExpired(job: CampaignExportJob, now: number): boolean {
@@ -1632,6 +1690,8 @@ export async function enqueueExport(
   const maxAttempts = Math.max(1, Math.floor(options.maxAttempts ?? CAMPAIGN_EXPORT_DEFAULT_MAX_ATTEMPTS));
   const job: CampaignExportJob = {
     id: crypto.randomUUID(),
+    payloadVersion: 1,
+    payload: { campaignId, format },
     campaignId,
     requesterId,
     format,
@@ -1682,6 +1742,7 @@ export async function runExportJob(
   const job = await store.get(jobId);
   if (!job) throw new CampaignExportJobError(`Export job ${jobId} not found`, "NOT_FOUND");
 
+  const payload = decodeCampaignExportPayload(job);
   const effective = expireIfNeeded(job, now);
   if (effective.status === "EXPIRED") {
     if (effective !== job) await store.save(effective);
@@ -1691,7 +1752,7 @@ export async function runExportJob(
   if (effective.status === "FAILED") {
     throw new CampaignExportJobError(effective.error ?? `Export job ${jobId} failed`, "FAILED");
   }
-  if (effective.attempts >= effective.maxAttempts) {
+  if (effective.status === "QUEUED" && effective.attempts >= effective.maxAttempts) {
     const failed: CampaignExportJob = {
       ...effective,
       status: "FAILED",
@@ -1703,21 +1764,24 @@ export async function runExportJob(
   }
 
   const batchSize = Math.max(1, Math.floor(options.batchSize ?? CAMPAIGN_EXPORT_DEFAULT_BATCH_SIZE));
+  const attempts = effective.status === "RUNNING"
+    ? effective.attempts
+    : effective.attempts + 1;
   const running: CampaignExportJob = {
     ...effective,
     status: "RUNNING",
-    attempts: effective.attempts + 1,
+    attempts,
     updatedAt: now,
   };
   await store.save(running);
 
   try {
-    const campaign = await getCampaign(running.campaignId, dataSource);
+    const campaign = await getCampaign(payload.campaignId, dataSource);
     if (!campaign) {
       const failed: CampaignExportJob = {
         ...running,
         status: "FAILED",
-        error: `Campaign ${running.campaignId} not found`,
+        error: `Campaign ${payload.campaignId} not found`,
         updatedAt: now,
       };
       await store.save(failed);
@@ -1726,15 +1790,23 @@ export async function runExportJob(
 
     const document = campaignToExportDocument(campaign);
     const total = Math.max(1, document.sponsors.length);
-    const processed = Math.min(total, batchSize);
+    const processed = Math.min(
+      total,
+      (running.processedSponsors ?? 0) + batchSize
+    );
     const progress = Math.min(100, Math.round((processed / total) * 100));
 
     if (processed < total) {
       // Bounded work: persist partial progress and let the caller resume.
-      return store.save({ ...running, progress, updatedAt: now });
+      return store.save({
+        ...running,
+        processedSponsors: processed,
+        progress,
+        updatedAt: now,
+      });
     }
 
-    const body = running.format === "json"
+    const body = payload.format === "json"
       ? JSON.stringify(document, null, 2)
       : campaignExportToCsv(document);
     const artifactKey = `campaign-export:${running.id}`;
@@ -1742,6 +1814,7 @@ export async function runExportJob(
     return store.save({
       ...running,
       status: "SUCCEEDED",
+      processedSponsors: processed,
       progress: 100,
       artifactKey,
       updatedAt: now,
@@ -1758,6 +1831,30 @@ export async function runExportJob(
     await store.save(failed);
     throw new CampaignExportJobError(message, "FAILED");
   }
+}
+
+/**
+ * Drains a fixed snapshot of job IDs before deployment shutdown. Jobs added
+ * after the snapshot remain queued for the next worker; incompatible payloads
+ * are left untouched so rollback does not destroy pending work.
+ */
+export async function drainExportJobs(
+  jobIds: readonly string[],
+  dataSource: CampaignDataSource = getCampaignDataSource(),
+  store: CampaignExportJobStore = getCampaignExportJobStore(),
+  options: CampaignExportJobOptions = {},
+  now = Date.now(),
+): Promise<CampaignExportJob[]> {
+  const drained: CampaignExportJob[] = [];
+  for (const jobId of jobIds) {
+    let job = await store.get(jobId);
+    if (!job) throw new CampaignExportJobError(`Export job ${jobId} not found`, "NOT_FOUND");
+    while (job.status === "QUEUED" || job.status === "RUNNING") {
+      job = await runExportJob(jobId, dataSource, store, options, now);
+    }
+    drained.push(job);
+  }
+  return drained;
 }
 
 /**
