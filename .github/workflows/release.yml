@@ -11,6 +11,10 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
     # Only run if there are changeset files or a version bump commit
     steps:
       - name: Checkout code
@@ -61,6 +65,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"
 
       - name: Tag published version
         if: steps.changesets.outputs.published == 'true'
@@ -72,6 +77,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -134,13 +140,40 @@ jobs:
           EOF
           first=1
           while read -r digest name; do
+            clean_name="${name#./}"
             if [ "$first" -eq 0 ]; then printf ',\n' >> dist/wasm/provenance.json; fi
             first=0
-            printf '    { "name": "%s", "sha256": "%s" }' "$name" "$digest" >> dist/wasm/provenance.json
+            printf '    { "name": "%s", "sha256": "%s" }' "$clean_name" "$digest" >> dist/wasm/provenance.json
           done < dist/wasm/SHA256SUMS
           printf '\n  ]\n}\n' >> dist/wasm/provenance.json
           # Validate the generated metadata is well-formed JSON.
           node -e "JSON.parse(require('fs').readFileSync('dist/wasm/provenance.json','utf8'))"
+
+      - name: Sign and verify release provenance
+        env:
+          RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.RELEASE_SIGNING_PRIVATE_KEY }}
+          RELEASE_SIGNING_PUBLIC_KEY: ${{ secrets.RELEASE_SIGNING_PUBLIC_KEY }}
+          REQUIRE_SIGNED_RELEASES: ${{ vars.REQUIRE_SIGNED_RELEASES }}
+        run: |
+          set -euo pipefail
+          if [ -n "${RELEASE_SIGNING_PRIVATE_KEY:-}" ] && [ -n "${RELEASE_SIGNING_PUBLIC_KEY:-}" ]; then
+            node scripts/release-provenance.mjs sign \
+              --statement dist/wasm/provenance.json \
+              --out dist/wasm/provenance.sig.json \
+              --signer "github-actions:${GITHUB_REPOSITORY}:${GITHUB_RUN_ID}"
+            node scripts/release-provenance.mjs verify \
+              --statement dist/wasm/provenance.json \
+              --signature dist/wasm/provenance.sig.json \
+              --dir dist/wasm \
+              --expected-repo "${GITHUB_REPOSITORY}" \
+              --expected-commit "${GITHUB_SHA}" \
+              --allowed-ref "${GITHUB_REF}"
+          elif [ "${REQUIRE_SIGNED_RELEASES:-}" = "true" ]; then
+            echo "::error::REQUIRE_SIGNED_RELEASES=true but RELEASE_SIGNING_PRIVATE_KEY / RELEASE_SIGNING_PUBLIC_KEY secrets are missing." >&2
+            exit 1
+          else
+            echo "::warning::Release signing secrets not configured; publishing checksummed provenance.json without Ed25519 signature."
+          fi
 
       - name: Upload wasm artifacts
         uses: actions/upload-artifact@v4
@@ -149,7 +182,7 @@ jobs:
           path: |
             dist/wasm/*.wasm
             dist/wasm/SHA256SUMS
-            dist/wasm/provenance.json
+            dist/wasm/provenance*.json
           if-no-files-found: error
 
       - name: Attach artifacts to GitHub release
@@ -158,12 +191,16 @@ jobs:
         run: |
           set -euo pipefail
           TAG="wasm-${GITHUB_SHA::12}"
+          ASSETS=(dist/wasm/*.wasm dist/wasm/SHA256SUMS dist/wasm/provenance.json)
+          if [ -f dist/wasm/provenance.sig.json ]; then
+            ASSETS+=(dist/wasm/provenance.sig.json)
+          fi
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/wasm/*.wasm dist/wasm/SHA256SUMS dist/wasm/provenance.json --clobber
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
           else
             gh release create "$TAG" \
               --target "$GITHUB_SHA" \
               --title "wasm ${GITHUB_SHA::12}" \
-              --notes "Checksummed wasm artifacts with source provenance for commit ${GITHUB_SHA}." \
-              dist/wasm/*.wasm dist/wasm/SHA256SUMS dist/wasm/provenance.json
+              --notes "Checksummed and signed wasm artifacts with source provenance for commit ${GITHUB_SHA}." \
+              "${ASSETS[@]}"
           fi

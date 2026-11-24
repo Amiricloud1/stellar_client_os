@@ -14,7 +14,14 @@ export const REVIEWER_COMMENT_RESOLUTION_STATUSES = [
   "dismissed",
 ] as const;
 
-export type ResolutionStatus = (typeof REVIEWER_COMMENT_RESOLUTION_STATUSES)[number];
+export type ResolutionStatus =
+  (typeof REVIEWER_COMMENT_RESOLUTION_STATUSES)[number];
+
+export type EvidenceLocationPrecision =
+  | "redacted"
+  | "region"
+  | "district"
+  | "exact";
 
 export interface VerificationEvidence {
   id: string;
@@ -25,9 +32,19 @@ export interface VerificationEvidence {
   uploadedAt: number;
   latitude?: number;
   longitude?: number;
+  /** Precision tier applied to stored coordinates for privacy minimization. */
+  locationPrecision?: EvidenceLocationPrecision;
+  /** Quarantine record ID verifying the upload passed security scanning. */
+  quarantineId?: string;
+  /** Published scan state for quarantined evidence. */
+  scanStatus?: "clean" | "published";
+  /** Published storage key promoted from quarantine after clean scan. */
+  publishedKey?: string;
   verifierId?: string;
   caption?: string;
   contentHash?: string;
+  underwriterId?: string;
+  insurancePolicyId?: string;
   /**
    * Monotonic version of this evidence record. Comments are anchored to a
    * specific evidence version so discussions remain attributable even after
@@ -55,7 +72,10 @@ export interface ReviewerComment {
 export interface CreateReviewerCommentInput {
   campaignId: string;
   evidenceId: string;
-  /** Evidence version the reviewer is commenting on. Defaults to the current version. */
+  /**
+   * Evidence version the reviewer is commenting on. Defaults to the current
+   * version.
+   */
   evidenceVersion?: number;
   authorId: string;
   body: string;

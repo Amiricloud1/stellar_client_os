@@ -4,7 +4,11 @@ import { MAX_KEY_LENGTH, type AllowedContentType } from "./presigner";
 /**
  * Safe, namespaced object key schema for milestone proof photos.
  *
+ * Published evidence:
  *   evidence/{campaignId}/{milestoneId}/{uuid}.{ext}
+ *
+ * Quarantined (pre-scan) evidence:
+ *   quarantine/evidence/{campaignId}/{milestoneId}/{uuid}.{ext}
  *
  * - `campaignId` and `milestoneId` are server-side identifiers (on-chain
  *   campaign / stream id and milestone index). They are sanitized to
@@ -13,13 +17,12 @@ import { MAX_KEY_LENGTH, type AllowedContentType } from "./presigner";
  *   reach the S3 key, so directory traversal is impossible.
  * - `{ext}` is derived from a validated MIME type in the allowlist.
  *
- * Ownership binding: the prefix `evidence/{campaignId}/{milestoneId}/`
- * binds every object to a specific campaign + milestone. Presign handlers
- * MUST authorize the caller against that campaign before issuing a URL, and
- * MUST reject any caller-supplied key that does not match the expected
- * prefix (see {@link assertEvidenceKeyPrefix}).
+ * Ownership binding: the prefix binds every object to a specific campaign +
+ * milestone. Presign handlers MUST upload into quarantine first and MUST NOT
+ * promote an object to the published prefix until scanning succeeds.
  */
 export const EVIDENCE_PREFIX = "evidence";
+export const QUARANTINE_PREFIX = "quarantine/evidence";
 
 const EXTENSIONS: Record<AllowedContentType, string> = {
   "image/jpeg": "jpg",
@@ -29,7 +32,9 @@ const EXTENSIONS: Record<AllowedContentType, string> = {
   "application/pdf": "pdf",
 };
 
-export function extensionForContentType(contentType: AllowedContentType): string {
+export function extensionForContentType(
+  contentType: AllowedContentType
+): string {
   const ext = EXTENSIONS[contentType];
   if (!ext) {
     throw new Error(`Unsupported content type: ${String(contentType)}`);
@@ -49,75 +54,7 @@ function sanitizeId(value: string, label: string): string {
   return normalized;
 }
 
-/**
- * Build the expected key prefix for a campaign + milestone.
- * Used both when generating keys and when validating caller-supplied keys.
- */
-export function evidenceKeyPrefix(campaignId: string, milestoneId: string): string {
-  const campaign = sanitizeId(campaignId, "campaignId");
-  const milestone = sanitizeId(milestoneId, "milestoneId");
-  return `${EVIDENCE_PREFIX}/${campaign}/${milestone}/`;
-}
-
-/**
- * Build a safe, namespaced object key for a milestone proof photo.
- *
- * The key is derived entirely from server-side input (campaign/milestone ids
- * and a generated UUID) plus a validated content type, so user-supplied file
- * names never reach the S3 key and cannot traverse directories.
- *
- * @param campaignId on-chain campaign / stream id (numeric string)
- * @param milestoneId milestone index within the campaign
- * @param contentType validated MIME type used to derive the file extension
- */
-export function buildEvidenceKey(
-  campaignId: string,
-  milestoneId: string,
-  contentType: AllowedContentType,
-): string {
-  const ext = extensionForContentType(contentType);
-  const prefix = evidenceKeyPrefix(campaignId, milestoneId);
-  const key = `${prefix}${randomUUID()}.${ext}`;
-
-  if (key.length > MAX_KEY_LENGTH) {
-    throw new Error(`Generated evidence key exceeds max length (${MAX_KEY_LENGTH})`);
-  }
-  return key;
-}
-
-/**
- * Assert that a caller-supplied key is a well-formed evidence key bound to
- * the expected campaign + milestone. Throws on any mismatch so presign
- * handlers can fail closed.
- *
- * Rejects:
- * - keys that do not start with `evidence/{campaignId}/{milestoneId}/`
- * - keys containing `..` or backslashes (traversal attempts)
- * - keys whose basename is not `{uuid}.{ext}` with an allowlisted extension
- * - keys exceeding {@link MAX_KEY_LENGTH}
- */
-export function assertEvidenceKeyPrefix(
-  key: string,
-  campaignId: string,
-  milestoneId: string,
-): void {
-  if (typeof key !== "string" || key.length === 0) {
-    throw new Error("Evidence key is required");
-  }
-  if (key.length > MAX_KEY_LENGTH) {
-    throw new Error(`Evidence key exceeds max length (${MAX_KEY_LENGTH})`);
-  }
-  if (key.includes("..") || key.includes("\\")) {
-    throw new Error("Evidence key contains illegal path segments");
-  }
-
-  const expectedPrefix = evidenceKeyPrefix(campaignId, milestoneId);
-  if (!key.startsWith(expectedPrefix)) {
-    throw new Error("Evidence key does not match expected campaign/milestone prefix");
-  }
-
-  const basename = key.slice(expectedPrefix.length);
-  // Basename must be a single segment: `{uuid}.{ext}`.
+function assertValidBasename(basename: string): void {
   if (basename.length === 0 || basename.includes("/")) {
     throw new Error("Evidence key has an invalid object name");
   }
@@ -131,4 +68,175 @@ export function assertEvidenceKeyPrefix(
   if (!allowedExts.has(ext)) {
     throw new Error(`Evidence key has a disallowed extension: ${ext}`);
   }
+}
+
+/**
+ * Build the expected published key prefix for a campaign + milestone.
+ * Used both when generating keys and when validating caller-supplied keys.
+ */
+export function evidenceKeyPrefix(
+  campaignId: string,
+  milestoneId: string
+): string {
+  const campaign = sanitizeId(campaignId, "campaignId");
+  const milestone = sanitizeId(milestoneId, "milestoneId");
+  return `${EVIDENCE_PREFIX}/${campaign}/${milestone}/`;
+}
+
+/**
+ * Build the expected quarantine key prefix for a campaign + milestone.
+ * Uploaded evidence lands here until security scanning completes cleanly.
+ */
+export function quarantineEvidenceKeyPrefix(
+  campaignId: string,
+  milestoneId: string
+): string {
+  const campaign = sanitizeId(campaignId, "campaignId");
+  const milestone = sanitizeId(milestoneId, "milestoneId");
+  return `${QUARANTINE_PREFIX}/${campaign}/${milestone}/`;
+}
+
+/**
+ * Build a safe, namespaced published object key for a milestone proof photo.
+ *
+ * @param campaignId on-chain campaign / stream id
+ * @param milestoneId milestone index within the campaign
+ * @param contentType validated MIME type used to derive the file extension
+ */
+export function buildEvidenceKey(
+  campaignId: string,
+  milestoneId: string,
+  contentType: AllowedContentType
+): string {
+  const ext = extensionForContentType(contentType);
+  const prefix = evidenceKeyPrefix(campaignId, milestoneId);
+  const key = `${prefix}${randomUUID()}.${ext}`;
+
+  if (key.length > MAX_KEY_LENGTH) {
+    throw new Error(
+      `Generated evidence key exceeds max length (${MAX_KEY_LENGTH})`
+    );
+  }
+  return key;
+}
+
+/**
+ * Build a safe, namespaced quarantine object key for an unscanned upload.
+ *
+ * @param campaignId on-chain campaign / stream id
+ * @param milestoneId milestone index within the campaign
+ * @param contentType validated MIME type used to derive the file extension
+ */
+export function buildQuarantineEvidenceKey(
+  campaignId: string,
+  milestoneId: string,
+  contentType: AllowedContentType
+): string {
+  const ext = extensionForContentType(contentType);
+  const prefix = quarantineEvidenceKeyPrefix(campaignId, milestoneId);
+  const key = `${prefix}${randomUUID()}.${ext}`;
+
+  if (key.length > MAX_KEY_LENGTH) {
+    throw new Error(
+      `Generated quarantine key exceeds max length (${MAX_KEY_LENGTH})`
+    );
+  }
+  return key;
+}
+
+/**
+ * Returns true when an S3 object key or URL points into the private quarantine
+ * namespace. Quarantined objects must never be published directly.
+ */
+export function isQuarantineEvidenceKey(keyOrUrl: string): boolean {
+  if (typeof keyOrUrl !== "string" || keyOrUrl.trim().length === 0) {
+    return false;
+  }
+  const trimmed = keyOrUrl.trim();
+  if (trimmed.startsWith(`${QUARANTINE_PREFIX}/`)) {
+    return true;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    const pathname = parsed.pathname.replace(/^\/+/, "");
+    return pathname.startsWith(`${QUARANTINE_PREFIX}/`);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Assert that a caller-supplied key is a well-formed published evidence key
+ * bound to the expected campaign + milestone. Throws on any mismatch so
+ * handlers can fail closed.
+ */
+export function assertEvidenceKeyPrefix(
+  key: string,
+  campaignId: string,
+  milestoneId: string
+): void {
+  if (typeof key !== "string" || key.length === 0) {
+    throw new Error("Evidence key is required");
+  }
+  if (key.length > MAX_KEY_LENGTH) {
+    throw new Error(`Evidence key exceeds max length (${MAX_KEY_LENGTH})`);
+  }
+  if (key.includes("..") || key.includes("\\")) {
+    throw new Error("Evidence key contains illegal path segments");
+  }
+
+  const expectedPrefix = evidenceKeyPrefix(campaignId, milestoneId);
+  if (!key.startsWith(expectedPrefix)) {
+    throw new Error(
+      "Evidence key does not match expected campaign/milestone prefix"
+    );
+  }
+
+  const basename = key.slice(expectedPrefix.length);
+  assertValidBasename(basename);
+}
+
+/**
+ * Assert that a key is a well-formed quarantine evidence key bound to the
+ * expected campaign + milestone.
+ */
+export function assertQuarantineEvidenceKeyPrefix(
+  key: string,
+  campaignId: string,
+  milestoneId: string
+): void {
+  if (typeof key !== "string" || key.length === 0) {
+    throw new Error("Quarantine evidence key is required");
+  }
+  if (key.length > MAX_KEY_LENGTH) {
+    throw new Error(`Evidence key exceeds max length (${MAX_KEY_LENGTH})`);
+  }
+  if (key.includes("..") || key.includes("\\")) {
+    throw new Error("Evidence key contains illegal path segments");
+  }
+
+  const expectedPrefix = quarantineEvidenceKeyPrefix(campaignId, milestoneId);
+  if (!key.startsWith(expectedPrefix)) {
+    throw new Error(
+      "Quarantine key does not match expected campaign/milestone prefix"
+    );
+  }
+
+  const basename = key.slice(expectedPrefix.length);
+  assertValidBasename(basename);
+}
+
+/**
+ * Derive the published object key corresponding to a verified clean quarantine
+ * key, preserving the exact campaign, milestone, UUID, and extension.
+ */
+export function promoteQuarantineKeyToPublished(
+  quarantineKey: string,
+  campaignId: string,
+  milestoneId: string
+): string {
+  assertQuarantineEvidenceKeyPrefix(quarantineKey, campaignId, milestoneId);
+  const quarantinePrefix = quarantineEvidenceKeyPrefix(campaignId, milestoneId);
+  const basename = quarantineKey.slice(quarantinePrefix.length);
+  return `${evidenceKeyPrefix(campaignId, milestoneId)}${basename}`;
 }

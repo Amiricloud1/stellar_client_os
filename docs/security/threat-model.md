@@ -64,12 +64,13 @@ risk.
 | Reentrancy / balance manipulation in escrow | A3 | B3 | Soroban auth macros; escrow owned by contract; unit tests per contract | implemented |
 | Unbounded payout arithmetic | A3 | B3 | Checked decimal math in distributor/campaign contracts | implemented |
 | Spam / resource exhaustion of API | A1, A2 | B1 | Rate limiting per [rate-limits.md](../rate-limits.md) | implemented |
-| Malicious upload content (XSS via media) | A2 | B4 | Content-addressed IPFS CIDs; served as downloads, not inline HTML | implemented |
+| Malicious upload content (XSS / malware via evidence) | A2 | B4 | Private S3 quarantine prefix (`quarantine/evidence/...`), deterministic magic-byte/malware/polyglot scanning, fail-closed publication gate (`apps/web/src/services/evidence-quarantine.service.ts`) | implemented |
 | Secrets committed to the repository | A4 | B6 | Pre-merge secret scanning (`.gitleaks.toml` + `scripts/security/scan-secrets.mjs`, see [secret-rotation.md](secret-rotation.md)) | implemented |
 | Telemetry leaking wallet/draft data | A1 | B5 | Allowlist-based sanitizer; opt-in sink; field-exclusion tests (`apps/mobile/src/offline/__tests__/telemetry.test.ts`) | implemented |
+| Exact GPS exposure in public campaign evidence | A1, A2 | B1, B4 | Default `district` (~1.1 km) coordinate minimization, redaction mode, and privileged authorization for exact precision (`apps/web/src/lib/location-precision.ts`) | implemented |
 | Stale queue replaying destructive edits | A1 | B5 | Deterministic latest-wins merge; conflict retries bounded by reconnects | implemented |
 | Fraudulent campaign verification evidence | A2 | B4 | Verification audit trail (`campaign-verification-audit` contract) | implemented |
-| Supply-chain compromise of published SDK | A4 | B7 | CI-gated changesets publish; lockfile-pinned workspace | planned |
+| Supply-chain compromise of published SDK and WASM releases | A4 | B7 | CI-gated changesets publish with `NPM_CONFIG_PROVENANCE=true`, Ed25519 signed `provenance.sig.json`, and fail-closed verification (`packages/sdk/src/provenance.ts`, `scripts/release-provenance.mjs`) | implemented |
 | Admin key compromise (A5) | A5 | B2, B6 | Hardware-held operator keys; multi-sig / threshold control of admin actions | planned |
 | Denial of service of IPFS pinning | A1 | B4 | Multiple pinning providers / re-pin runbook | planned |
 
@@ -98,7 +99,9 @@ Every row must be one of `implemented`, `planned`, `accepted` — enforced by
 | Privacy-safe offline sync telemetry | A1/B5 identity leak | apps/mobile | implemented |
 | Rate limiting on campaign/API endpoints | A1, A2/B1 | apps/web | implemented |
 | Threshold admin keys for contract operations | A5/B2, B6 | contracts, deployments | planned |
-| SDK release provenance (signed/attested publishes) | A4/B7 | packages/sdk, .github/workflows | planned |
+| SDK and WASM release provenance (signed/attested publishes) | A4/B7 | packages/sdk, scripts, .github/workflows | implemented |
+| Evidence upload quarantine and security scanning before publication | A2/B4 | apps/web | implemented |
+| Campaign evidence location precision minimization | A1, A2/B1, B4 | apps/web | implemented |
 | Contract fuzzing for escrow arithmetic | A3/B3 | contracts | planned |
 | Remove hardcoded Stellar testnet seed fallback in `campaign-verification/stream` route (move fully to `ANCHOR_SECRET_KEY`; replace test fixture with a generated keypair) | A4/B6 credential leaks | apps/web | planned |
 
