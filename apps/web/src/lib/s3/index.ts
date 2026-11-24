@@ -8,4 +8,16 @@ export {
   type PresignUploadRequest,
   type PresignUploadResult,
 } from "./presigner";
-export { buildEvidenceKey, extensionForContentType } from "./keys";
+export {
+  EVIDENCE_PREFIX,
+  QUARANTINE_PREFIX,
+  evidenceKeyPrefix,
+  quarantineEvidenceKeyPrefix,
+  buildEvidenceKey,
+  buildQuarantineEvidenceKey,
+  isQuarantineEvidenceKey,
+  assertEvidenceKeyPrefix,
+  assertQuarantineEvidenceKeyPrefix,
+  promoteQuarantineKeyToPublished,
+  extensionForContentType,
+} from "./keys";

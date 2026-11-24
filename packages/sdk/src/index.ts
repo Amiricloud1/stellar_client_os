@@ -210,6 +210,29 @@ export {
   type LoadTarget,
   type LoadTestResult,
 } from "./load-test.js";
+export {
+  PROVENANCE_SCHEMA_VERSION,
+  PROVENANCE_SIGNATURE_DOMAIN,
+  ProvenanceError,
+  isProvenanceError,
+  normalizeArtifactName,
+  computeArtifactSha256,
+  computePublicKeyId,
+  validateProvenanceStatement,
+  canonicalizeProvenanceStatement,
+  parseSha256Sums,
+  signReleaseProvenance,
+  verifyReleaseProvenance,
+  assertValidReleaseProvenance,
+  type ArtifactDigest,
+  type ReleaseProvenanceStatement,
+  type ArtifactSignatureEnvelope,
+  type TrustedSigner,
+  type ProvenanceVerificationPolicy,
+  type ProvenanceVerificationResult,
+  type ProvenanceErrorCode,
+  type SignReleaseProvenanceOptions,
+} from "./provenance.js";
 
 // Export tax reporting utilities (issue #792)
 export * from "./tax.js";
