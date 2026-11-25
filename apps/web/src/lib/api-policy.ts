@@ -155,6 +155,10 @@ export const ROUTE_POLICIES: readonly RoutePolicyEntry[] = [
   // Audited operator webhook redelivery (issue #230). Each manual attempt is
   // recorded; only privileged operators may trigger a redelivery.
   { path: '/api/admin/webhooks/:id/redeliver', policy: 'privileged', roles: DEFAULT_PRIVILEGED_ROLES },
+  // Canary rollout control (issue #282). Rehearsal, promotion, evaluation, and
+  // rollback are privileged operator actions and are recorded in the
+  // controller's audit history.
+  { path: '/api/admin/canary', policy: 'privileged', roles: DEFAULT_PRIVILEGED_ROLES },
 ] as const;
 
 /** Minimal shape of the session object the guard understands. */
@@ -243,6 +247,56 @@ export function hasRequiredRole(
     }
   }
   return matched;
+}
+
+/** Environment variable holding the shared privileged API key. */
+export const ADMIN_API_KEY_ENV = 'ADMIN_API_KEY';
+
+/**
+ * Returns true when `request` carries `Authorization: Bearer <token>` matching
+ * the secret stored in `env[envVar]`. An unset secret denies everyone.
+ */
+export function hasBearerToken(
+  request: Request,
+  envVar: string,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const configured = env[envVar];
+  if (typeof configured !== 'string' || configured.length === 0) {
+    return false;
+  }
+  const header = request.headers.get('authorization') ?? '';
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+  return match !== null && safeCompare(match[1], configured);
+}
+
+/**
+ * Synchronous compatibility guard used by legacy admin routes.
+ *
+ * @returns `null` when the request is authorized, otherwise an explicit 503
+ *          (no key configured, fail closed) or 401 (missing/wrong key).
+ */
+export function checkPolicy(
+  request: Request,
+  policy: ApiPolicy,
+  env: Record<string, string | undefined> = process.env,
+  envVar: string = ADMIN_API_KEY_ENV,
+): NextResponse | null {
+  if (policy === 'public') {
+    return null;
+  }
+  const configured = env[envVar];
+  if (typeof configured !== 'string' || configured.length === 0) {
+    return errorResponse(
+      503,
+      'policy_unavailable',
+      `Privileged access is not configured (${envVar} is unset).`,
+    );
+  }
+  if (!hasBearerToken(request, envVar, env)) {
+    return errorResponse(401, 'unauthenticated', 'Authentication required.');
+  }
+  return null;
 }
 
 /** Normalizes a pathname by stripping a trailing slash (except root). */
