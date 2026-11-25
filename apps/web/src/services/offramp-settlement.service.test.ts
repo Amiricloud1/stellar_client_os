@@ -451,3 +451,188 @@ describe("OfframpSettlementService Trust Boundaries", () => {
     });
   });
 });
+
+// ==================== 6. CALLBACK VALIDATION (ISSUE #279) ====================
+
+describe("Callback Validation - Origin, State, Expiry, Network", () => {
+  const TEST_SECRET = "test-webhook-secret";
+
+  beforeEach(() => {
+    vi.stubEnv("OFFRAMP_WEBHOOK_SECRET", TEST_SECRET);
+    vi.stubEnv("NEXT_PUBLIC_NETWORK_PASSPHRASE", "Test SDF Network ; September 2015");
+    vi.stubEnv("NEXT_PUBLIC_STELLAR_NETWORK", "testnet");
+  });
+
+  it("rejects callback with invalid signature (origin validation)", () => {
+    const expiresAt = new Date(baseTime + 600_000).toISOString();
+    service.createSettlement(
+      {
+        transactionReference: "ref-sig-1",
+        providerId: "cashwyre",
+        walletAddress: "GABC123",
+        token: "USDC",
+        amount: 50,
+        fiatAmount: 77500,
+        currency: "NGN",
+        bankCode: "044",
+        accountNumber: "0123456789",
+        quoteExpiresAt: expiresAt,
+      },
+      baseTime
+    );
+
+    expect(() => {
+      service.processProviderCallback(
+        {
+          callbackId: "cb-invalid-sig",
+          transactionReference: "ref-sig-1",
+          providerId: "cashwyre",
+          status: "completed",
+          timestamp: new Date(baseTime + 5_000).toISOString(),
+          signature: "invalid-signature-value",
+        },
+        baseTime + 5_000,
+        { webhookSecret: TEST_SECRET }
+      );
+    }).toThrow("Callback signature verification failed");
+  });
+
+  it("rejects callback with expired timestamp (replay attack prevention)", () => {
+    const expiresAt = new Date(baseTime + 600_000).toISOString();
+    service.createSettlement(
+      {
+        transactionReference: "ref-replay-1",
+        providerId: "cashwyre",
+        walletAddress: "GABC123",
+        token: "USDC",
+        amount: 50,
+        fiatAmount: 77500,
+        currency: "NGN",
+        bankCode: "044",
+        accountNumber: "0123456789",
+        quoteExpiresAt: expiresAt,
+      },
+      baseTime
+    );
+
+    // Callback timestamp is 10 minutes old
+    const oldTimestamp = new Date(baseTime - 10 * 60 * 1000).toISOString();
+
+    expect(() => {
+      service.processProviderCallback(
+        {
+          callbackId: "cb-replay",
+          transactionReference: "ref-replay-1",
+          providerId: "cashwyre",
+          status: "completed",
+          timestamp: oldTimestamp,
+        },
+        baseTime
+      );
+    }).toThrow("too old");
+  });
+
+  it("rejects callback from wrong network (cross-network attack prevention)", () => {
+    const expiresAt = new Date(baseTime + 600_000).toISOString();
+    service.createSettlement(
+      {
+        transactionReference: "ref-network-1",
+        providerId: "cashwyre",
+        walletAddress: "GABC123",
+        token: "USDC",
+        amount: 50,
+        fiatAmount: 77500,
+        currency: "NGN",
+        bankCode: "044",
+        accountNumber: "0123456789",
+        quoteExpiresAt: expiresAt,
+      },
+      baseTime
+    );
+
+    vi.stubEnv("NODE_ENV", "production");
+
+    expect(() => {
+      service.processProviderCallback(
+        {
+          callbackId: "cb-wrong-network",
+          transactionReference: "ref-network-1",
+          providerId: "cashwyre",
+          status: "completed",
+          timestamp: new Date(baseTime + 5_000).toISOString(),
+          networkPassphrase: "Public Global Stellar Network ; September 2015",
+        },
+        baseTime + 5_000
+      );
+    }).toThrow("does not match");
+  });
+
+  it("rejects invalid state transitions (state validation)", () => {
+    const expiresAt = new Date(baseTime + 600_000).toISOString();
+    service.createSettlement(
+      {
+        transactionReference: "ref-state-1",
+        providerId: "cashwyre",
+        walletAddress: "GABC123",
+        token: "USDC",
+        amount: 50,
+        fiatAmount: 77500,
+        currency: "NGN",
+        bankCode: "044",
+        accountNumber: "0123456789",
+        quoteExpiresAt: expiresAt,
+      },
+      baseTime
+    );
+
+    // Try to transition directly from pending to completed (invalid)
+    expect(() => {
+      service.processProviderCallback(
+        {
+          callbackId: "cb-invalid-transition",
+          transactionReference: "ref-state-1",
+          providerId: "cashwyre",
+          status: "completed",
+          timestamp: new Date(baseTime + 5_000).toISOString(),
+        },
+        baseTime + 5_000
+      );
+    }).toThrow("Invalid state transition");
+  });
+
+  it("allows validation to be skipped for testing purposes", () => {
+    const expiresAt = new Date(baseTime + 600_000).toISOString();
+    service.createSettlement(
+      {
+        transactionReference: "ref-skip-validation",
+        providerId: "cashwyre",
+        walletAddress: "GABC123",
+        token: "USDC",
+        amount: 50,
+        fiatAmount: 77500,
+        currency: "NGN",
+        bankCode: "044",
+        accountNumber: "0123456789",
+        quoteExpiresAt: expiresAt,
+      },
+      baseTime
+    );
+
+    // Invalid signature but validation is skipped
+    const result = service.processProviderCallback(
+      {
+        callbackId: "cb-skip",
+        transactionReference: "ref-skip-validation",
+        providerId: "cashwyre",
+        status: "processing",
+        timestamp: new Date(baseTime - 10 * 60 * 1000).toISOString(), // Old timestamp
+        signature: "invalid-sig",
+      },
+      baseTime,
+      { skipValidation: true }
+    );
+
+    expect(result.actionTaken).toBe("transitioned");
+    expect(result.currentStatus).toBe("processing");
+  });
+});

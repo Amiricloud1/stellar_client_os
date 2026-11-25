@@ -47,11 +47,15 @@ flowchart LR
   - Timeout Escalation: Transfers pending longer than 15 minutes transition to `timeout` / `delayed`, triggering automated alerting and manual reconciliation tracking.
 
 ### Boundary 3: Platform <-> Offramp Providers (Cashwyre / AutoRamp)
-- **Trust Assumption:** Provider callbacks arrive asynchronously over public internet rails and may suffer from packet duplication, retries, network latency, or out-of-order delivery.
-- **Enforcement:**
-  - Idempotency & Deduplication: Every callback includes a unique `callbackId` and `transactionReference`. Callbacks are deduplicated; replays are acknowledged without re-executing state changes or double-crediting.
-  - State Locking: Once a settlement reaches a terminal state (`completed` or `failed`), it cannot be overwritten by out-of-order or delayed messages.
-  - Delayed Settlement Reconciliation: Settlements delayed past `DELAYED_SETTLEMENT_THRESHOLD_MS` (5 minutes) enter the delayed queue for automated or operator-driven reconciliation.
+- **Trust Assumption:** Provider callbacks arrive asynchronously over public internet rails and may suffer from packet duplication, retries, network latency, or out-of-order delivery. Additionally, callbacks may be subject to replay attacks, cross-network attacks, and unauthorized submissions.
+- **Enforcement (Issue #279):**
+  - **Origin Validation:** HMAC SHA-256 signature verification using shared webhook secret. Signatures are verified using timing-safe comparison to prevent timing attacks.
+  - **Expiry Validation:** Callback timestamps must be within 5 minutes of current time (with 30-second clock skew tolerance). Older callbacks are rejected to prevent replay attacks.
+  - **Network Validation:** Callbacks must include network passphrase or network name matching the configured Stellar network (testnet/mainnet). Cross-network callbacks are rejected.
+  - **State Transition Validation:** Validates that status transitions follow the allowed state machine. Terminal states (`completed`, `failed`, `expired`) cannot be overwritten.
+  - **Idempotency & Deduplication:** Every callback includes a unique `callbackId` and `transactionReference`. Callbacks are deduplicated; replays are acknowledged without re-executing state changes or double-crediting.
+  - **State Locking:** Once a settlement reaches a terminal state, it cannot be overwritten by out-of-order or delayed messages.
+  - **Delayed Settlement Reconciliation:** Settlements delayed past `DELAYED_SETTLEMENT_THRESHOLD_MS` (5 minutes) enter the delayed queue for automated or operator-driven reconciliation.
 
 ---
 
@@ -90,7 +94,153 @@ stateDiagram-v2
 
 ---
 
-## 3. Idempotency & Duplicate Callback Handling
+## 3. Callback Security & Validation (Issue #279)
+
+To protect against replay attacks, cross-network attacks, and unauthorized callbacks, all provider callbacks undergo comprehensive validation before processing:
+
+### 3.1 Validation Layers
+
+#### Layer 1: Origin Validation (HMAC Signature)
+Every callback must include an HMAC SHA-256 signature computed over the canonical payload:
+```json
+{
+  "callbackId": "cb-001",
+  "transactionReference": "ref-12345",
+  "providerId": "cashwyre",
+  "status": "completed",
+  "timestamp": "2024-01-15T10:30:00.000Z"
+}
+```
+
+**Signature Generation:**
+```
+signature = HMAC-SHA256(webhook_secret, canonical_payload)
+```
+
+**Validation Rules:**
+- Signatures are verified using timing-safe comparison to prevent timing attacks
+- Missing signatures are rejected in production mode
+- Invalid signatures result in HTTP 401 Unauthorized
+
+#### Layer 2: Expiry Validation (Timestamp Age)
+Callback timestamps must be recent to prevent replay attacks:
+- **Maximum Age:** 5 minutes (300 seconds)
+- **Clock Skew Tolerance:** 30 seconds
+- **Validation Logic:**
+  ```
+  age = current_time - callback_timestamp
+  valid = (age <= 300s) AND (age >= -30s)
+  ```
+
+**Rejection Scenarios:**
+- Timestamp older than 5 minutes → HTTP 400 (CALLBACK_EXPIRED)
+- Timestamp in future beyond tolerance → HTTP 400 (CALLBACK_FROM_FUTURE)
+
+#### Layer 3: Network Validation
+Callbacks must specify the Stellar network and match the configured environment:
+- **Network Passphrase:** e.g., "Test SDF Network ; September 2015"
+- **Network Name:** "testnet" or "mainnet"
+
+**Validation Rules:**
+- At least one network identifier required in production
+- Network must match `NEXT_PUBLIC_NETWORK_PASSPHRASE` or `NEXT_PUBLIC_STELLAR_NETWORK`
+- Cross-network callbacks result in HTTP 400 (NETWORK_MISMATCH)
+
+#### Layer 4: State Transition Validation
+State transitions must follow the allowed state machine:
+
+| Current Status | Allowed Next States |
+|----------------|---------------------|
+| `pending` | `processing`, `confirmed`, `expired`, `failed` |
+| `confirmed` | `processing`, `completed`, `failed`, `delayed` |
+| `processing` | `completed`, `failed`, `delayed`, `timeout` |
+| `delayed` | `completed`, `failed`, `timeout` |
+| `timeout` | `completed`, `failed` |
+| `completed` | *(terminal - no transitions)* |
+| `failed` | *(terminal - no transitions)* |
+| `expired` | *(terminal - no transitions)* |
+
+**Terminal State Protection:**
+- Once a settlement reaches `completed`, `failed`, or `expired`, it cannot transition to any other state
+- Duplicate callbacks of the same terminal state are allowed (idempotent)
+- Invalid transitions result in HTTP 409 Conflict (INVALID_STATE_TRANSITION)
+
+### 3.2 Configuration
+
+**Environment Variables:**
+```bash
+# Webhook signing secret (required in production)
+OFFRAMP_WEBHOOK_SECRET=your-secret-key-here
+
+# Network configuration
+NEXT_PUBLIC_NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NEXT_PUBLIC_STELLAR_NETWORK=testnet
+```
+
+**Validation Configuration:**
+```typescript
+{
+  MAX_CALLBACK_AGE_MS: 5 * 60 * 1000,      // 5 minutes
+  CLOCK_SKEW_TOLERANCE_MS: 30 * 1000,      // 30 seconds
+  NETWORK_PASSPHRASE: process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE,
+  WEBHOOK_SECRET_ENV_KEY: "OFFRAMP_WEBHOOK_SECRET"
+}
+```
+
+### 3.3 Provider Integration
+
+**Callback Payload Format:**
+```json
+{
+  "callbackId": "cb-unique-001",
+  "transactionReference": "ref-12345",
+  "providerId": "cashwyre",
+  "status": "completed",
+  "timestamp": "2024-01-15T10:30:00.000Z",
+  "signature": "a3f5b2c8d1e9f7a6b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1",
+  "networkPassphrase": "Test SDF Network ; September 2015",
+  "network": "testnet",
+  "providerStatus": "SETTLED",
+  "message": "Payout completed successfully"
+}
+```
+
+**Required Fields:**
+- `callbackId`: Unique identifier for idempotency
+- `transactionReference`: Links callback to settlement
+- `providerId`: Provider identifier (cashwyre, autoramp)
+- `status`: Payout status (pending, processing, completed, failed, etc.)
+- `timestamp`: ISO 8601 timestamp
+- `signature`: HMAC SHA-256 signature (required in production)
+- `networkPassphrase` or `network`: Network identifier (required in production)
+
+### 3.4 Error Responses
+
+| Error Code | HTTP Status | Description |
+|------------|-------------|-------------|
+| `MISSING_SIGNATURE` | 401 | Signature required in production |
+| `INVALID_SIGNATURE` | 401 | Signature verification failed |
+| `SIGNATURE_VERIFICATION_ERROR` | 500 | Internal signature verification error |
+| `MISSING_TIMESTAMP` | 400 | Timestamp field required |
+| `INVALID_TIMESTAMP` | 400 | Timestamp not valid ISO 8601 |
+| `CALLBACK_EXPIRED` | 400 | Timestamp older than 5 minutes |
+| `CALLBACK_FROM_FUTURE` | 400 | Timestamp in future beyond tolerance |
+| `MISSING_NETWORK` | 400 | Network identifier required |
+| `NETWORK_MISMATCH` | 400 | Network doesn't match configuration |
+| `INVALID_STATE_TRANSITION` | 409 | State transition not allowed |
+
+**Example Error Response:**
+```json
+{
+  "success": false,
+  "error": "Callback timestamp is too old (age: 420s, max: 300s)",
+  "code": "CALLBACK_EXPIRED"
+}
+```
+
+---
+
+## 4. Idempotency & Duplicate Callback Handling
 
 To guarantee that network retries or replay attacks never cause double payouts or state corruption:
 
@@ -113,7 +263,7 @@ To guarantee that network retries or replay attacks never cause double payouts o
 
 ---
 
-## 4. Delayed Settlement & Reconciliation Operations
+## 5. Delayed Settlement & Reconciliation Operations
 
 ### Detection
 Any settlement where `status === "processing"` or `status === "confirmed"` that exceeds 5 minutes without a terminal webhook is flagged as `delayed`.
@@ -150,7 +300,15 @@ Any settlement where `status === "processing"` or `status === "confirmed"` that 
 
 ---
 
-## 5. Compatibility & Migration Implications
+## 6. Compatibility & Migration Implications
 
-- **API Compatibility:** Existing client integrations calling `getQuoteStatus` or `createOfframp` are non-breaking. The addition of `"timeout"` and `"delayed"` statuses is fully backward-compatible with the UI tracker.
+- **API Compatibility:** Existing client integrations calling `getQuoteStatus` or `createOfframp` are non-breaking. The addition of callback validation (Issue #279) adds optional `signature`, `networkPassphrase`, and `network` fields to callback payloads. Existing callbacks without these fields will work in non-production environments but will be rejected in production for security.
+- **Provider Integration:** Offramp providers (Cashwyre, AutoRamp) must update their callback implementations to include:
+  - HMAC SHA-256 signatures computed with shared webhook secret
+  - Network identifiers (networkPassphrase or network name)
+  - Timestamps within 5-minute freshness window
 - **Database / Storage Migration:** Settlement records extend existing quote structures with `failureCategory`, `reconciledAt`, and `processedCallbacks`. In environments using persistent databases (PostgreSQL/Redis), add nullable columns for these fields.
+- **Configuration:** New environment variables required for production:
+  - `OFFRAMP_WEBHOOK_SECRET`: Shared secret for HMAC signature verification
+  - `NEXT_PUBLIC_NETWORK_PASSPHRASE`: Expected Stellar network passphrase
+  - `NEXT_PUBLIC_STELLAR_NETWORK`: Network name (testnet/mainnet)

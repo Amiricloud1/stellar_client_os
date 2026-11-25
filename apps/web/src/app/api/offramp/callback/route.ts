@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { offrampSettlementService } from "@/services/offramp-settlement.service";
+import { CallbackValidationError } from "@/lib/callback-validation";
 import type { PayoutStatus, SettlementFailureCategory } from "@/types/offramp";
 
 const CallbackSchema = z.object({
@@ -33,6 +34,8 @@ const CallbackSchema = z.object({
     .optional(),
   timestamp: z.string().optional(),
   signature: z.string().optional(),
+  networkPassphrase: z.string().optional(),
+  network: z.string().optional(),
   metadata: z.record(z.unknown()).optional(),
 });
 
@@ -41,6 +44,12 @@ const CallbackSchema = z.object({
  *
  * Webhook/callback endpoint for offramp payout providers (Cashwyre, AutoRamp).
  * Idempotently processes status updates and deduplicates replays.
+ * 
+ * Security (Issue #279):
+ * - Origin Validation: HMAC signature verification
+ * - State Validation: Validates allowed state transitions
+ * - Expiry Validation: Rejects callbacks older than 5 minutes
+ * - Network Validation: Ensures callback matches configured Stellar network
  */
 export async function POST(req: NextRequest) {
   try {
@@ -60,6 +69,7 @@ export async function POST(req: NextRequest) {
 
     const payload = parseResult.data;
 
+    // Process callback with comprehensive validation (origin, state, expiry, network)
     const result = offrampSettlementService.processProviderCallback({
       callbackId: payload.callbackId,
       transactionReference: payload.transactionReference,
@@ -70,6 +80,8 @@ export async function POST(req: NextRequest) {
       failureCategory: payload.failureCategory as SettlementFailureCategory | undefined,
       timestamp: payload.timestamp || new Date().toISOString(),
       signature: payload.signature,
+      networkPassphrase: payload.networkPassphrase,
+      network: payload.network,
       metadata: payload.metadata,
     });
 
@@ -78,6 +90,18 @@ export async function POST(req: NextRequest) {
       data: result,
     });
   } catch (err: unknown) {
+    // Handle validation errors with appropriate HTTP status codes
+    if (err instanceof CallbackValidationError) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: err.message,
+          code: err.code,
+        },
+        { status: err.httpStatus }
+      );
+    }
+
     const message = err instanceof Error ? err.message : "Internal callback error";
     return NextResponse.json(
       { success: false, error: message },
