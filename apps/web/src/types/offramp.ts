@@ -223,6 +223,8 @@ export interface ProviderCallbackPayload {
     failureCategory?: SettlementFailureCategory;
     timestamp: string;
     signature?: string;
+    networkPassphrase?: string;
+    network?: string;
     metadata?: Record<string, unknown>;
 }
 

@@ -6,6 +6,8 @@
  * 2. System <-> Bridge Boundary: Bridge confirmation tracking and timeout monitoring.
  * 3. System <-> Provider Boundary: Idempotent callback processing, duplicate callback
  *    deduplication, provider failure handling, and delayed settlement reconciliation.
+ * 4. Callback Security: Origin validation (HMAC), state transition validation, expiry
+ *    validation (timestamp age), and network validation (passphrase matching).
  */
 
 import {
@@ -17,6 +19,11 @@ import {
   DelayedSettlementRecord,
   SETTLEMENT_CONFIG,
 } from "@/types/offramp";
+import {
+  validateCallback,
+  CallbackValidationError,
+  type CallbackWithNetwork,
+} from "@/lib/callback-validation";
 
 export class QuoteExpiredError extends Error {
   constructor(message = "Offramp quote has expired. Please refresh your quote.") {
@@ -131,14 +138,45 @@ export class OfframpSettlementService {
   /**
    * Processes a provider callback with strict idempotency and duplicate deduplication.
    * Handles duplicate callbacks, delayed settlement reconciliation, and terminal state protection.
+   * 
+   * @param callback - The provider callback payload
+   * @param now - Current timestamp (for testing)
+   * @param options - Validation options
+   * @throws {CallbackValidationError} If callback validation fails
    */
   public processProviderCallback(
     callback: ProviderCallbackPayload,
-    now: number = Date.now()
+    now: number = Date.now(),
+    options?: {
+      skipValidation?: boolean;
+      webhookSecret?: string;
+    }
   ): ReconciliationResult {
     const timestampStr = new Date(now).toISOString();
     const record = this.settlements.get(callback.transactionReference);
 
+    // Phase 1: Comprehensive Callback Validation (Issue #279)
+    // Validate origin, state, expiry, and network before processing
+    if (!options?.skipValidation) {
+      const validationResult = validateCallback(
+        callback as CallbackWithNetwork,
+        record?.status,
+        {
+          webhookSecret: options?.webhookSecret,
+          now,
+        }
+      );
+
+      if (!validationResult.valid && validationResult.error) {
+        throw new CallbackValidationError(
+          validationResult.error.message,
+          validationResult.error.code,
+          validationResult.error.httpStatus
+        );
+      }
+    }
+
+    // Phase 2: Settlement Record Lookup
     if (!record) {
       return {
         transactionReference: callback.transactionReference,
@@ -162,7 +200,7 @@ export class OfframpSettlementService {
         actionTaken: "duplicate_ignored",
         isDuplicate: true,
         auditTimestamp: timestampStr,
-        notes: `Duplicate callbackId ${callback.callbackId} detected and ignored`,
+        notes: `Duplicate callbackId ${callback.callbackId} detected and ignored (replay attack prevented)`,
       };
     }
 
